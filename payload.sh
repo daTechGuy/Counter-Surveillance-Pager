@@ -615,6 +615,35 @@ handle_flock_wifi_line() {
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"
 }
 
+# Vendor-specific alert labels for select Mesh-Detect OUI/MAC hits (used by
+# both the WiFi and BLE hit handlers below). Most hits just show the generic
+# "Mesh-Detect (...)" phrasing; a few high-confidence single-vendor OUI
+# blocks get a specific name instead -- not exhaustive, and deliberately not
+# derived from mesh_detect_targets.conf's inline vendor comments (those are
+# stripped at parse time by both the awk and bash loaders, so displaying
+# them properly would mean carrying vendor names through the config format
+# as real data, not comments -- more than this needed for one vendor). Add
+# more entries here as wanted. Takes the raw OUI/MAC value (the part after
+# "oui:"/"mac:" in a matchkind string), not the whole matchkind.
+mesh_vendor_label() {
+    case "${1,,}" in
+        00:25:df|00:1f:55|00:0f:13)
+            # Axon Enterprise (body cams, Fleet dash cams, Taser 7/10) --
+            # OUI 00:25:DF is IEEE-registered to "Axon Enterprise, Inc."
+            # (formerly "TASER International, Inc."); 00:1F:55/00:0F:13 are
+            # the same vendor's other allocated blocks. Cross-checked
+            # against colonelpanichacks/oui-spy-unified-blue's PRESET_AXON
+            # (src/raw/detector.cpp) which also lists a BLE Company ID
+            # (0x034D) and Service UUID (0xFC81) for this vendor -- not
+            # checked here, since that needs raw BLE advertisement parsing
+            # (own hcidump reader) that this OUI-only WiFi/BLE lookup
+            # doesn't have; see rogue_tracker_monitor.awk for what that
+            # kind of check looks like if this ever gets built.
+            echo "Axon Cam" ;;
+        *) echo "" ;;
+    esac
+}
+
 # Parse one "wifi_mesh|MAC|oui:x" or "wifi_mesh|MAC|mac:x" line from
 # mesh_wifi_monitor.awk and LOG/loot/vibrate it. Same session dedup pattern
 # as the other detectors, keyed separately (WIFI_MESH) so it doesn't collide
@@ -626,9 +655,16 @@ handle_mesh_wifi_line() {
     [ -z "$mac" ] && return
     if echo "$SEEN_STRONG" | grep -q "$mac WIFI_MESH\|$mac MESH_BLE"; then return; fi
 
+    local vendor
+    vendor=$(mesh_vendor_label "${matchkind#*:}")
+
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
-    ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)"
+    if [ -n "$vendor" ]; then
+        ENTRY="DECT: $CURRENT_TIME | $mac | $vendor detected (WiFi, $matchkind)"
+    else
+        ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)"
+    fi
     LOG "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
     DETECTIONS=$((DETECTIONS + 1))
@@ -825,7 +861,12 @@ while true; do
             MATCH=$(mesh_ble_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
-            ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)"
+            VENDOR=$(mesh_vendor_label "${MATCH#*:}")
+            if [ -n "$VENDOR" ]; then
+                ENTRY="DECT: $CURRENT_TIME | $MAC | $VENDOR detected (BLE \"$NAME\", $MATCH)"
+            else
+                ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)"
+            fi
             LOG "$ENTRY"
             echo "$ENTRY" >> "$LOG_FILE"
             DETECTIONS=$((DETECTIONS + 1))
