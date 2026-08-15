@@ -36,12 +36,21 @@
 #     *methods* this payload's generic matcher ports (see
 #     mesh_wifi_monitor.awk and mesh_detect_targets.conf headers). NOT
 #     ported: mesh-detect's Meshtastic LoRa alert relay (needs LoRa hardware
-#     this device doesn't have) and its baked-in OUI list (the upstream
-#     "privacy" fork that reportedly had one, lukeswitz/esp32-oui-sniffer,
-#     no longer exists -- this payload's target list ships empty, same as
-#     upstream Esp32-oui-sniffer's own default).
+#     this device doesn't have).
 #   All credit for the underlying detection concepts and the original
 #   Flock-You code belongs to Colonel Panic; this payload is a derivative work.
+# Rogue BLE tracker detection (rogue_tracker_monitor.awk) is NOT a Colonel
+# Panic port -- it's new here, structurally matching Apple Find My / Tile /
+# Samsung SmartTag / Google Find My Device Network beacons (all engineered
+# to defeat static OUI/MAC watchlists like Mesh-Detect's, via rotating
+# addresses -- see that file's header for exactly why this needed a
+# different detection approach). Byte-level formats sourced from and
+# verified against: seemoo-lab/openhaystack (Apple), Heinrich et al.'s
+# "Privacy Analysis of Samsung's Crowd-Sourced Bluetooth Location Tracking
+# System" (arXiv:2210.14702) plus community reverse-engineering (Samsung,
+# Tile), and Google's own public Find Hub Network Accessory Specification
+# (FMDN). See rogue_tracker_monitor.awk's header for exact citations
+# and what wasn't decoded.
 # Original Flock-You Contributors: colonelpanichacks, Claude (Anthropic), Grok (xAI), Brandon Starkweather
 # Remote ID spec/byte-offset sources (see rid_common.awk header for citations):
 #   opendroneid/opendroneid-core-c, opendroneid/transmitter-linux
@@ -75,6 +84,9 @@
 #   Mesh-Detect WiFi scan: + awk, iw, tcpdump, a second radio (phy1) -- same
 #                        shared radio/channel-hop, only runs once
 #                        mesh_detect_targets.conf has an oui:/mac: entry
+#   Rogue tracker BLE scan: + awk, hcidump (own reader, alongside Drone BLE
+#                        scan's) -- no config needed to be active, but see
+#                        tracker_allowlist.conf re: your own trackers
 #   Drone BLE scan    : + awk, hcidump
 #   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1)
 # ============================================================================
@@ -83,18 +95,40 @@
 #  - Drone BLE detection only sees advertisements during Flock-You's own
 #    ~12-of-15s hcitool lescan windows (it piggybacks on that scan rather
 #    than running a separate one) -- NOT continuous like the ESP32 Sky-Spy.
+#    Rogue tracker BLE detection has the exact same limitation, for the
+#    exact same reason (its hcidump reader is equally passive).
 #  - All three WiFi detectors (Flock probe + Mesh-Detect + drone Remote ID)
 #    now share one hopped radio (channels 11/6/1, 250ms dwell, matching
 #    flock-you's own CUSTOM hop set) instead of drone detection's old fixed
 #    channel 6. A drone beaconing Remote ID only on 5GHz, or on a 2.4GHz
 #    channel outside 11/6/1, will still be missed -- same for a Mesh-Detect
 #    target whose beacon/probe traffic never lands on one of those channels.
-#  - mesh_detect_targets.conf ships EMPTY. Both Mesh-Detect detectors (BLE
-#    and WiFi) are no-ops until you add oui:/mac:/name: entries yourself --
-#    see that file's header. This is intentional, not a bug: upstream
-#    Esp32-oui-sniffer has no default list either (it's genuinely
-#    user-configured via its web UI), and the "privacy" fork that reportedly
-#    baked one in is a dead link as of this writing.
+#  - Rogue tracker detection's persistence heuristic (see
+#    handle_tracker_line() below) has no GPS and can't tell "this tracker
+#    has followed me across locations" from "this tracker has sat 15+
+#    minutes near wherever the Pager itself is sitting" -- it's the same
+#    class of heuristic Apple/Android's own on-device detection uses, just
+#    without their location-diversity refinement. A tracker in a stationary
+#    neighboring apartment/vehicle you're not near could false-positive if
+#    you happen to stay put nearby for the persistence window; a tracker
+#    that boards a fast-moving vehicle you're not in but that happens to sit
+#    near the Pager only briefly could false-negative.
+#  - Rogue tracker allowlisting (tracker_allowlist.conf) needs periodic
+#    maintenance for the three protocols with rotating MACs (Apple/Samsung/
+#    Google) -- see that file's header for why there's no "add once, forget
+#    forever" option available here. Tile's MAC doesn't rotate, so a Tile
+#    allowlist entry is permanent.
+#  - rogue_tracker_monitor.awk only checks the AD-type + company/service-ID
+#    + protocol-type-byte header for each of the four protocols, not deeper
+#    payload fields (Apple's status-byte bits, Samsung's aging counter/
+#    battery fields, FMDN's hashed-flags byte) -- see that file's header for
+#    why. This is enough to identify the protocol, not to decode e.g.
+#    battery level.
+#  - mesh_detect_targets.conf ships pre-populated with ~50 active + ~20
+#    commented-out OUI entries -- see that file's header for sourcing and
+#    the false-positive-risk tiering. It is NOT empty by default anymore
+#    (it was, in an earlier version of this payload, before real sourced
+#    data was found to seed it with).
 #  - Mesh-Detect's WiFi matcher (mesh_wifi_monitor.awk) matches the
 #    transmitter MAC of ANY management frame (beacon, probe request/response,
 #    etc.) against your OUI/MAC list, same as Esp32-oui-sniffer's WiFi Probe
@@ -116,8 +150,17 @@
 #    parsing) is likewise only unit-tested against synthetic packets and a
 #    synthetic config file, not run on-device yet -- same "ported and
 #    unit-tested, not field-confirmed" caveat applies.
+#  - rogue_tracker_monitor.awk has been checked against synthetic packets
+#    for all four protocols (positive match per protocol, two negative
+#    cases, and the packet-count emit-throttle) with gawk -- not yet against
+#    a real AirTag/Tile/SmartTag/FMDN accessory or on-device. Same "unit-
+#    tested, not field-confirmed" caveat as the WiFi detectors above.
 #  - BLE Extended/Long-Range advertising (Bluetooth 5) Remote ID is not
-#    decoded, only Legacy advertising -- covers the common case.
+#    decoded, only Legacy advertising -- covers the common case. Rogue
+#    tracker detection has the same gap: a tracker that only ever uses BT5
+#    extended advertising (not confirmed either way for any of the four
+#    protocols covered) would be invisible to hcidump's legacy-advertising
+#    capture the same way.
 #  - Still unverified: real-world timing/coverage against an actual
 #    Remote-ID-broadcasting drone, which wasn't available during development.
 #    Everything up to that point (wire formats, byte offsets, framing) has
@@ -162,14 +205,31 @@ BLE_HITS="$WORK_DIR/ble_rid_hits.log"
 WIFI_HITS="$WORK_DIR/wifi_rid_hits.log"
 FLOCK_WIFI_HITS="$WORK_DIR/flock_wifi_hits.log"
 MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS"
+TRACKER_HITS="$WORK_DIR/tracker_hits.log"
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS"
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
 WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
 FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
 MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO"
+TRACKER_FIFO="$WORK_DIR/tracker_raw.fifo"
+rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
+TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
+TRACKER_LOG_FILE="${LOOT_DIR}/rogue_trackers_${TIMESTAMP}.txt"
+echo "Rogue BLE tracker log started at $(date)" > "$TRACKER_LOG_FILE"
+# Persistence heuristic thresholds -- see handle_tracker_line() and this
+# file's KNOWN LIMITATIONS section on why these are time-window-based, not
+# GPS-based, and what that does and doesn't catch.
+TRACKER_PERSISTENCE_SECONDS=900      # 15 min -- how long a tracker must keep
+                                      # being seen before it's treated as
+                                      # "following", not "nearby once"
+TRACKER_PERSISTENCE_MIN_SIGHTINGS=3  # also require this many distinct hit
+                                      # lines (rogue_tracker_monitor.awk's own
+                                      # throttle already spaces these out)
+TRACKER_ALERT_COOLDOWN=300           # 5 min between repeat UI alerts for the
+                                      # same still-present tracker (loot log
+                                      # is never throttled)
 
 WIFI_IFACE="wlan1mon"
 # Channel hop set/order/dwell matches flock-you's own CUSTOM mode (main.cpp:
@@ -190,16 +250,19 @@ FLOCK_TCPDUMP_PID=""
 FLOCK_WIFI_MON_PID=""
 MESH_TCPDUMP_PID=""
 MESH_WIFI_MON_PID=""
+TRACKER_HCIDUMP_PID=""
+TRACKER_MON_PID=""
 WIFI_HOP_PID=""
 WIFI_IFACE_CREATED=0
 
 cleanup() {
     for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$TCPDUMP_PID" "$WIFI_MON_PID" \
              "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" \
-             "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" "$WIFI_HOP_PID"; do
+             "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" \
+             "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" "$WIFI_HOP_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO"
+    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -236,6 +299,24 @@ if [ -f "$MESH_CONFIG_FILE" ]; then
     fi
 fi
 
+# Loads tracker_allowlist.conf (mac: lines only) into an associative set --
+# MACs here are never counted as sightings at all, so they can't cross the
+# persistence threshold or trigger fmdn_unwanted's immediate alert either.
+declare -A TRACKER_ALLOWLIST=()
+load_tracker_allowlist() {
+    local raw
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        raw="${raw%%#*}"
+        raw="${raw#"${raw%%[![:space:]]*}"}"
+        raw="${raw%"${raw##*[![:space:]]}"}"
+        [ -z "$raw" ] && continue
+        case "$raw" in
+            [Mm][Aa][Cc]:*) TRACKER_ALLOWLIST["$(echo "${raw#*:}" | tr 'A-Z' 'a-z')"]=1 ;;
+        esac
+    done < "$TRACKER_ALLOWLIST_FILE"
+}
+[ -f "$TRACKER_ALLOWLIST_FILE" ] && load_tracker_allowlist
+
 # Cycles the shared monitor-mode radio through WIFI_CHANNELS forever. Backgrounded
 # only once a usable monitor interface is confirmed (see capability detection below).
 wifi_channel_hop() {
@@ -259,6 +340,7 @@ BLE_RID_OK=0
 WIFI_RID_OK=0
 FLOCK_WIFI_OK=0
 MESH_WIFI_OK=0
+TRACKER_BLE_OK=0
 
 LOG yellow "Counter-Surveillance-Pager started at $(date)"
 
@@ -302,6 +384,17 @@ if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$HCIDUMP" ]; then
     LOG green "Drone BLE detection: enabled (hcidump found)"
 elif [ "$AWK_FILES_OK" = "1" ]; then
     LOG red "Drone BLE detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
+fi
+
+# Own file-existence gate (like FLOCK_AWK_FILE_OK / MESH_AWK_FILE_OK above) --
+# a missing rogue_tracker_monitor.awk shouldn't take down drone BLE detection.
+if [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
+    TRACKER_BLE_OK=1
+    LOG green "Rogue tracker BLE detection: enabled (hcidump found)"
+elif [ ! -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
+    LOG red "Rogue tracker BLE detection: disabled (rogue_tracker_monitor.awk not found -- looked in $SCRIPT_DIR)"
+else
+    LOG red "Rogue tracker BLE detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
 fi
 
 if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP" ] && iw phy phy1 info >/dev/null 2>&1; then
@@ -358,6 +451,22 @@ if [ "$BLE_RID_OK" = "1" ]; then
     BLE_MON_PID=$!
 fi
 
+# Own hcidump process, same adapter, same reasoning as the WiFi detectors'
+# own tcpdump processes: rid_ble_monitor.awk's rules end in `next`, so this
+# isn't a 3rd -f on that pipeline. HCI monitor sockets support multiple
+# simultaneous readers, so this is a second passive listener, not a second
+# radio -- and like the drone BLE reader, it only sees advertisements during
+# whatever scan window Flock-You's own hcitool lescan cycle has open (hcidump
+# doesn't itself enable scanning).
+if [ "$TRACKER_BLE_OK" = "1" ]; then
+    mkfifo "$TRACKER_FIFO"
+    "$HCIDUMP" -i hci0 --raw > "$TRACKER_FIFO" 2>"$WORK_DIR/tracker_hcidump.log" &
+    TRACKER_HCIDUMP_PID=$!
+    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" \
+        < "$TRACKER_FIFO" >> "$TRACKER_HITS" 2>"$WORK_DIR/tracker_monitor.log" &
+    TRACKER_MON_PID=$!
+fi
+
 if [ "$WIFI_RID_OK" = "1" ]; then
     mkfifo "$WIFI_FIFO"
     # -l: line-buffer tcpdump's own text output so packets reach the awk
@@ -405,7 +514,7 @@ LOG green    "  Penguin"
 LOG magenta  "  Pigvision"
 LOG cyan     "  Other Flock (BLE name match or WiFi wildcard-probe/IE match)"
 LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
-LOG red      "  Drone Remote ID"
+LOG red      "  Drone Remote ID / Rogue BLE Tracker (both same color -- distinguished by alert text)"
 LOG "----------------------------------"
 
 DETECTIONS=0
@@ -418,6 +527,17 @@ BLE_HITS_OFFSET=0
 WIFI_HITS_OFFSET=0
 FLOCK_WIFI_HITS_OFFSET=0
 MESH_WIFI_HITS_OFFSET=0
+TRACKER_HITS_OFFSET=0
+
+# Per (mac|protocol) tracker state -- see handle_tracker_line(). Keyed on
+# the exact string rogue_tracker_monitor.awk emits as its 3rd field
+# (applefindmy/tile/smarttag/fmdn_normal/fmdn_unwanted), so Apple/Samsung/
+# Google's MAC rotation naturally starts a fresh persistence count under a
+# new key once the MAC changes -- there's no way around that without the
+# key-derivation access described in tracker_allowlist.conf's header.
+declare -A TRACKER_FIRST_SEEN
+declare -A TRACKER_SIGHTINGS
+declare -A TRACKER_LAST_ALERT
 
 # Case-insensitive "does haystack contain needle" without a subshell, since
 # this runs per BLE-scan-result per cycle and a $(...) fork per check adds up.
@@ -509,6 +629,67 @@ handle_mesh_wifi_line() {
         echo 0 > "${LED}/brightness" 2>/dev/null
     fi
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
+}
+
+# Human-readable label per rogue_tracker_monitor.awk protocol tag.
+tracker_protocol_label() {
+    case "$1" in
+        applefindmy)   echo "Apple Find My (AirTag or similar)" ;;
+        tile)          echo "Tile" ;;
+        smarttag)      echo "Samsung SmartTag" ;;
+        fmdn_normal)   echo "Google Find My Device Network" ;;
+        fmdn_unwanted) echo "Google Find My Device Network -- device itself flagged unwanted tracking" ;;
+        *)             echo "$1" ;;
+    esac
+}
+
+# Parse one "ble_tracker|MAC|protocol|detail" line from
+# rogue_tracker_monitor.awk. Every non-allowlisted sighting is logged
+# (loot is never throttled, matching every other detector here), but the
+# LED/vibrate/RINGTONE alert only fires once the persistence threshold is
+# crossed (or immediately for fmdn_unwanted, which is the device itself
+# self-reporting) -- see this file's KNOWN LIMITATIONS on what that
+# heuristic does and doesn't catch, and TRACKER_PERSISTENCE_* above for the
+# thresholds.
+handle_tracker_line() {
+    local line="$1"
+    local src mac protocol detail
+    IFS='|' read -r src mac protocol detail <<< "$line"
+    [ -z "$mac" ] && return
+
+    local mac_lc="${mac,,}"
+    [ -n "${TRACKER_ALLOWLIST[$mac_lc]:-}" ] && return
+
+    local key="${mac}|${protocol}"
+    local now
+    now=$(date +%s)
+    [ -z "${TRACKER_FIRST_SEEN[$key]:-}" ] && TRACKER_FIRST_SEEN[$key]=$now
+    TRACKER_SIGHTINGS[$key]=$(( ${TRACKER_SIGHTINGS[$key]:-0} + 1 ))
+
+    local label
+    label=$(tracker_protocol_label "$protocol")
+    echo "$(date '+%H:%M:%S') | $mac | $label | sighting=${TRACKER_SIGHTINGS[$key]} | $detail" >> "$TRACKER_LOG_FILE"
+
+    local age=$(( now - TRACKER_FIRST_SEEN[$key] ))
+    local eligible=0
+    if [ "$protocol" = "fmdn_unwanted" ]; then
+        eligible=1
+    elif [ "$age" -ge "$TRACKER_PERSISTENCE_SECONDS" ] && [ "${TRACKER_SIGHTINGS[$key]}" -ge "$TRACKER_PERSISTENCE_MIN_SIGHTINGS" ]; then
+        eligible=1
+    fi
+    [ "$eligible" = "0" ] && return
+
+    local last="${TRACKER_LAST_ALERT[$key]:-0}"
+    [ $((now - last)) -lt "$TRACKER_ALERT_COOLDOWN" ] && return
+    TRACKER_LAST_ALERT[$key]=$now
+
+    local minutes=$(( age / 60 ))
+    LOG red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
+    LED RED
+    RINGTONE warning
+    ALERT_RINGTONE "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
+    LED OFF
+    DETECTIONS=$((DETECTIONS + 1))
 }
 
 # Parse one "SRC|MAC|MSG_TYPE|k=v;k=v;..." line and LOG/alert/loot it.
@@ -670,6 +851,17 @@ while true; do
                 [ -n "$line" ] && handle_mesh_wifi_line "$line"
             done < <(tail -c "+$((MESH_WIFI_HITS_OFFSET + 1))" "$MESH_WIFI_HITS")
             MESH_WIFI_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Rogue BLE tracker: drain whatever rogue_tracker_monitor.awk found ---
+    if [ "$TRACKER_BLE_OK" = "1" ]; then
+        NEW_SIZE=$(wc -c < "$TRACKER_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$TRACKER_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_tracker_line "$line"
+            done < <(tail -c "+$((TRACKER_HITS_OFFSET + 1))" "$TRACKER_HITS")
+            TRACKER_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 
