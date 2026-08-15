@@ -2,23 +2,27 @@
 
 ## Credit
 
-All three detection concepts this payload combines originate with **[colonelpanichacks (Colonel Panic)](https://github.com/colonelpanichacks)**:
+All detection concepts this payload combines originate with **[colonelpanichacks (Colonel Panic)](https://github.com/colonelpanichacks)**:
 
 - **[Flock-You / flock-you](https://github.com/colonelpanichacks/flock-you)** ([Flock_Detect on the official Pager payload repo](https://github.com/hak5/wifipineapplepager-payloads/tree/master/library/user/reconnaissance/Flock_Detect)) -- the BLE scan loop and Flock Safety BLE-name detection logic in this payload are taken from here **unmodified**. The **WiFi** Flock detection (`flock_wifi_monitor.awk`) is a **port**, not a copy: flock-you's `main.cpp` moved its primary detection method to WiFi (OUI-gated wildcard-SSID Probe Request + an exact IE-fingerprint match, replacing the OUI-only checks it started with) some time after this payload's BLE-only detector was originally written, and that BLE-only path alone was found in practice to miss at least one real camera. `flock_wifi_monitor.awk` ports that current WiFi method -- the 31-entry OUI list, the wildcard-probe check, and the `FLOCK_PROBE_IE_SIG_PRIMARY` fingerprint -- onto this device's `tcpdump`/awk stack, including the same 11/6/1 channel-hop flock-you uses (credited there to nsm_barri's observation on the cameras' hop timing). See `flock_wifi_monitor.awk`'s header for exactly what was ported and what upstream ESP32-driver-specific workarounds were deliberately left out.
 - **[Sky-Spy](https://github.com/colonelpanichacks/Sky-Spy)** -- the drone Remote ID detection *approach* this payload ports comes from here. Sky-Spy itself is ESP32 firmware with no Linux build, so the port is a from-scratch reimplementation of that same detection concept against the ASTM F3411 spec, for the Pager's own Linux BLE/WiFi stack.
+- **[mesh-detect](https://github.com/colonelpanichacks/mesh-detect) / [Esp32-oui-sniffer](https://github.com/colonelpanichacks/Esp32-oui-sniffer)** -- the generic BLE-name / OUI-prefix / full-MAC surveillance-device matching *methods* this payload's Mesh-Detect matcher ports (`mesh_wifi_monitor.awk` + the BLE matching pass in `payload.sh`). mesh-detect is itself an index repo pointing at several ESP32 firmwares; Esp32-oui-sniffer is the one whose three detection methods (OUI prefix, full MAC, BLE name substring) got ported here. **Not ported**: mesh-detect's Meshtastic LoRa alert relay (needs a physical LoRa radio wired to the device, which the Pager doesn't have) and any baked-in OUI list -- Esp32-oui-sniffer itself has none (targets are configured live through its web UI), and the "privacy" fork reported to have one baked in, `lukeswitz/esp32-oui-sniffer`, no longer exists as of this writing. See `mesh_detect_targets.conf`'s header.
 
-All credit for the underlying detection concepts and the original Flock-You code belongs to Colonel Panic. This repo is a derivative work combining his projects into one payload for a device (the Pager) that neither Sky-Spy nor flock-you's current WiFi method natively run on.
+All credit for the underlying detection concepts and the original Flock-You code belongs to Colonel Panic. This repo is a derivative work combining his projects into one payload for a device (the Pager) that none of Sky-Spy, flock-you's current WiFi method, or Esp32-oui-sniffer natively run on.
 
 ## What this is
 
-Combines two detectors into one Pager payload:
+Combines three detectors into one Pager payload:
 
 - **Flock Safety detection**, two independent paths sharing one dedup/alert pipeline:
   - **BLE name scan** -- taken verbatim from Flock-You / Flock_Detect. Unmodified scan loop, unmodified alert logic.
   - **WiFi wildcard-probe + IE signature** -- a port of flock-you's current (and, per its own commit history, more reliable) WiFi detection method. See Credit above and `flock_wifi_monitor.awk`.
+- **Mesh-Detect surveillance watchlist**, two independent paths, config-driven via `mesh_detect_targets.conf` (ships empty -- see that file):
+  - **BLE**: OUI prefix / full MAC / device-name substring match against `hcitool lescan` results (reuses the Flock BLE scan's own output rather than running a second scan).
+  - **WiFi**: OUI prefix / full MAC match against the transmitter of any 802.11 management frame. See `mesh_wifi_monitor.awk`.
 - **Drone Remote ID detection** -- a from-scratch Linux port of what Sky-Spy does on ESP32, reimplementing its detection logic directly against the ASTM F3411 / Open Drone ID spec for the Pager's own BLE and WiFi radios, using `hcidump` and `iw`/`tcpdump` instead of ESP-IDF.
 
-Both WiFi detectors (Flock probe + drone Remote ID) now share one radio hopping channels 11/6/1 (250ms dwell) instead of drone detection's old fixed channel 6 -- see Known limitations.
+All three WiFi detectors (Flock probe + Mesh-Detect + drone Remote ID) share one radio hopping channels 11/6/1 (250ms dwell) instead of drone detection's old fixed channel 6 -- see Known limitations.
 
 ## Why this needed real engineering, not a copy-paste
 
@@ -52,22 +56,29 @@ None of this required guessing at busybox-awk-specific behavior blind -- every p
 | `rid_ble_monitor.awk` | Reads `hcidump --raw`'s text output, reassembles HCI Event packets from its line-wrapped hex format, extracts LE Advertising Report events, looks for the Remote ID Service Data AD structure. |
 | `rid_wifi_monitor.awk` | Reads `tcpdump -xx`'s text output, reassembles per-packet hex bytes, strips the radiotap header, looks for the Remote ID vendor IE (Beacon method) or NAN Service Descriptor attribute (NAN method). |
 | `flock_wifi_monitor.awk` | Its own `tcpdump -xx` reader on the same interface (see its header for why it's not a 3rd `-f` on `rid_wifi_monitor.awk`). Ports flock-you's current WiFi detection: OUI-gated wildcard-SSID Probe Request, exact match against `FLOCK_PROBE_IE_SIG_PRIMARY`. |
+| `mesh_wifi_monitor.awk` | Its own `tcpdump -xx` reader (same reasoning as `flock_wifi_monitor.awk`). Loads `mesh_detect_targets.conf` at startup via `-v CONFIG_FILE=...`; matches the transmitter MAC of any WiFi management frame against its oui:/mac: entries. |
+| `mesh_detect_targets.conf` | Plain-text OUI/MAC/name watchlist for Mesh-Detect, read by both `mesh_wifi_monitor.awk` (oui:/mac:) and `payload.sh`'s BLE matching pass (oui:/mac:/name:). Ships empty -- see its header for format and why. |
 
 ## Requirements per detector (each degrades independently)
 
 - **Flock BLE** (unchanged from Flock-You): `hciconfig`, `hcitool` -- if these were on your Pager before, nothing changes here.
 - **Flock WiFi**: + `awk`, `iw`, `tcpdump`, and a usable second radio (`phy1`) -- same prerequisite as Drone WiFi below, and shares that radio/channel-hop with it.
+- **Mesh-Detect BLE**: none beyond Flock BLE above (reuses its `hcitool lescan` output) -- but is a no-op until `mesh_detect_targets.conf` has an `oui:`/`mac:`/`name:` entry.
+- **Mesh-Detect WiFi**: same as Flock WiFi (`awk`, `iw`, `tcpdump`, `phy1`) -- no-op until the config has an `oui:`/`mac:` entry (`name:` is BLE-only).
 - **Drone BLE**: + `awk`, `hcidump`. Both confirmed present on this device.
 - **Drone WiFi**: + `awk`, `iw`, `tcpdump`, and a usable second radio (`phy1`). Confirmed on this device: `phy1` exists and accepts `iw phy phy1 interface add wlan1mon type monitor`, and a real capture was taken from it successfully.
 
 ## Known limitations (by design, not oversights)
 
 - **Drone BLE detection is not continuous.** It piggybacks on Flock-You's own `hcitool lescan` windows (~12 of every ~15 seconds) rather than running a separate scan, so it inherits that duty cycle. Continuous BLE scanning independent of the Flock cycle would need its own `hcitool lescan`/`bluetoothctl` session, which risks fighting the Flock scan for the single BLE radio -- left as a follow-up if the merged duty cycle proves insufficient in practice.
-- **Both WiFi detectors now hop channels 11/6/1** (250ms dwell, matching flock-you's own hop set/order/timing) instead of drone detection's old fixed channel 6. A drone or camera transmitting only on 5GHz, or on a 2.4GHz channel outside 11/6/1, will still be missed.
+- **All three WiFi detectors now hop channels 11/6/1** (250ms dwell, matching flock-you's own hop set/order/timing) instead of drone detection's old fixed channel 6. A drone, camera, or Mesh-Detect target transmitting only on 5GHz, or on a 2.4GHz channel outside 11/6/1, will still be missed.
 - **`flock_wifi_monitor.awk`'s detection logic is unit-tested, not field-confirmed.** Its tcpdump/radiotap framing reuses the byte offsets already hardware-verified for `rid_wifi_monitor.awk`, and its OUI/wildcard/IE-signature logic has been checked against synthetic packets built to exactly match flock-you's own published fingerprint constant -- but not yet against a real camera's actual RF. If a real camera's IE signature has drifted from that constant (which is plausible -- flock-you's own commit history shows the fingerprint approach superseding an earlier OUI-only method, implying the on-air signature isn't fixed forever), this will miss it the same way the unmodified BLE path apparently already can.
+- **`mesh_detect_targets.conf` ships EMPTY on purpose.** Both Mesh-Detect paths (BLE and WiFi) are no-ops until you add `oui:`/`mac:`/`name:` entries yourself. This mirrors upstream Esp32-oui-sniffer, which also has no default list -- see the file's header and Credit above for why there's no baked-in list to pre-populate it with.
+- **Mesh-Detect's WiFi matcher is intentionally broad**, matching any management frame (beacon, probe request/response, etc.) from a listed OUI/MAC -- not gated to a specific frame subtype or signature the way the Flock WiFi detector is. That's the point of a general watchlist, but it also means a common OUI (e.g. a big manufacturer's prefix) will alert on unrelated devices sharing it -- keep entries as specific as practical.
+- **`mesh_wifi_monitor.awk`'s logic is unit-tested only** (synthetic packets + a synthetic config file, off-device with `gawk`), same "ported, not field-confirmed" caveat as `flock_wifi_monitor.awk`.
 - **BLE Extended/Long-Range advertising (Bluetooth 5) is not decoded** -- only Legacy advertising (the common case for consumer drones).
 - **Auth messages are identified but not decoded** (their content isn't useful for a recon alert).
-- UI alerts are cooldown-throttled per MAC (10s, `ALERT_COOLDOWN` in `payload.sh`) for drone Remote ID, and deduplicated once per session per MAC for both Flock paths (BLE and WiFi), since repeat detections of the same camera/drone would otherwise spam the console. The loot logs are **never** throttled -- every decoded message/hit is recorded.
+- UI alerts are cooldown-throttled per MAC (10s, `ALERT_COOLDOWN` in `payload.sh`) for drone Remote ID, and deduplicated once per session per MAC for both Flock paths and both Mesh-Detect paths, since repeat detections of the same device would otherwise spam the console. The loot logs are **never** throttled -- every decoded message/hit is recorded.
 
 ## Confirmed live on hardware
 
@@ -77,10 +88,12 @@ Beyond the local decoder testing described above, on the actual Pager:
 - A synthetic hit line appended directly to the WiFi hits file while the payload was running was picked up on the very next drain cycle and produced a correct on-screen `DRONE REMOTE ID` alert (title, MAC, decoded UAS ID, and transport all correct) -- confirming the full chain end to end: capture -> awk decode -> bash hit parsing -> cooldown/dedup -> `LOG`/`LED`/`RINGTONE`/`ALERT_RINGTONE`.
 - Flock Safety **BLE** detection is the original, untouched Flock-You code path, so it carries the same confidence as upstream.
 - Flock Safety **WiFi** detection (`flock_wifi_monitor.awk`) has been checked with `gawk` against synthetic packets (matching OUI + wildcard SSID + exact IE signature; wrong-OUI; directed/non-wildcard probe) to confirm it fires exactly when it should and stays silent otherwise -- **not yet run on the actual Pager hardware or against real captured traffic.**
+- **Mesh-Detect** (`mesh_wifi_monitor.awk` + the BLE matching pass in `payload.sh`) has been checked the same way: synthetic WiFi packets against a synthetic config (OUI match, full-MAC match, no-match, empty-config-is-a-no-op) with `gawk`, and the bash-side config loader / OUI / MAC / case-insensitive name matching tested standalone -- all correct. **Not yet run on the actual Pager hardware.**
 
 ## What's genuinely still unverified
 
 - Real-world timing and coverage against an actual Remote-ID-broadcasting drone, or a real Flock Safety camera -- neither was available during development of the original drone-RID work.
-- The new WiFi Flock detector specifically: it hasn't been run on-device yet (only syntax/logic-tested off-device with `gawk`), and even once it runs cleanly there, whether a real camera's current on-air IE signature still matches `FLOCK_PROBE_IE_SIG_PRIMARY` is unconfirmed. If BLE detection alone missed a known camera, checking the WiFi path against that same camera (`tail -f` the loot dir, or watch for `wifi_flock|` lines in `flock_wifi_hits.log` under `/tmp/flock_sky_spy/`) is the natural next test.
+- The WiFi Flock detector specifically: it hasn't been run on-device yet (only syntax/logic-tested off-device with `gawk`), and even once it runs cleanly there, whether a real camera's current on-air IE signature still matches `FLOCK_PROBE_IE_SIG_PRIMARY` is unconfirmed. If BLE detection alone missed a known camera, checking the WiFi path against that same camera (`tail -f` the loot dir, or watch for `wifi_flock|` lines in `flock_wifi_hits.log` under `/tmp/flock_sky_spy/`) is the natural next test.
+- Mesh-Detect, entirely: it hasn't run on-device yet, and it has no targets configured out of the box -- add entries to `mesh_detect_targets.conf` and watch for `wifi_mesh|` lines in `mesh_wifi_hits.log` (or the on-screen "Mesh-Detect" alerts) as the first real test.
 
-Loot: `/root/loot/flock_sky_spy/flock_you_<ts>.txt` (Flock hits, same format as upstream) and `/root/loot/flock_sky_spy/drone_rid_<ts>.txt` (every decoded drone message: time, transport, MAC, message type, fields).
+Loot: `/root/loot/flock_sky_spy/flock_you_<ts>.txt` (Flock + Mesh-Detect hits, same format as upstream) and `/root/loot/flock_sky_spy/drone_rid_<ts>.txt` (every decoded drone message: time, transport, MAC, message type, fields).

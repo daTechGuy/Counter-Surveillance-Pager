@@ -6,13 +6,18 @@
 #              wildcard-SSID Probe Request + IE fingerprint, with the same
 #              11/6/1 channel hop flock-you uses), since flock-you's main
 #              branch moved to WiFi as its primary detection path and the
-#              BLE name scan alone was found to miss cameras -- combined with
-#              an Open Drone ID (ASTM F3411) detector covering all three
-#              broadcast transports: BLE legacy advertising, WiFi Beacon, and
-#              WiFi NAN -- ported from the Sky-Spy ESP32 firmware's detection
-#              approach onto the Pager's Linux BLE/WiFi stack, since no
-#              Linux/bash build of Sky-Spy exists upstream.
-# Credit: All three detection concepts this payload combines originate with
+#              BLE name scan alone was found to miss cameras -- PLUS a
+#              generalized BLE+WiFi OUI/MAC/name surveillance-device matcher
+#              modeled on Esp32-oui-sniffer (part of the mesh-detect hardware
+#              family), config-driven via mesh_detect_targets.conf since that
+#              firmware's target list is itself user-configured (there's no
+#              baked-in list to port) -- combined with an Open Drone ID
+#              (ASTM F3411) detector covering all three broadcast transports:
+#              BLE legacy advertising, WiFi Beacon, and WiFi NAN -- ported
+#              from the Sky-Spy ESP32 firmware's detection approach onto the
+#              Pager's Linux BLE/WiFi stack, since no Linux/bash build of
+#              Sky-Spy exists upstream.
+# Credit: All detection concepts this payload combines originate with
 #   colonelpanichacks (Colonel Panic):
 #   - Flock-You (https://github.com/colonelpanichacks/flock-you) -- the BLE
 #     scan loop and name-match logic (unmodified), and the WiFi OUI list /
@@ -24,6 +29,16 @@
 #     ESP32 firmware with no Linux build, so the port is a from-scratch
 #     reimplementation against the ASTM F3411 spec -- see rid_common.awk for
 #     exactly what was reimplemented and why.
+#   - mesh-detect / Esp32-oui-sniffer (https://github.com/colonelpanichacks/mesh-detect,
+#     https://github.com/colonelpanichacks/Esp32-oui-sniffer) -- the
+#     BLE-name / OUI-prefix / full-MAC surveillance-device detection
+#     *methods* this payload's generic matcher ports (see
+#     mesh_wifi_monitor.awk and mesh_detect_targets.conf headers). NOT
+#     ported: mesh-detect's Meshtastic LoRa alert relay (needs LoRa hardware
+#     this device doesn't have) and its baked-in OUI list (the upstream
+#     "privacy" fork that reportedly had one, lukeswitz/esp32-oui-sniffer,
+#     no longer exists -- this payload's target list ships empty, same as
+#     upstream Esp32-oui-sniffer's own default).
 #   All credit for the underlying detection concepts and the original
 #   Flock-You code belongs to Colonel Panic; this payload is a derivative work.
 # Original Flock-You Contributors: colonelpanichacks, Claude (Anthropic), Grok (xAI), Brandon Starkweather
@@ -31,20 +46,20 @@
 #   opendroneid/opendroneid-core-c, opendroneid/transmitter-linux
 # Category: Reconnaissance
 #
-# The Remote ID decoders and the WiFi Flock detector are plain POSIX-ish awk
-# (rid_common.awk + rid_ble_monitor.awk + rid_wifi_monitor.awk +
-# flock_wifi_monitor.awk), not python3: this device (mipsel_24kc / ramips,
-# 30M flash) has no python3 in its opkg feeds at all, confirmed live against
-# the actual hardware -- awk was confirmed present with the specific
-# functions needed (index/substr/toupper/sprintf/fflush).
+# The Remote ID decoders and the WiFi Flock/mesh detectors are plain
+# POSIX-ish awk (rid_common.awk + rid_ble_monitor.awk + rid_wifi_monitor.awk
+# + flock_wifi_monitor.awk + mesh_wifi_monitor.awk), not python3: this
+# device (mipsel_24kc / ramips, 30M flash) has no python3 in its opkg feeds
+# at all, confirmed live against the actual hardware -- awk was confirmed
+# present with the specific functions needed
+# (index/substr/toupper/sprintf/fflush/getline-from-file).
 # The Remote ID awk parsers were verified against this exact device's real
 # hcidump 5.72 / tcpdump 4.99.5 text-output formats, including hand-decoding
 # a real capture byte-by-byte to confirm the framing, before being wired in
-# here. flock_wifi_monitor.awk reuses that same verified tcpdump -xx framing;
-# its detection logic itself (OUI list, wildcard/IE-signature check) was
-# validated against synthetic packets built to match flock-you's own
-# FLOCK_PROBE_IE_SIG_PRIMARY constant, not yet against a real camera capture
-# -- see KNOWN LIMITATIONS.
+# here. flock_wifi_monitor.awk and mesh_wifi_monitor.awk reuse that same
+# verified tcpdump -xx framing; their detection logic itself was validated
+# against synthetic packets (matching + non-matching cases for each), not
+# yet against real camera/device captures -- see KNOWN LIMITATIONS.
 #
 # ============================================================================
 # REQUIRES, PER DETECTOR (each is independently optional -- missing tools
@@ -53,6 +68,12 @@
 #   Flock BLE scan    : hciconfig, hcitool               (stock on Flock-You)
 #   Flock WiFi scan    : + awk, iw, tcpdump, a second radio (phy1) -- shares
 #                        its capture radio/channel-hop with Drone WiFi scan
+#   Mesh-Detect BLE scan: none beyond Flock BLE scan above -- reuses its
+#                        hcitool lescan output, only runs once
+#                        mesh_detect_targets.conf has an oui:/mac:/name: entry
+#   Mesh-Detect WiFi scan: + awk, iw, tcpdump, a second radio (phy1) -- same
+#                        shared radio/channel-hop, only runs once
+#                        mesh_detect_targets.conf has an oui:/mac: entry
 #   Drone BLE scan    : + awk, hcidump
 #   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1)
 # ============================================================================
@@ -61,11 +82,24 @@
 #  - Drone BLE detection only sees advertisements during Flock-You's own
 #    ~12-of-15s hcitool lescan windows (it piggybacks on that scan rather
 #    than running a separate one) -- NOT continuous like the ESP32 Sky-Spy.
-#  - Both WiFi detectors (Flock probe + drone Remote ID) now share one
-#    hopped radio (channels 11/6/1, 250ms dwell, matching flock-you's own
-#    CUSTOM hop set) instead of drone detection's old fixed channel 6. A
-#    drone beaconing Remote ID only on 5GHz, or on a 2.4GHz channel outside
-#    11/6/1, will still be missed.
+#  - All three WiFi detectors (Flock probe + Mesh-Detect + drone Remote ID)
+#    now share one hopped radio (channels 11/6/1, 250ms dwell, matching
+#    flock-you's own CUSTOM hop set) instead of drone detection's old fixed
+#    channel 6. A drone beaconing Remote ID only on 5GHz, or on a 2.4GHz
+#    channel outside 11/6/1, will still be missed -- same for a Mesh-Detect
+#    target whose beacon/probe traffic never lands on one of those channels.
+#  - mesh_detect_targets.conf ships EMPTY. Both Mesh-Detect detectors (BLE
+#    and WiFi) are no-ops until you add oui:/mac:/name: entries yourself --
+#    see that file's header. This is intentional, not a bug: upstream
+#    Esp32-oui-sniffer has no default list either (it's genuinely
+#    user-configured via its web UI), and the "privacy" fork that reportedly
+#    baked one in is a dead link as of this writing.
+#  - Mesh-Detect's WiFi matcher (mesh_wifi_monitor.awk) matches the
+#    transmitter MAC of ANY management frame (beacon, probe request/response,
+#    etc.) against your OUI/MAC list, same as Esp32-oui-sniffer's WiFi Probe
+#    method -- broader and noisier than the Flock detector's tightly-gated
+#    wildcard-probe+IE check, by design: it's a general OUI/MAC watchlist,
+#    not a single-vendor fingerprint.
 #  - flock_wifi_monitor.awk's detection logic (OUI match, wildcard-probe
 #    check, IE-signature match) has been verified against synthetic packets
 #    built to flock-you's own documented signature, and its tcpdump-framing
@@ -77,6 +111,10 @@
 #    at least once upstream), this will silently miss it the same way the
 #    unmodified BLE path can. Treat this as "ported and unit-tested," not
 #    "field-confirmed."
+#  - mesh_wifi_monitor.awk's matching logic (OUI/MAC lookup, config-file
+#    parsing) is likewise only unit-tested against synthetic packets and a
+#    synthetic config file, not run on-device yet -- same "ported and
+#    unit-tested, not field-confirmed" caveat applies.
 #  - BLE Extended/Long-Range advertising (Bluetooth 5) Remote ID is not
 #    decoded, only Legacy advertising -- covers the common case.
 #  - Still unverified: real-world timing/coverage against an actual
@@ -119,11 +157,15 @@ echo "Drone Remote ID log started at $(date)" > "$DRONE_LOG_FILE"
 BLE_HITS="$WORK_DIR/ble_rid_hits.log"
 WIFI_HITS="$WORK_DIR/wifi_rid_hits.log"
 FLOCK_WIFI_HITS="$WORK_DIR/flock_wifi_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS"
+MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS"
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
 WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
 FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO"
+MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
+rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO"
+
+MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 
 WIFI_IFACE="wlan1mon"
 # Channel hop set/order/dwell matches flock-you's own CUSTOM mode (main.cpp:
@@ -142,20 +184,53 @@ TCPDUMP_PID=""
 WIFI_MON_PID=""
 FLOCK_TCPDUMP_PID=""
 FLOCK_WIFI_MON_PID=""
+MESH_TCPDUMP_PID=""
+MESH_WIFI_MON_PID=""
 WIFI_HOP_PID=""
 WIFI_IFACE_CREATED=0
 
 cleanup() {
     for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$TCPDUMP_PID" "$WIFI_MON_PID" \
-             "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" "$WIFI_HOP_PID"; do
+             "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" \
+             "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" "$WIFI_HOP_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO"
+    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
 }
 trap cleanup EXIT INT TERM
+
+# Loads mesh_detect_targets.conf into three bash arrays for the BLE matching
+# pass below (see handle_ble_line in the main loop). The WiFi matcher
+# (mesh_wifi_monitor.awk) parses the same file itself, independently -- kept
+# duplicated rather than shared, since one's bash and the other's awk and
+# there's no clean way to pass parsed arrays between them.
+declare -a MESH_OUI_TARGETS=()
+declare -a MESH_MAC_TARGETS=()
+declare -a MESH_NAME_TARGETS=()
+load_mesh_targets() {
+    local raw
+    while IFS= read -r raw || [ -n "$raw" ]; do
+        raw="${raw%%#*}"                                  # strip comments
+        raw="${raw#"${raw%%[![:space:]]*}"}"               # trim leading ws
+        raw="${raw%"${raw##*[![:space:]]}"}"               # trim trailing ws
+        [ -z "$raw" ] && continue
+        case "$raw" in
+            [Oo][Uu][Ii]:*) MESH_OUI_TARGETS+=("$(echo "${raw#*:}" | tr 'A-Z' 'a-z')") ;;
+            [Mm][Aa][Cc]:*) MESH_MAC_TARGETS+=("$(echo "${raw#*:}" | tr 'A-Z' 'a-z')") ;;
+            [Nn][Aa][Mm][Ee]:*) MESH_NAME_TARGETS+=("${raw#*:}") ;;
+        esac
+    done < "$MESH_CONFIG_FILE"
+}
+MESH_BLE_OK=0
+if [ -f "$MESH_CONFIG_FILE" ]; then
+    load_mesh_targets
+    if [ ${#MESH_OUI_TARGETS[@]} -gt 0 ] || [ ${#MESH_MAC_TARGETS[@]} -gt 0 ] || [ ${#MESH_NAME_TARGETS[@]} -gt 0 ]; then
+        MESH_BLE_OK=1
+    fi
+fi
 
 # Cycles the shared monitor-mode radio through WIFI_CHANNELS forever. Backgrounded
 # only once a usable monitor interface is confirmed (see capability detection below).
@@ -179,6 +254,7 @@ IW=$(command -v iw)
 BLE_RID_OK=0
 WIFI_RID_OK=0
 FLOCK_WIFI_OK=0
+MESH_WIFI_OK=0
 
 LOG yellow "Flock-Sky-Spy started at $(date)"
 
@@ -199,6 +275,24 @@ if [ ! -f "$SCRIPT_DIR/flock_wifi_monitor.awk" ]; then
     FLOCK_AWK_FILE_OK=0
 fi
 
+# Same idea for Mesh-Detect's WiFi matcher: file presence is one gate, but it
+# also only makes sense to run if the config actually has an oui:/mac: entry
+# (name: entries are BLE-only, see mesh_detect_targets.conf's header).
+MESH_AWK_FILE_OK=1
+if [ ! -f "$SCRIPT_DIR/mesh_wifi_monitor.awk" ]; then
+    LOG red "Mesh-Detect WiFi detection: disabled (mesh_wifi_monitor.awk not found -- looked in $SCRIPT_DIR)"
+    MESH_AWK_FILE_OK=0
+fi
+MESH_WIFI_TARGETS_PRESENT=0
+if [ ${#MESH_OUI_TARGETS[@]} -gt 0 ] || [ ${#MESH_MAC_TARGETS[@]} -gt 0 ]; then
+    MESH_WIFI_TARGETS_PRESENT=1
+fi
+if [ "$MESH_BLE_OK" = "1" ]; then
+    LOG green "Mesh-Detect BLE detection: enabled (${#MESH_OUI_TARGETS[@]} oui, ${#MESH_MAC_TARGETS[@]} mac, ${#MESH_NAME_TARGETS[@]} name target(s))"
+else
+    LOG yellow "Mesh-Detect BLE detection: no-op (mesh_detect_targets.conf has no oui:/mac:/name: entries yet)"
+fi
+
 if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$HCIDUMP" ]; then
     BLE_RID_OK=1
     LOG green "Drone BLE detection: enabled (hcidump found)"
@@ -214,7 +308,7 @@ if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP"
     fi
     if iw dev "$WIFI_IFACE" info >/dev/null 2>&1; then
         ip link set "$WIFI_IFACE" up 2>>"$LOG_FILE"
-        iw dev "$WIFI_IFACE" set channel "$(echo $WIFI_CHANNELS | cut -d' ' -f1)" 2>>"$LOG_FILE"
+        iw dev "$WIFI_IFACE" set channel "${WIFI_CHANNELS%% *}" 2>>"$LOG_FILE"
         WIFI_RID_OK=1
         LOG green "Drone WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
         wifi_channel_hop &
@@ -223,6 +317,12 @@ if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP"
             FLOCK_WIFI_OK=1
             LOG green "Flock WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
         fi
+        if [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ]; then
+            MESH_WIFI_OK=1
+            LOG green "Mesh-Detect WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
+        elif [ "$MESH_AWK_FILE_OK" = "1" ]; then
+            LOG yellow "Mesh-Detect WiFi detection: no-op (mesh_detect_targets.conf has no oui:/mac: entries yet)"
+        fi
     fi
 fi
 if [ "$WIFI_RID_OK" = "0" ] && [ "$AWK_FILES_OK" = "1" ]; then
@@ -230,6 +330,9 @@ if [ "$WIFI_RID_OK" = "0" ] && [ "$AWK_FILES_OK" = "1" ]; then
 fi
 if [ "$FLOCK_WIFI_OK" = "0" ] && [ "$FLOCK_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
     LOG red "Flock WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
+fi
+if [ "$MESH_WIFI_OK" = "0" ] && [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
+    LOG red "Mesh-Detect WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -280,11 +383,24 @@ if [ "$FLOCK_WIFI_OK" = "1" ]; then
     FLOCK_WIFI_MON_PID=$!
 fi
 
+# Same reasoning as the Flock WiFi pipeline above: its own tcpdump process
+# rather than a 4th -f alongside rid_wifi_monitor.awk / flock_wifi_monitor.awk.
+if [ "$MESH_WIFI_OK" = "1" ]; then
+    mkfifo "$MESH_WIFI_FIFO"
+    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$MESH_WIFI_FIFO" 2>"$WORK_DIR/mesh_tcpdump.log" &
+    MESH_TCPDUMP_PID=$!
+    "$AWK" -v CONFIG_FILE="$MESH_CONFIG_FILE" \
+        -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/mesh_wifi_monitor.awk" \
+        < "$MESH_WIFI_FIFO" >> "$MESH_WIFI_HITS" 2>"$WORK_DIR/mesh_wifi_monitor.log" &
+    MESH_WIFI_MON_PID=$!
+fi
+
 LOG "Color key:"
 LOG yellow   "  FS Ext Battery"
 LOG green    "  Penguin"
 LOG magenta  "  Pigvision"
 LOG cyan     "  Other Flock (BLE name match or WiFi wildcard-probe/IE match)"
+LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
 LOG red      "  Drone Remote ID"
 LOG "----------------------------------"
 
@@ -297,6 +413,35 @@ declare -A DRONE_KNOWN
 BLE_HITS_OFFSET=0
 WIFI_HITS_OFFSET=0
 FLOCK_WIFI_HITS_OFFSET=0
+MESH_WIFI_HITS_OFFSET=0
+
+# Case-insensitive "does haystack contain needle" without a subshell, since
+# this runs per BLE-scan-result per cycle and a $(...) fork per check adds up.
+mesh_contains_ci() {
+    local haystack_lc="${1,,}" needle_lc="${2,,}"
+    case "$haystack_lc" in
+        *"$needle_lc"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Checks one "MAC NAME" BLE scan result against mesh_detect_targets.conf's
+# oui:/mac:/name: lists (already loaded into the MESH_*_TARGETS arrays by
+# load_mesh_targets at startup). Echoes "oui:x" / "mac:x" / "name:x" for the
+# first match, or nothing.
+mesh_ble_match() {
+    local mac_lc="${1,,}" name="$2" t
+    for t in "${MESH_MAC_TARGETS[@]}"; do
+        [ "$mac_lc" = "$t" ] && { echo "mac:$t"; return; }
+    done
+    local oui_lc="${mac_lc:0:8}"   # "xx:xx:xx"
+    for t in "${MESH_OUI_TARGETS[@]}"; do
+        [ "$oui_lc" = "$t" ] && { echo "oui:$t"; return; }
+    done
+    for t in "${MESH_NAME_TARGETS[@]}"; do
+        if mesh_contains_ci "$name" "$t"; then echo "name:$t"; return; fi
+    done
+}
 
 # Parse one "wifi_flock|MAC|wildcard_probe_ie_sig|oui=xx:xx:xx" line from
 # flock_wifi_monitor.awk and LOG/loot/vibrate it -- same session-lifetime
@@ -328,6 +473,38 @@ handle_flock_wifi_line() {
         echo 0 > "${LED}/brightness" 2>/dev/null
     fi
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"
+}
+
+# Parse one "wifi_mesh|MAC|oui:x" or "wifi_mesh|MAC|mac:x" line from
+# mesh_wifi_monitor.awk and LOG/loot/vibrate it. Same session dedup pattern
+# as the other detectors, keyed separately (WIFI_MESH) so it doesn't collide
+# with a Flock or drone hit on the same MAC.
+handle_mesh_wifi_line() {
+    local line="$1"
+    local src mac matchkind
+    IFS='|' read -r src mac matchkind <<< "$line"
+    [ -z "$mac" ] && return
+    if echo "$SEEN_STRONG" | grep -q "$mac WIFI_MESH\|$mac MESH_BLE"; then return; fi
+
+    local CURRENT_TIME ENTRY
+    CURRENT_TIME=$(date '+%H:%M:%S')
+    ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)"
+    LOG "$ENTRY"
+    echo "$ENTRY" >> "$LOG_FILE"
+    DETECTIONS=$((DETECTIONS + 1))
+    COUNTER=$((COUNTER + 1))
+    if [ -f /sys/class/gpio/vibrator/value ]; then
+        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+        sleep 0.15
+        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+    fi
+    if ls /sys/class/leds/* >/dev/null 2>&1; then
+        LED=$(ls /sys/class/leds/* | head -1)
+        echo 1 > "${LED}/brightness" 2>/dev/null
+        sleep 0.3
+        echo 0 > "${LED}/brightness" 2>/dev/null
+    fi
+    SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
 }
 
 # Parse one "SRC|MAC|MSG_TYPE|k=v;k=v;..." line and LOG/alert/loot it.
@@ -434,6 +611,39 @@ while true; do
         done
     fi
 
+    # --- Mesh-Detect BLE scan: reuse the same hcitool lescan dump above, ---
+    # --- checked against mesh_detect_targets.conf instead of Flock names ---
+    # Process substitution (not a `cmd | while` pipe), same reasoning as the
+    # WiFi drains below, so SEEN_STRONG updates persist in this shell.
+    if [ "$MESH_BLE_OK" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
+        while read -r full_line; do
+            MAC=$(echo "$full_line" | awk '{print $1}')
+            NAME=$(echo "$full_line" | cut -d' ' -f2-)
+            [ -z "$MAC" ] && continue
+            if echo "$SEEN_STRONG" | grep -q "$MAC WIFI_MESH\|$MAC MESH_BLE"; then continue; fi
+            MATCH=$(mesh_ble_match "$MAC" "$NAME")
+            [ -z "$MATCH" ] && continue
+            CURRENT_TIME=$(date '+%H:%M:%S')
+            ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)"
+            LOG "$ENTRY"
+            echo "$ENTRY" >> "$LOG_FILE"
+            DETECTIONS=$((DETECTIONS + 1))
+            COUNTER=$((COUNTER + 1))
+            if [ -f /sys/class/gpio/vibrator/value ]; then
+                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+                sleep 0.15
+                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+            fi
+            if ls /sys/class/leds/* >/dev/null 2>&1; then
+                LED=$(ls /sys/class/leds/* | head -1)
+                echo 1 > "${LED}/brightness" 2>/dev/null
+                sleep 0.3
+                echo 0 > "${LED}/brightness" 2>/dev/null
+            fi
+            SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
+        done < <(sort -u /tmp/hci_scan.txt)
+    fi
+
     # --- Flock Safety WiFi scan: drain whatever flock_wifi_monitor.awk found ---
     # Uses process substitution (not a `cmd | while` pipe) so the SEEN_STRONG
     # update inside handle_flock_wifi_line persists in *this* shell -- see the
@@ -445,6 +655,17 @@ while true; do
                 [ -n "$line" ] && handle_flock_wifi_line "$line"
             done < <(tail -c "+$((FLOCK_WIFI_HITS_OFFSET + 1))" "$FLOCK_WIFI_HITS")
             FLOCK_WIFI_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Mesh-Detect WiFi scan: drain whatever mesh_wifi_monitor.awk found ---
+    if [ "$MESH_WIFI_OK" = "1" ]; then
+        NEW_SIZE=$(wc -c < "$MESH_WIFI_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$MESH_WIFI_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_mesh_wifi_line "$line"
+            done < <(tail -c "+$((MESH_WIFI_HITS_OFFSET + 1))" "$MESH_WIFI_HITS")
+            MESH_WIFI_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 
