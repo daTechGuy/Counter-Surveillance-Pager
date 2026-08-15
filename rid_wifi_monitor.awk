@@ -1,5 +1,5 @@
 # rid_wifi_monitor.awk -- run as:
-#   tcpdump -i wlan1mon -n -l -xx type mgt | awk -f rid_common.awk -f rid_wifi_monitor.awk
+#   tcpdump -i wlan0mon -n -l -xx type mgt | awk -f rid_common.awk -f rid_wifi_monitor.awk
 #
 # Parses tcpdump 4.99.5's `-xx` text hex-dump format, confirmed against a
 # real capture from this device: a one-line-per-packet summary (starts with

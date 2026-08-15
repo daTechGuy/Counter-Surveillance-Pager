@@ -76,21 +76,42 @@
 # just disable that one piece and are reported at startup, everything else
 # still runs):
 #   Flock BLE scan    : hciconfig, hcitool               (stock on Flock-You)
-#   Flock WiFi scan    : + awk, iw, tcpdump, a second radio (phy1) -- shares
-#                        its capture radio/channel-hop with Drone WiFi scan
+#   Flock WiFi scan    : + awk, iw, tcpdump, a second radio (phy0/wlan0mon)
+#                        -- shares its capture radio/channel-hop with Drone
+#                        WiFi scan
 #   Mesh-Detect BLE scan: none beyond Flock BLE scan above -- reuses its
 #                        hcitool lescan output, only runs once
 #                        mesh_detect_targets.conf has an oui:/mac:/name: entry
-#   Mesh-Detect WiFi scan: + awk, iw, tcpdump, a second radio (phy1) -- same
-#                        shared radio/channel-hop, only runs once
+#   Mesh-Detect WiFi scan: + awk, iw, tcpdump, a second radio (phy0/wlan0mon)
+#                        -- same shared radio/channel-hop, only runs once
 #                        mesh_detect_targets.conf has an oui:/mac: entry
 #   Rogue tracker BLE scan: + awk, hcidump (own reader, alongside Drone BLE
 #                        scan's) -- no config needed to be active, but see
 #                        tracker_allowlist.conf re: your own trackers
 #   Drone BLE scan    : + awk, hcidump
-#   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1)
+#   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy0/wlan0mon)
 # ============================================================================
 #
+# WIFI RADIO: phy0/wlan0mon, NOT phy1/wlan1mon -- confirmed live on hardware
+# that phy1/wlan1mon is the Pager's own default-configured primary recon
+# interface (/etc/config/pineapd: `bands '2,5'`, `hop '1'`, `hopspeed
+# 'fast'`, auto-started at boot by pineapd --recon=true), which actively
+# fights this payload's own channel-hop loop for control of that interface
+# -- observed as wifi_hop.log filling with continuous "Resource busy (-16)"
+# and wlan1mon's actual channel drifting onto 5GHz (44, 144) that this
+# payload's own hop set never sets, meaning none of the WiFi detectors were
+# reliably on the 2.4GHz channels they need to be on. phy0/wlan0mon was
+# confirmed idle (no pineapd hop activity, wlan0 not currently acting as an
+# AP) at the time of this fix, and is also the more capable radio (2.4/5/
+# 6GHz ac/ax vs wlan1mon's 2.4GHz-only) -- though WIFI_CHANNELS below is
+# deliberately still 2.4GHz-only (11/6/1), matching flock-you's own hop set,
+# since the devices this payload targets are overwhelmingly 2.4GHz; wider
+# per-cycle coverage would mean less dwell time on the channels that
+# actually matter. KNOWN RISK: if the Pager's native AP/hotspot features
+# ever get used on phy0 while this payload is running, THAT would collide
+# with wlan0mon the same way pineapd's recon collided with wlan1mon -- this
+# wasn't the case when this fix was made and verified, but isn't guaranteed
+# to never happen.
 # KNOWN LIMITATIONS -- read before relying on this in the field:
 #  - Drone BLE detection only sees advertisements during Flock-You's own
 #    ~12-of-15s hcitool lescan windows (it piggybacks on that scan rather
@@ -231,7 +252,7 @@ TRACKER_ALERT_COOLDOWN=300           # 5 min between repeat UI alerts for the
                                       # same still-present tracker (loot log
                                       # is never throttled)
 
-WIFI_IFACE="wlan1mon"
+WIFI_IFACE="wlan0mon"
 # Channel hop set/order/dwell matches flock-you's own CUSTOM mode (main.cpp:
 # customChannels[] / CHANNEL_DWELL_MS) -- credited there to nsm_barri's
 # observation that the cameras hop channels in ascending order roughly every
@@ -413,9 +434,9 @@ else
     LOG red "Rogue tracker BLE detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
 fi
 
-if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP" ] && iw phy phy1 info >/dev/null 2>&1; then
+if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP" ] && iw phy phy0 info >/dev/null 2>&1; then
     if ! iw dev "$WIFI_IFACE" info >/dev/null 2>&1; then
-        if iw phy phy1 interface add "$WIFI_IFACE" type monitor 2>>"$LOG_FILE"; then
+        if iw phy phy0 interface add "$WIFI_IFACE" type monitor 2>>"$LOG_FILE"; then
             WIFI_IFACE_CREATED=1
         fi
     fi
@@ -423,29 +444,29 @@ if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP"
         ip link set "$WIFI_IFACE" up 2>>"$LOG_FILE"
         iw dev "$WIFI_IFACE" set channel "${WIFI_CHANNELS%% *}" 2>>"$LOG_FILE"
         WIFI_RID_OK=1
-        LOG green "Drone WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
+        LOG green "Drone WiFi detection: enabled ($WIFI_IFACE on phy0, hopping ch $WIFI_CHANNELS)"
         wifi_channel_hop &
         WIFI_HOP_PID=$!
         if [ "$FLOCK_AWK_FILE_OK" = "1" ]; then
             FLOCK_WIFI_OK=1
-            LOG green "Flock WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
+            LOG green "Flock WiFi detection: enabled ($WIFI_IFACE on phy0, hopping ch $WIFI_CHANNELS)"
         fi
         if [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ]; then
             MESH_WIFI_OK=1
-            LOG green "Mesh-Detect WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
+            LOG green "Mesh-Detect WiFi detection: enabled ($WIFI_IFACE on phy0, hopping ch $WIFI_CHANNELS)"
         elif [ "$MESH_AWK_FILE_OK" = "1" ]; then
             LOG yellow "Mesh-Detect WiFi detection: no-op (mesh_detect_targets.conf has no oui:/mac: entries yet)"
         fi
     fi
 fi
 if [ "$WIFI_RID_OK" = "0" ] && [ "$AWK_FILES_OK" = "1" ]; then
-    LOG red "Drone WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
+    LOG red "Drone WiFi detection: disabled (need awk+iw+tcpdump and a usable phy0)"
 fi
 if [ "$FLOCK_WIFI_OK" = "0" ] && [ "$FLOCK_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
-    LOG red "Flock WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
+    LOG red "Flock WiFi detection: disabled (need awk+iw+tcpdump and a usable phy0)"
 fi
 if [ "$MESH_WIFI_OK" = "0" ] && [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
-    LOG red "Mesh-Detect WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
+    LOG red "Mesh-Detect WiFi detection: disabled (need awk+iw+tcpdump and a usable phy0)"
 fi
 
 # ---------------------------------------------------------------------------
