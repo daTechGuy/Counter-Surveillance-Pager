@@ -2,19 +2,23 @@
 
 ## Credit
 
-Both detectors this payload combines originate with **[colonelpanichacks (Colonel Panic)](https://github.com/colonelpanichacks)**:
+All three detection concepts this payload combines originate with **[colonelpanichacks (Colonel Panic)](https://github.com/colonelpanichacks)**:
 
-- **[Flock-You / flock-you](https://github.com/colonelpanichacks/flock-you)** ([Flock_Detect on the official Pager payload repo](https://github.com/hak5/wifipineapplepager-payloads/tree/master/library/user/reconnaissance/Flock_Detect)) -- the BLE scan loop and Flock Safety detection logic in this payload are taken from here **unmodified**.
+- **[Flock-You / flock-you](https://github.com/colonelpanichacks/flock-you)** ([Flock_Detect on the official Pager payload repo](https://github.com/hak5/wifipineapplepager-payloads/tree/master/library/user/reconnaissance/Flock_Detect)) -- the BLE scan loop and Flock Safety BLE-name detection logic in this payload are taken from here **unmodified**. The **WiFi** Flock detection (`flock_wifi_monitor.awk`) is a **port**, not a copy: flock-you's `main.cpp` moved its primary detection method to WiFi (OUI-gated wildcard-SSID Probe Request + an exact IE-fingerprint match, replacing the OUI-only checks it started with) some time after this payload's BLE-only detector was originally written, and that BLE-only path alone was found in practice to miss at least one real camera. `flock_wifi_monitor.awk` ports that current WiFi method -- the 31-entry OUI list, the wildcard-probe check, and the `FLOCK_PROBE_IE_SIG_PRIMARY` fingerprint -- onto this device's `tcpdump`/awk stack, including the same 11/6/1 channel-hop flock-you uses (credited there to nsm_barri's observation on the cameras' hop timing). See `flock_wifi_monitor.awk`'s header for exactly what was ported and what upstream ESP32-driver-specific workarounds were deliberately left out.
 - **[Sky-Spy](https://github.com/colonelpanichacks/Sky-Spy)** -- the drone Remote ID detection *approach* this payload ports comes from here. Sky-Spy itself is ESP32 firmware with no Linux build, so the port is a from-scratch reimplementation of that same detection concept against the ASTM F3411 spec, for the Pager's own Linux BLE/WiFi stack.
 
-All credit for the underlying detection concepts and the original Flock-You code belongs to Colonel Panic. This repo is a derivative work combining both of his projects into one payload for a device (the Pager) that Sky-Spy doesn't natively run on.
+All credit for the underlying detection concepts and the original Flock-You code belongs to Colonel Panic. This repo is a derivative work combining his projects into one payload for a device (the Pager) that neither Sky-Spy nor flock-you's current WiFi method natively run on.
 
 ## What this is
 
 Combines two detectors into one Pager payload:
 
-- **Flock Safety BLE detection** -- taken verbatim from Flock-You / Flock_Detect. Unmodified scan loop, unmodified alert logic.
+- **Flock Safety detection**, two independent paths sharing one dedup/alert pipeline:
+  - **BLE name scan** -- taken verbatim from Flock-You / Flock_Detect. Unmodified scan loop, unmodified alert logic.
+  - **WiFi wildcard-probe + IE signature** -- a port of flock-you's current (and, per its own commit history, more reliable) WiFi detection method. See Credit above and `flock_wifi_monitor.awk`.
 - **Drone Remote ID detection** -- a from-scratch Linux port of what Sky-Spy does on ESP32, reimplementing its detection logic directly against the ASTM F3411 / Open Drone ID spec for the Pager's own BLE and WiFi radios, using `hcidump` and `iw`/`tcpdump` instead of ESP-IDF.
+
+Both WiFi detectors (Flock probe + drone Remote ID) now share one radio hopping channels 11/6/1 (250ms dwell) instead of drone detection's old fixed channel 6 -- see Known limitations.
 
 ## Why this needed real engineering, not a copy-paste
 
@@ -43,35 +47,40 @@ None of this required guessing at busybox-awk-specific behavior blind -- every p
 
 | File | Role |
 |---|---|
-| `payload.sh` | Main driver. Runs Flock-You's original BLE loop unchanged; starts the two Remote ID background monitors (each via a named FIFO, not a shell pipe, so their PIDs are directly killable on exit) if their dependencies are present; drains their hit logs each cycle for LOG/LED/RINGTONE alerts. |
-| `rid_common.awk` | Shared decode functions: hex conversion, ASTM message decoders (Basic ID, Location, System, Self ID, Operator ID), field sanitization, hit-line formatting. No I/O, no BEGIN/END/main rules -- loaded via a second `-f` alongside one of the two monitor scripts below. |
+| `payload.sh` | Main driver. Runs Flock-You's original BLE loop unchanged; hops the shared monitor-mode radio across channels 11/6/1; starts three background monitors (each via a named FIFO, not a shell pipe, so their PIDs are directly killable on exit) if their dependencies are present; drains their hit logs each cycle for LOG/LED/RINGTONE alerts. |
+| `rid_common.awk` | Shared decode functions: hex conversion, ASTM message decoders (Basic ID, Location, System, Self ID, Operator ID), field sanitization, hit-line formatting, and the 802.11 MAC-string helper `flock_wifi_monitor.awk` also reuses. No I/O, no BEGIN/END/main rules -- loaded via a second `-f` alongside one of the monitor scripts below. |
 | `rid_ble_monitor.awk` | Reads `hcidump --raw`'s text output, reassembles HCI Event packets from its line-wrapped hex format, extracts LE Advertising Report events, looks for the Remote ID Service Data AD structure. |
 | `rid_wifi_monitor.awk` | Reads `tcpdump -xx`'s text output, reassembles per-packet hex bytes, strips the radiotap header, looks for the Remote ID vendor IE (Beacon method) or NAN Service Descriptor attribute (NAN method). |
+| `flock_wifi_monitor.awk` | Its own `tcpdump -xx` reader on the same interface (see its header for why it's not a 3rd `-f` on `rid_wifi_monitor.awk`). Ports flock-you's current WiFi detection: OUI-gated wildcard-SSID Probe Request, exact match against `FLOCK_PROBE_IE_SIG_PRIMARY`. |
 
 ## Requirements per detector (each degrades independently)
 
 - **Flock BLE** (unchanged from Flock-You): `hciconfig`, `hcitool` -- if these were on your Pager before, nothing changes here.
+- **Flock WiFi**: + `awk`, `iw`, `tcpdump`, and a usable second radio (`phy1`) -- same prerequisite as Drone WiFi below, and shares that radio/channel-hop with it.
 - **Drone BLE**: + `awk`, `hcidump`. Both confirmed present on this device.
 - **Drone WiFi**: + `awk`, `iw`, `tcpdump`, and a usable second radio (`phy1`). Confirmed on this device: `phy1` exists and accepts `iw phy phy1 interface add wlan1mon type monitor`, and a real capture was taken from it successfully.
 
 ## Known limitations (by design, not oversights)
 
 - **Drone BLE detection is not continuous.** It piggybacks on Flock-You's own `hcitool lescan` windows (~12 of every ~15 seconds) rather than running a separate scan, so it inherits that duty cycle. Continuous BLE scanning independent of the Flock cycle would need its own `hcitool lescan`/`bluetoothctl` session, which risks fighting the Flock scan for the single BLE radio -- left as a follow-up if the merged duty cycle proves insufficient in practice.
-- **Drone WiFi detection is fixed to channel 6 (2.4GHz)**, matching Sky-Spy's own default. A drone broadcasting Remote ID only on 5GHz, or on a 2.4GHz channel other than 6, will be missed. Channel hopping across a small set (1/6/11 at minimum) is a reasonable next step once channel 6 alone is confirmed working against a real drone.
+- **Both WiFi detectors now hop channels 11/6/1** (250ms dwell, matching flock-you's own hop set/order/timing) instead of drone detection's old fixed channel 6. A drone or camera transmitting only on 5GHz, or on a 2.4GHz channel outside 11/6/1, will still be missed.
+- **`flock_wifi_monitor.awk`'s detection logic is unit-tested, not field-confirmed.** Its tcpdump/radiotap framing reuses the byte offsets already hardware-verified for `rid_wifi_monitor.awk`, and its OUI/wildcard/IE-signature logic has been checked against synthetic packets built to exactly match flock-you's own published fingerprint constant -- but not yet against a real camera's actual RF. If a real camera's IE signature has drifted from that constant (which is plausible -- flock-you's own commit history shows the fingerprint approach superseding an earlier OUI-only method, implying the on-air signature isn't fixed forever), this will miss it the same way the unmodified BLE path apparently already can.
 - **BLE Extended/Long-Range advertising (Bluetooth 5) is not decoded** -- only Legacy advertising (the common case for consumer drones).
 - **Auth messages are identified but not decoded** (their content isn't useful for a recon alert).
-- UI alerts are cooldown-throttled per MAC (10s, `ALERT_COOLDOWN` in `payload.sh`) since WiFi Remote ID beacons repeat far faster than Flock's BLE cycle and would otherwise spam the console. The loot log (`drone_rid_*.txt`) is **never** throttled -- every decoded message is recorded.
+- UI alerts are cooldown-throttled per MAC (10s, `ALERT_COOLDOWN` in `payload.sh`) for drone Remote ID, and deduplicated once per session per MAC for both Flock paths (BLE and WiFi), since repeat detections of the same camera/drone would otherwise spam the console. The loot logs are **never** throttled -- every decoded message/hit is recorded.
 
 ## Confirmed live on hardware
 
 Beyond the local decoder testing described above, on the actual Pager:
 
-- Both background pipelines (`hcidump`/`awk` for BLE, `tcpdump`/`awk` for WiFi) start, stay running, and produce **zero stderr output** -- confirmed via `ps` and the pipelines' own log files while `payload.sh` was live.
+- The `hcidump`/`awk` (BLE) and `tcpdump`/`awk` (drone WiFi) background pipelines start, stay running, and produce **zero stderr output** -- confirmed via `ps` and the pipelines' own log files while `payload.sh` was live.
 - A synthetic hit line appended directly to the WiFi hits file while the payload was running was picked up on the very next drain cycle and produced a correct on-screen `DRONE REMOTE ID` alert (title, MAC, decoded UAS ID, and transport all correct) -- confirming the full chain end to end: capture -> awk decode -> bash hit parsing -> cooldown/dedup -> `LOG`/`LED`/`RINGTONE`/`ALERT_RINGTONE`.
-- Flock Safety detection is the original, untouched Flock-You code path, so it carries the same confidence as upstream.
+- Flock Safety **BLE** detection is the original, untouched Flock-You code path, so it carries the same confidence as upstream.
+- Flock Safety **WiFi** detection (`flock_wifi_monitor.awk`) has been checked with `gawk` against synthetic packets (matching OUI + wildcard SSID + exact IE signature; wrong-OUI; directed/non-wildcard probe) to confirm it fires exactly when it should and stays silent otherwise -- **not yet run on the actual Pager hardware or against real captured traffic.**
 
-## The one thing that's genuinely still unverified
+## What's genuinely still unverified
 
-Real-world timing and coverage against an actual Remote-ID-broadcasting drone (or a real Flock Safety device) -- neither was available during development. Every stage up to "a real target is nearby and broadcasting" has been checked against real captures and confirmed live on this hardware; what's left is just letting it run somewhere a real target actually shows up.
+- Real-world timing and coverage against an actual Remote-ID-broadcasting drone, or a real Flock Safety camera -- neither was available during development of the original drone-RID work.
+- The new WiFi Flock detector specifically: it hasn't been run on-device yet (only syntax/logic-tested off-device with `gawk`), and even once it runs cleanly there, whether a real camera's current on-air IE signature still matches `FLOCK_PROBE_IE_SIG_PRIMARY` is unconfirmed. If BLE detection alone missed a known camera, checking the WiFi path against that same camera (`tail -f` the loot dir, or watch for `wifi_flock|` lines in `flock_wifi_hits.log` under `/tmp/flock_sky_spy/`) is the natural next test.
 
 Loot: `/root/loot/flock_sky_spy/flock_you_<ts>.txt` (Flock hits, same format as upstream) and `/root/loot/flock_sky_spy/drone_rid_<ts>.txt` (every decoded drone message: time, transport, MAC, message type, fields).
