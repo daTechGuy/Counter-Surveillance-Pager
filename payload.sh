@@ -267,7 +267,23 @@ cleanup() {
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
 }
-trap cleanup EXIT INT TERM
+# Trapping INT/TERM via a plain `trap cleanup EXIT INT TERM` runs cleanup()
+# on those signals but does NOT terminate the process afterward -- a bash
+# trap handler just returns to whatever was interrupted unless it calls
+# `exit` itself, so that form left payload.sh silently resuming its main
+# loop after a kill/Ctrl-C, with every capture pipeline dead and never
+# relaunched (only launched once, before the loop). Confirmed live on
+# hardware: SIGTERM ran cleanup and killed every hcidump/tcpdump/awk child
+# as expected, but the outer while loop kept going regardless, orphaned,
+# until force-killed. EXIT alone needs no explicit exit (the shell is
+# already exiting by definition when that pseudo-signal fires); INT/TERM
+# do. cleanup() running twice (once from the INT/TERM trap, once more from
+# EXIT firing as that trap's own `exit` unwinds) is harmless -- every
+# action in it is already idempotent (kill/rm -f on already-gone
+# PIDs/files, iw dev del with stderr suppressed).
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Loads mesh_detect_targets.conf into three bash arrays for the BLE matching
 # pass below (see handle_ble_line in the main loop). The WiFi matcher
