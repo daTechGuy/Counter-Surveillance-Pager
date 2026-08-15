@@ -51,6 +51,13 @@
 # Tile), and Google's own public Find Hub Network Accessory Specification
 # (FMDN). See rogue_tracker_monitor.awk's header for exact citations
 # and what wasn't decoded.
+# Deauth-flood + evil-twin AP detection (deauth_eviltwin_monitor.awk) is
+# also NOT a port -- standard, widely-documented WiFi attack signatures
+# (repeated Deauthentication/Disassociation frames; a Beacon advertising a
+# known SSID from an unrecognized BSSID), not something needing a specific
+# upstream reference implementation the way the tracker protocols did. See
+# that file's header for the detection logic and trusted_networks.conf's
+# header for the evil-twin config format.
 # Original Flock-You Contributors: colonelpanichacks, Claude (Anthropic), Grok (xAI), Brandon Starkweather
 # Remote ID spec/byte-offset sources (see rid_common.awk header for citations):
 #   opendroneid/opendroneid-core-c, opendroneid/transmitter-linux
@@ -90,6 +97,12 @@
 #                        tracker_allowlist.conf re: your own trackers
 #   Drone BLE scan    : + awk, hcidump
 #   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
+#   Deauth flood scan : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
+#                        -- same shared radio/channel-hop, works standalone,
+#                        no config needed
+#   Evil-twin AP scan : same as deauth flood (same detector file/process) --
+#                        no-op until trusted_networks.conf has a trusted:
+#                        entry
 # ============================================================================
 #
 # WIFI RADIO: phy1/wlan1mon -- confirmed live on hardware (drove past a real
@@ -197,6 +210,21 @@
 #    cases, and the packet-count emit-throttle) with gawk -- not yet against
 #    a real AirTag/Tile/SmartTag/FMDN accessory or on-device. Same "unit-
 #    tested, not field-confirmed" caveat as the WiFi detectors above.
+#  - deauth_eviltwin_monitor.awk / handle_deauth_line()'s rate math was
+#    checked with synthetic packets (throttle behavior) and standalone bash
+#    scenarios (real flood, normal single disconnect, slow trickle, cooldown
+#    suppression, evil-twin positive/negative/unrelated-SSID) -- not yet
+#    against a real deauth attack tool or a real rogue AP, and the
+#    DEAUTH_FLOOD_RATE=3/DEAUTH_FLOOD_MIN_DELTA=5 thresholds are reasoned
+#    defaults, not calibrated against a real attack's actual frame rate.
+#    Same "unit-tested, not field-confirmed" caveat.
+#  - Evil-twin detection only checks Beacon frames, not Probe Response
+#    (which also carries SSID+BSSID) -- see deauth_eviltwin_monitor.awk's
+#    header for why. A rogue AP that only replies to probes and never
+#    beacons would be missed.
+#  - trusted_networks.conf ships EMPTY -- evil-twin detection is a no-op
+#    until you add your own network's SSID+BSSID(s). No vendor list applies
+#    here the way it did for Mesh-Detect; only you know your own network.
 #  - BLE Extended/Long-Range advertising (Bluetooth 5) Remote ID is not
 #    decoded, only Legacy advertising -- covers the common case. Rogue
 #    tracker detection has the same gap: a tracker that only ever uses BT5
@@ -248,13 +276,15 @@ WIFI_HITS="$WORK_DIR/wifi_rid_hits.log"
 FLOCK_WIFI_HITS="$WORK_DIR/flock_wifi_hits.log"
 MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
 TRACKER_HITS="$WORK_DIR/tracker_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS"
+DEAUTH_HITS="$WORK_DIR/deauth_eviltwin_hits.log"
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$DEAUTH_HITS"
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
 WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
 FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
 MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
 TRACKER_FIFO="$WORK_DIR/tracker_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO"
+DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
+rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$DEAUTH_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
@@ -272,6 +302,21 @@ TRACKER_PERSISTENCE_MIN_SIGHTINGS=3  # also require this many distinct hit
 TRACKER_ALERT_COOLDOWN=300           # 5 min between repeat UI alerts for the
                                       # same still-present tracker (loot log
                                       # is never throttled)
+
+TRUSTED_NETWORKS_FILE="$SCRIPT_DIR/trusted_networks.conf"
+DEAUTH_LOG_FILE="${LOOT_DIR}/deauth_eviltwin_${TIMESTAMP}.txt"
+echo "Deauth/evil-twin log started at $(date)" > "$DEAUTH_LOG_FILE"
+# Deauth-flood rate thresholds -- see handle_deauth_line(). Cross-multiplied
+# (delta_count >= RATE * delta_time) rather than divided, since plain bash
+# arithmetic is integer-only and division would round small rates to 0.
+DEAUTH_FLOOD_RATE=3        # frames/sec sustained to count as an active flood,
+                            # not one real client actually disconnecting
+DEAUTH_FLOOD_MIN_DELTA=5   # also require at least this many frames in the
+                            # current sample so a tiny delta_time doesn't
+                            # trigger off just 1-2 frames
+DEAUTH_ALERT_COOLDOWN=60   # seconds between repeat UI alerts for the same
+                            # still-flooding source / still-present rogue AP
+                            # (loot log is never throttled)
 
 WIFI_IFACE="wlan1mon"
 # Channel hop set/order/dwell matches flock-you's own CUSTOM mode (main.cpp:
@@ -294,6 +339,8 @@ MESH_TCPDUMP_PID=""
 MESH_WIFI_MON_PID=""
 TRACKER_HCIDUMP_PID=""
 TRACKER_MON_PID=""
+DEAUTH_TCPDUMP_PID=""
+DEAUTH_MON_PID=""
 WIFI_HOP_PID=""
 WIFI_IFACE_CREATED=0
 
@@ -301,10 +348,11 @@ cleanup() {
     for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$TCPDUMP_PID" "$WIFI_MON_PID" \
              "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" \
              "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" \
-             "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" "$WIFI_HOP_PID"; do
+             "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" \
+             "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO"
+    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$DEAUTH_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -399,6 +447,7 @@ WIFI_RID_OK=0
 FLOCK_WIFI_OK=0
 MESH_WIFI_OK=0
 TRACKER_BLE_OK=0
+DEAUTH_OK=0
 
 LOG yellow "Counter-Surveillance-Pager started at $(date)"
 
@@ -430,6 +479,15 @@ fi
 MESH_WIFI_TARGETS_PRESENT=0
 if [ ${#MESH_OUI_TARGETS[@]} -gt 0 ] || [ ${#MESH_MAC_TARGETS[@]} -gt 0 ]; then
     MESH_WIFI_TARGETS_PRESENT=1
+fi
+
+# Deauth-flood detection needs no config at all (works standalone); evil-twin
+# needs trusted_networks.conf entries, but that's checked awk-side (HAVE_TRUSTED)
+# and just no-ops rather than needing a separate bash-side gate here.
+DEAUTH_AWK_FILE_OK=1
+if [ ! -f "$SCRIPT_DIR/deauth_eviltwin_monitor.awk" ]; then
+    LOG red "Deauth/evil-twin detection: disabled (deauth_eviltwin_monitor.awk not found -- looked in $SCRIPT_DIR)"
+    DEAUTH_AWK_FILE_OK=0
 fi
 if [ "$MESH_BLE_OK" = "1" ]; then
     LOG green "Mesh-Detect BLE detection: enabled (${#MESH_OUI_TARGETS[@]} oui, ${#MESH_MAC_TARGETS[@]} mac, ${#MESH_NAME_TARGETS[@]} name target(s))"
@@ -478,6 +536,10 @@ if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP"
         elif [ "$MESH_AWK_FILE_OK" = "1" ]; then
             LOG yellow "Mesh-Detect WiFi detection: no-op (mesh_detect_targets.conf has no oui:/mac: entries yet)"
         fi
+        if [ "$DEAUTH_AWK_FILE_OK" = "1" ]; then
+            DEAUTH_OK=1
+            LOG green "Deauth/evil-twin detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
+        fi
     fi
 fi
 if [ "$WIFI_RID_OK" = "0" ] && [ "$AWK_FILES_OK" = "1" ]; then
@@ -488,6 +550,9 @@ if [ "$FLOCK_WIFI_OK" = "0" ] && [ "$FLOCK_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_
 fi
 if [ "$MESH_WIFI_OK" = "0" ] && [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
     LOG red "Mesh-Detect WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
+fi
+if [ "$DEAUTH_OK" = "0" ] && [ "$DEAUTH_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
+    LOG red "Deauth/evil-twin detection: disabled (need awk+iw+tcpdump and a usable phy1)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -566,13 +631,25 @@ if [ "$MESH_WIFI_OK" = "1" ]; then
     MESH_WIFI_MON_PID=$!
 fi
 
+# Same reasoning again: its own tcpdump process, 5th reader total on this
+# one radio.
+if [ "$DEAUTH_OK" = "1" ]; then
+    mkfifo "$DEAUTH_FIFO"
+    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$DEAUTH_FIFO" 2>"$WORK_DIR/deauth_tcpdump.log" &
+    DEAUTH_TCPDUMP_PID=$!
+    "$AWK" -v CONFIG_FILE="$TRUSTED_NETWORKS_FILE" \
+        -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/deauth_eviltwin_monitor.awk" \
+        < "$DEAUTH_FIFO" >> "$DEAUTH_HITS" 2>"$WORK_DIR/deauth_monitor.log" &
+    DEAUTH_MON_PID=$!
+fi
+
 LOG "Color key:"
 LOG yellow   "  FS Ext Battery"
 LOG green    "  Penguin"
 LOG magenta  "  Pigvision"
 LOG cyan     "  Other Flock (BLE name match or WiFi wildcard-probe/IE match)"
 LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
-LOG red      "  Drone Remote ID / Rogue BLE Tracker (both same color -- distinguished by alert text)"
+LOG red      "  Drone Remote ID / Rogue BLE Tracker / Deauth Flood / Evil-Twin AP (all same color -- distinguished by alert text)"
 LOG "----------------------------------"
 
 DETECTIONS=0
@@ -596,6 +673,15 @@ TRACKER_HITS_OFFSET=0
 declare -A TRACKER_FIRST_SEEN
 declare -A TRACKER_SIGHTINGS
 declare -A TRACKER_LAST_ALERT
+DEAUTH_HITS_OFFSET=0
+
+# Per-source-MAC deauth-flood rate state (see handle_deauth_line()) and
+# per-rogue-BSSID evil-twin alert cooldown state. Both keyed simply (MAC),
+# unlike tracker state above -- neither deauth transmitters nor rogue APs
+# have a MAC-rotation problem to design around.
+declare -A DEAUTH_LAST_COUNT
+declare -A DEAUTH_LAST_TIME
+declare -A DEAUTH_LAST_ALERT
 
 # Case-insensitive "does haystack contain needle" without a subshell, since
 # this runs per BLE-scan-result per cycle and a $(...) fork per check adds up.
@@ -786,6 +872,68 @@ handle_tracker_line() {
     DETECTIONS=$((DETECTIONS + 1))
 }
 
+# Parse one line from deauth_eviltwin_monitor.awk -- either
+# "deauth|SRC|DST|deauth|COUNT" / "...|disassoc|COUNT", or
+# "eviltwin|BSSID|SSID|rogue_bssid". Every sighting is logged (loot never
+# throttled); the loud LED/vibrate/RINGTONE alert only fires once a real
+# flood rate is confirmed (deauth) or immediately (evil-twin -- a rogue AP
+# existing at all is already the signal, no rate needed), each cooldown-
+# throttled separately so a sustained attack doesn't spam the UI.
+handle_deauth_line() {
+    local line="$1"
+    local kind mac f3 f4 f5
+    IFS='|' read -r kind mac f3 f4 f5 <<< "$line"
+    [ -z "$mac" ] && return
+
+    local now
+    now=$(date +%s)
+
+    if [ "$kind" = "deauth" ]; then
+        local dst="$f3" subtype="$f4" count="$f5"
+        echo "$(date '+%H:%M:%S') | deauth | $mac -> $dst | $subtype | count=$count" >> "$DEAUTH_LOG_FILE"
+
+        local last_count="${DEAUTH_LAST_COUNT[$mac]:-0}" last_time="${DEAUTH_LAST_TIME[$mac]:-$now}"
+        local delta_count=$((count - last_count))
+        local delta_time=$((now - last_time))
+        DEAUTH_LAST_COUNT[$mac]=$count
+        DEAUTH_LAST_TIME[$mac]=$now
+        # First-ever sighting for this MAC (last_time defaulted to now) has
+        # delta_time=0 -- skip the rate check entirely rather than divide
+        # by zero or cross-multiply against a meaningless zero window.
+        [ "$delta_time" -le 0 ] && return
+        # Cross-multiplied, not divided: delta_count/delta_time >= RATE
+        # becomes delta_count >= RATE * delta_time, avoiding bash's
+        # integer-only arithmetic rounding a real fractional rate down to 0.
+        if [ "$delta_count" -ge "$DEAUTH_FLOOD_MIN_DELTA" ] && [ "$delta_count" -ge "$((DEAUTH_FLOOD_RATE * delta_time))" ]; then
+            local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
+            [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
+            DEAUTH_LAST_ALERT[$mac]=$now
+            LOG red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s"
+            LED RED
+            RINGTONE warning
+            ALERT_RINGTONE "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
+            LED OFF
+            DETECTIONS=$((DETECTIONS + 1))
+        fi
+        return
+    fi
+
+    if [ "$kind" = "eviltwin" ]; then
+        local ssid="$f3"
+        echo "$(date '+%H:%M:%S') | eviltwin | bssid=$mac | ssid=$ssid" >> "$DEAUTH_LOG_FILE"
+
+        local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
+        [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
+        DEAUTH_LAST_ALERT[$mac]=$now
+        LOG red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID"
+        LED RED
+        RINGTONE warning
+        ALERT_RINGTONE "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
+        LED OFF
+        DETECTIONS=$((DETECTIONS + 1))
+    fi
+}
+
 # Parse one "SRC|MAC|MSG_TYPE|k=v;k=v;..." line and LOG/alert/loot it.
 handle_rid_line() {
     local line="$1"
@@ -961,6 +1109,17 @@ while true; do
                 [ -n "$line" ] && handle_tracker_line "$line"
             done < <(tail -c "+$((TRACKER_HITS_OFFSET + 1))" "$TRACKER_HITS")
             TRACKER_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Deauth/evil-twin: drain whatever deauth_eviltwin_monitor.awk found ---
+    if [ "$DEAUTH_OK" = "1" ]; then
+        NEW_SIZE=$(wc -c < "$DEAUTH_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$DEAUTH_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_deauth_line "$line"
+            done < <(tail -c "+$((DEAUTH_HITS_OFFSET + 1))" "$DEAUTH_HITS")
+            DEAUTH_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 
