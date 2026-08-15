@@ -1,6 +1,6 @@
 # flock_wifi_monitor.awk -- WiFi wildcard-probe + OUI + IE-signature Flock
 # Safety camera detector, run as:
-#   tcpdump -i wlan0mon -n -l -xx type mgt | awk -f rid_common.awk -f flock_wifi_monitor.awk
+#   tcpdump -i wlan1mon -n -l -xx type mgt | awk -f rid_common.awk -f flock_wifi_monitor.awk
 #
 # Ports flock-you's current WiFi detection method -- the one that superseded
 # its original BLE device-name scan -- onto the Pager's Linux WiFi stack.

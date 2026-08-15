@@ -11,7 +11,7 @@
 # scan's own hcitool lescan output, same as name matching there).
 #
 # Run as:
-#   tcpdump -i wlan0mon -n -l -xx type mgt \
+#   tcpdump -i wlan1mon -n -l -xx type mgt \
 #     | awk -v CONFIG_FILE=mesh_detect_targets.conf \
 #           -f rid_common.awk -f mesh_wifi_monitor.awk
 #
