@@ -1,5 +1,6 @@
 #!/bin/bash
-# Title: Flock-Sky-Spy - Combined Flock Safety + Drone Remote ID Detector
+# Title: Counter-Surveillance-Pager - Flock + Mesh-Detect + Drone Remote ID
+#   (formerly Flock-Sky-Spy -- renamed once scope grew past just Flock/drones)
 # Description: Flock Safety surveillance device detector -- BLE device-name
 #              scanning (unmodified logic from Flock-You / Flock_Detect) PLUS
 #              a port of flock-you's current WiFi method (OUI-gated
@@ -133,25 +134,28 @@
 # pinned down, and a silent wrong guess here fails exactly the same
 # unhelpful way (background awk exits immediately, nothing shows in LOG).
 SCRIPT_DIR="."
-for _candidate in "." "/root/payloads/user/reconnaissance/Flock_Sky_Spy" "$(dirname "$0" 2>/dev/null)"; do
+for _candidate in "." "/root/payloads/user/reconnaissance/Counter_Surveillance_Pager" "$(dirname "$0" 2>/dev/null)"; do
     if [ -n "$_candidate" ] && [ -f "$_candidate/rid_common.awk" ]; then
         SCRIPT_DIR="$_candidate"
         break
     fi
 done
-LOOT_DIR="/root/loot/flock_sky_spy"
-WORK_DIR="/tmp/flock_sky_spy"
+LOOT_DIR="/root/loot/counter_surveillance_pager"
+WORK_DIR="/tmp/counter_surveillance_pager"
 mkdir -p "$LOOT_DIR" "$WORK_DIR"
 rm -f "$WORK_DIR"/*.log "$WORK_DIR"/*.fifo 2>/dev/null
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${LOOT_DIR}/flock_you_${TIMESTAMP}.txt"
+# Renamed from flock_you_<ts>.txt: this file now carries Flock AND
+# Mesh-Detect hits, not just Flock. (Drone Remote ID keeps its own separate
+# log below, unchanged.)
+LOG_FILE="${LOOT_DIR}/surveillance_${TIMESTAMP}.txt"
 DRONE_LOG_FILE="${LOOT_DIR}/drone_rid_${TIMESTAMP}.txt"
 # Created (truncating) here, before any of the capability-detection commands
 # below start appending (2>>) diagnostic output to LOG_FILE -- writing this
 # with `>` again later would silently wipe out those first-run diagnostics
 # right when they're most useful (e.g. did `iw ... type monitor` fail?).
-echo "Flock-Sky-Spy started at $(date)" > "$LOG_FILE"
+echo "Counter-Surveillance-Pager started at $(date)" > "$LOG_FILE"
 echo "Drone Remote ID log started at $(date)" > "$DRONE_LOG_FILE"
 
 BLE_HITS="$WORK_DIR/ble_rid_hits.log"
@@ -256,7 +260,7 @@ WIFI_RID_OK=0
 FLOCK_WIFI_OK=0
 MESH_WIFI_OK=0
 
-LOG yellow "Flock-Sky-Spy started at $(date)"
+LOG yellow "Counter-Surveillance-Pager started at $(date)"
 
 AWK_FILES_OK=1
 for _f in rid_common.awk rid_ble_monitor.awk rid_wifi_monitor.awk; do
