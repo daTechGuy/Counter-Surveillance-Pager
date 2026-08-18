@@ -186,7 +186,7 @@ function flock_sig_matches(arr, start, end,   sigA, sigB) {
 }
 
 function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
-                                   oui, mac, ies_start, r, matched, sig) {
+                                   oui, mac, ies_start, r, matched, sig, rssi, rssi_sfx) {
     if (fnpkt < 4) return
     itlen = hex2dec(fpkt[3]) + hex2dec(fpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -214,14 +214,17 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
     matched = flock_sig_matches(fpkt, ies_start, fnpkt)
     if (!matched && fnpkt - 4 >= ies_start) matched = flock_sig_matches(fpkt, ies_start, fnpkt - 4)
 
+    rssi = wifi_rssi(fpkt, itlen, fnpkt)
+    rssi_sfx = (rssi != 127) ? "|rssi=" rssi : ""
+
     if (matched) {
-        print "wifi_flock|" mac "|wildcard_probe_ie_sig|oui=" oui "|conf=high"
+        print "wifi_flock|" mac "|wildcard_probe_ie_sig|oui=" oui "|conf=high" rssi_sfx
     } else {
         sig = flock_build_ie_sig(fpkt, ies_start, fnpkt)
         if (sig == "" && fnpkt - 4 >= ies_start) sig = flock_build_ie_sig(fpkt, ies_start, fnpkt - 4)
         if (sig == "") sig = "unparseable"
         gsub(/\|/, ";", sig)   # keep "|" as our own field delimiter in the loot line
-        print "wifi_flock|" mac "|wildcard_probe_oui_only|oui=" oui "|conf=low|sig=" sig
+        print "wifi_flock|" mac "|wildcard_probe_oui_only|oui=" oui "|conf=low|sig=" sig rssi_sfx
     }
     fflush()
 }

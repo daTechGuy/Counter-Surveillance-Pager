@@ -225,14 +225,15 @@ function emit_hit(src, mac, arr, base, rssi,    mtype, fields) {
 
 # ODID_MessagePack_encoded: header(1) + SingleMessageSize(1) + MsgPackSize(1)
 # + up to 9x 25-byte messages. base = 1-indexed position of the header byte.
-function emit_message_pack(src, mac, arr, base,    single_size, pack_size, i, msg_base) {
+# rssi is optional (5th arg) and just passed through to each emit_hit() call.
+function emit_message_pack(src, mac, arr, base, rssi,    single_size, pack_size, i, msg_base) {
     single_size = hex2dec(arr[base + 1])
     if (single_size == 0) single_size = 25
     pack_size = hex2dec(arr[base + 2])
     if (pack_size > 9) pack_size = 9
     msg_base = base + 3
     for (i = 0; i < pack_size; i++) {
-        emit_hit(src, mac, arr, msg_base)
+        emit_hit(src, mac, arr, msg_base, rssi)
         msg_base += single_size
     }
 }
@@ -273,4 +274,22 @@ function ble_total_adv_len(arr, len_start, nreports,    r, total) {
 function ble_rssi_for(arr, rssi_start, r, pkt_len) {
     if (rssi_start + r > pkt_len) return 127
     return sign8(hex2dec(arr[rssi_start + r]))
+}
+
+# WiFi RSSI (radiotap Antenna Signal, dBm) -- deliberately NOT a general
+# radiotap present-flags walk: this device's driver was confirmed live
+# (11 real captures, cross-checked byte-for-byte against tcpdump's own
+# decoded "-NNdBm signal" line for every single one) to always emit a
+# radiotap header in the same fixed 56-byte layout already relied on
+# everywhere in this project for dot11_start (itlen==56), and within that
+# fixed layout, 0-indexed byte offset 30 is always the Antenna Signal
+# field. Deliberately does NOT try to be correct for any other itlen --
+# an itlen this project has never actually seen from this hardware would
+# mean a different, unconfirmed field layout, and guessing at that is
+# worse than just not reporting RSSI: returns 127 (same "not available"
+# sentinel as ble_rssi_for()) for anything other than the confirmed case.
+function wifi_rssi(arr, itlen, pkt_len) {
+    if (itlen != 56) return 127
+    if (31 > pkt_len) return 127
+    return sign8(hex2dec(arr[31]))
 }

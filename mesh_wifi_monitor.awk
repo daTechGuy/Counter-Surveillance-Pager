@@ -77,7 +77,7 @@ END {
     if (mesh_have_targets && mstarted && mnpkt > 0) process_mesh_packet()
 }
 
-function process_mesh_packet(    itlen, dot11_start, b0, ftype, oui, full_mac, mac, matchkind) {
+function process_mesh_packet(    itlen, dot11_start, b0, ftype, oui, full_mac, mac, matchkind, rssi) {
     if (mnpkt < 4) return
     itlen = hex2dec(mpkt[3]) + hex2dec(mpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -96,6 +96,7 @@ function process_mesh_packet(    itlen, dot11_start, b0, ftype, oui, full_mac, m
     if (matchkind == "") return
 
     mac = mac_str_dot11(mpkt, dot11_start + 10)
-    print "wifi_mesh|" mac "|" matchkind
+    rssi = wifi_rssi(mpkt, itlen, mnpkt)
+    print "wifi_mesh|" mac "|" matchkind ((rssi != 127) ? "|rssi=" rssi : "")
     fflush()
 }

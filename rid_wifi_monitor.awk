@@ -61,7 +61,7 @@ END {
 # layout. Mixing these two up (which the first, python version of this
 # payload did) silently breaks multi-message vendor IEs, so this is called
 # out explicitly rather than sharing a helper with the BLE side.
-function scan_wifi_beacon_ies(arr, start, end, mac,    i, elemid, elen, o1, o2, o3, ouitype, svcbase) {
+function scan_wifi_beacon_ies(arr, start, end, mac, rssi,    i, elemid, elen, o1, o2, o3, ouitype, svcbase) {
     i = start
     while (i + 1 <= end) {
         elemid = hex2dec(arr[i])
@@ -71,7 +71,7 @@ function scan_wifi_beacon_ies(arr, start, end, mac,    i, elemid, elen, o1, o2, 
             ouitype = hex2dec(arr[i + 5])
             if (o1 == "FA" && o2 == "0B" && o3 == "BC" && ouitype == 13) {
                 svcbase = i + 6   # message_counter byte; pack starts right after it
-                emit_message_pack("wifi_beacon", mac, arr, svcbase + 1)
+                emit_message_pack("wifi_beacon", mac, arr, svcbase + 1, rssi)
             }
         }
         i += 2 + elen
@@ -79,7 +79,7 @@ function scan_wifi_beacon_ies(arr, start, end, mac,    i, elemid, elen, o1, o2, 
     }
 }
 
-function scan_wifi_nan(arr, start, end, mac,    category, action_code, o1, o2, o3, ouitype, \
+function scan_wifi_nan(arr, start, end, mac, rssi,    category, action_code, o1, o2, o3, ouitype, \
                         i, attrid, attrlen, svcid_ok, svcinfolen, svcbase) {
     if (start + 5 > end) return
     category = hex2dec(arr[start])
@@ -102,7 +102,7 @@ function scan_wifi_nan(arr, start, end, mac,    category, action_code, o1, o2, o
                 svcinfolen = hex2dec(arr[i + 12])
                 svcbase = i + 13   # message_counter byte
                 if (svcinfolen >= 1) {
-                    emit_message_pack("wifi_nan", mac, arr, svcbase + 1)
+                    emit_message_pack("wifi_nan", mac, arr, svcbase + 1, rssi)
                 }
             }
         }
@@ -111,7 +111,7 @@ function scan_wifi_nan(arr, start, end, mac,    category, action_code, o1, o2, o
     }
 }
 
-function process_wifi_packet(    itlen, dot11_start, b0, ftype, stype, sa, body_start, ies_start) {
+function process_wifi_packet(    itlen, dot11_start, b0, ftype, stype, sa, body_start, ies_start, rssi) {
     if (npkt < 4) return
     itlen = hex2dec(pkt[3]) + hex2dec(pkt[4]) * 256
     dot11_start = 1 + itlen
@@ -124,11 +124,12 @@ function process_wifi_packet(    itlen, dot11_start, b0, ftype, stype, sa, body_
 
     sa = mac_str_dot11(pkt, dot11_start + 10)
     body_start = dot11_start + 24
+    rssi = wifi_rssi(pkt, itlen, npkt)
 
     if (stype == 8) {            # Beacon
         ies_start = body_start + 12   # skip fixed beacon fields (timestamp+interval+capability)
-        if (ies_start <= npkt) scan_wifi_beacon_ies(pkt, ies_start, npkt, sa)
+        if (ies_start <= npkt) scan_wifi_beacon_ies(pkt, ies_start, npkt, sa, rssi)
     } else if (stype == 13) {    # Action (public action frames carry NAN)
-        if (body_start <= npkt) scan_wifi_nan(pkt, body_start, npkt, sa)
+        if (body_start <= npkt) scan_wifi_nan(pkt, body_start, npkt, sa, rssi)
     }
 }

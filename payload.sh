@@ -894,9 +894,17 @@ handle_flock_ble_line() {
     [ -z "$mac" ] && return
     if echo "$SEEN_STRONG" | grep -q "$mac BLE_FLOCK_UUID"; then return; fi
 
+    # $kv is just "|rssi=N" or "" -- flock_ble_monitor.awk has no other
+    # trailing fields on this line, unlike the other handlers that need to
+    # split rssi out of a value they'd otherwise use for something else.
+    local rssi_sfx=""
+    case "$kv" in
+        *rssi=*) rssi_sfx=" | rssi=${kv#*rssi=}" ;;
+    esac
+
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
-    ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$GPS_TAG"
+    ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
     LOG yellow "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
     DETECTIONS=$((DETECTIONS + 1))
@@ -944,15 +952,28 @@ handle_mesh_wifi_line() {
     [ -z "$mac" ] && return
     if echo "$SEEN_STRONG" | grep -q "$mac WIFI_MESH\|$mac MESH_BLE"; then return; fi
 
+    # wifi_mesh|MAC|matchkind was an exact 3-field fit for the 3 `read` vars
+    # above before RSSI was added, so a trailing "|rssi=N" lands INSIDE
+    # $matchkind instead of its own field -- split it back out here, since
+    # mesh_vendor_label() below does an exact `case` match against
+    # matchkind's OUI/MAC and would silently stop matching anything with
+    # "|rssi=-45" stuck on the end.
+    local rssi=""
+    case "$matchkind" in
+        *"|rssi="*) rssi="${matchkind#*|rssi=}"; matchkind="${matchkind%%|rssi=*}" ;;
+    esac
+    local rssi_sfx=""
+    [ -n "$rssi" ] && rssi_sfx=" | rssi=$rssi"
+
     local vendor
     vendor=$(mesh_vendor_label "${matchkind#*:}")
 
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
     if [ -n "$vendor" ]; then
-        ENTRY="DECT: $CURRENT_TIME | $mac | $vendor detected (WiFi, $matchkind)$GPS_TAG"
+        ENTRY="DECT: $CURRENT_TIME | $mac | $vendor detected (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
     else
-        ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$GPS_TAG"
+        ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
     fi
     LOG "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
@@ -1049,9 +1070,30 @@ handle_deauth_line() {
     local now
     now=$(date +%s)
 
+    # deauth_eviltwin_monitor.awk's deauth line already had 5 pipe-fields
+    # (kind,mac,dst,subtype,count) before RSSI was added, an exact fit for
+    # the 5 `read` vars above -- so a trailing "|rssi=N" there lands INSIDE
+    # $f5 as e.g. "10|rssi=-45" (embedded pipe) instead of a clean count,
+    # breaking the arithmetic below. eviltwin's line only had 4 fields
+    # before, so its optional rssi gets its own clean 5th field instead
+    # ("rssi=-45", no embedded pipe) -- the two branches need different
+    # extraction because of that, not one shared one.
+    local rssi=""
+    if [ "$kind" = "deauth" ]; then
+        case "$f5" in
+            *"|rssi="*) rssi="${f5#*|rssi=}"; f5="${f5%%|rssi=*}" ;;
+        esac
+    elif [ "$kind" = "eviltwin" ]; then
+        case "$f5" in
+            rssi=*) rssi="${f5#rssi=}" ;;
+        esac
+    fi
+    local rssi_sfx=""
+    [ -n "$rssi" ] && rssi_sfx=" | rssi=$rssi"
+
     if [ "$kind" = "deauth" ]; then
         local dst="$f3" subtype="$f4" count="$f5"
-        echo "$(date '+%H:%M:%S') | deauth | $mac -> $dst | $subtype | count=$count$GPS_TAG" >> "$DEAUTH_LOG_FILE"
+        echo "$(date '+%H:%M:%S') | deauth | $mac -> $dst | $subtype | count=$count$rssi_sfx$GPS_TAG" >> "$DEAUTH_LOG_FILE"
 
         local last_count="${DEAUTH_LAST_COUNT[$mac]:-0}" last_time="${DEAUTH_LAST_TIME[$mac]:-$now}"
         local delta_count=$((count - last_count))
@@ -1081,7 +1123,7 @@ handle_deauth_line() {
 
     if [ "$kind" = "eviltwin" ]; then
         local ssid="$f3"
-        echo "$(date '+%H:%M:%S') | eviltwin | bssid=$mac | ssid=$ssid$GPS_TAG" >> "$DEAUTH_LOG_FILE"
+        echo "$(date '+%H:%M:%S') | eviltwin | bssid=$mac | ssid=$ssid$rssi_sfx$GPS_TAG" >> "$DEAUTH_LOG_FILE"
 
         local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
         [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
@@ -1102,11 +1144,24 @@ handle_rid_line() {
     IFS='|' read -r src mac msgtype kv <<< "$line"
     [ -z "$mac" ] && return
 
+    # emit_hit()'s optional rssi lands as a trailing "|rssi=N" on $kv --
+    # stripped out here BEFORE the grep -o 'field=[^;]*' extractions below,
+    # since those have no semicolon after the last field and would
+    # otherwise swallow "|rssi=N" straight into lon/operator_lon's value
+    # (lon and operator_lon are always the last field in their message
+    # types' k=v;k=v;... string -- see decode_location()/decode_system()).
+    local rssi=""
+    case "$kv" in
+        *"|rssi="*) rssi="${kv#*|rssi=}"; kv="${kv%%|rssi=*}" ;;
+    esac
+    local rssi_sfx=""
+    [ -n "$rssi" ] && rssi_sfx=" | rssi=$rssi"
+
     # $kv's own lat/lon (basic_id/location/system messages) is the DRONE's
     # or its operator's self-reported position via Remote ID -- unrelated to
     # $GPS_TAG below, which is where the Pager itself was standing when it
     # heard it.
-    echo "$(date '+%H:%M:%S') | $src | $mac | $msgtype | $kv$GPS_TAG" >> "$DRONE_LOG_FILE"
+    echo "$(date '+%H:%M:%S') | $src | $mac | $msgtype | $kv$rssi_sfx$GPS_TAG" >> "$DRONE_LOG_FILE"
 
     local summary="$msgtype"
     case "$msgtype" in

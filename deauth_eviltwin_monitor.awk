@@ -119,7 +119,7 @@ function extract_ssid(arr, start, end,    i, id, elen) {
 }
 
 function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
-                                    src, dst, bssid, ies_start, ssid, key, subtype_name) {
+                                    src, dst, bssid, ies_start, ssid, key, subtype_name, rssi, rssi_sfx) {
     if (dnpkt < 4) return
     itlen = hex2dec(dpkt[3]) + hex2dec(dpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -130,13 +130,16 @@ function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
     stype = int(b0 / 16) % 16
     if (ftype != 0) return   # management frames only (tcpdump's "type mgt" filter already ensures this)
 
+    rssi = wifi_rssi(dpkt, itlen, dnpkt)
+    rssi_sfx = (rssi != 127) ? "|rssi=" rssi : ""
+
     if (stype == 12 || stype == 10) {                # Deauth / Disassoc
         src = mac_str_dot11(dpkt, dot11_start + 10)   # addr2: transmitter
         dst = mac_str_dot11(dpkt, dot11_start + 4)    # addr1: destination
         subtype_name = (stype == 12) ? "deauth" : "disassoc"
         key = src
         if (deauth_throttle_ok(key)) {
-            print "deauth|" src "|" dst "|" subtype_name "|" dcount[key]
+            print "deauth|" src "|" dst "|" subtype_name "|" dcount[key] rssi_sfx
             fflush()
         }
         return
@@ -151,7 +154,7 @@ function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
         if ((ssid, tolower(bssid)) in trusted) return   # known-good BSSID for this SSID
         key = ssid "|" tolower(bssid)
         if (deauth_throttle_ok(key)) {
-            print "eviltwin|" bssid "|" ssid "|rogue_bssid"
+            print "eviltwin|" bssid "|" ssid "|rogue_bssid" rssi_sfx
             fflush()
         }
     }
