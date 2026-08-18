@@ -105,6 +105,13 @@
 #                        UNVERIFIED signature (16-bit Service UUID 0x09C8),
 #                        see flock_ble_monitor.awk's header. No config needed
 #                        to be active.
+#   Smart-glasses BLE scan: + awk, hcidump (own reader, alongside the above)
+#                        -- UNVERIFIED company-ID signatures (Meta Ray-Ban/
+#                        Snap Spectacles/Bose Frames/Vuzix/XREAL), see
+#                        glasses_ble_monitor.awk's header. Gated on
+#                        WANT_MESH, not its own menu toggle -- another
+#                        signal for the same category mesh_detect_
+#                        targets.conf's OUI/name entries already cover.
 #   Drone BLE scan    : + awk, hcidump
 #   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
 #   Deauth flood scan : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
@@ -323,16 +330,18 @@ FLOCK_WIFI_HITS="$WORK_DIR/flock_wifi_hits.log"
 MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
 TRACKER_HITS="$WORK_DIR/tracker_hits.log"
 FLOCK_BLE_HITS="$WORK_DIR/flock_ble_hits.log"
+GLASSES_BLE_HITS="$WORK_DIR/glasses_ble_hits.log"
 DEAUTH_HITS="$WORK_DIR/deauth_eviltwin_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$DEAUTH_HITS"
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$GLASSES_BLE_HITS" "$DEAUTH_HITS"
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
 WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
 FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
 MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
 TRACKER_FIFO="$WORK_DIR/tracker_raw.fifo"
 FLOCK_BLE_FIFO="$WORK_DIR/flock_ble_raw.fifo"
+GLASSES_BLE_FIFO="$WORK_DIR/glasses_ble_raw.fifo"
 DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$DEAUTH_FIFO"
+rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
@@ -396,6 +405,8 @@ TRACKER_HCIDUMP_PID=""
 TRACKER_MON_PID=""
 FLOCK_BLE_HCIDUMP_PID=""
 FLOCK_BLE_MON_PID=""
+GLASSES_BLE_HCIDUMP_PID=""
+GLASSES_BLE_MON_PID=""
 DEAUTH_TCPDUMP_PID=""
 DEAUTH_MON_PID=""
 WIFI_HOP_PID=""
@@ -407,10 +418,11 @@ cleanup() {
              "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" \
              "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" \
              "$FLOCK_BLE_HCIDUMP_PID" "$FLOCK_BLE_MON_PID" \
+             "$GLASSES_BLE_HCIDUMP_PID" "$GLASSES_BLE_MON_PID" \
              "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$DEAUTH_FIFO"
+    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -561,6 +573,7 @@ FLOCK_WIFI_OK=0
 MESH_WIFI_OK=0
 TRACKER_BLE_OK=0
 FLOCK_BLE_UUID_OK=0
+GLASSES_BLE_OK=0
 DEAUTH_OK=0
 
 LOG yellow "Counter-Surveillance-Pager started at $(date)"
@@ -647,6 +660,23 @@ elif [ ! -f "$SCRIPT_DIR/flock_ble_monitor.awk" ]; then
     LOG red "Flock BLE (UUID 0x09C8) detection: disabled (flock_ble_monitor.awk not found -- looked in $SCRIPT_DIR)"
 else
     LOG red "Flock BLE (UUID 0x09C8) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
+fi
+
+# Own file-existence gate, same pattern as Flock BLE UUID above -- see
+# glasses_ble_monitor.awk's header for why this is UNVERIFIED. Gated on
+# WANT_MESH, not its own menu toggle -- this is another signal for the
+# same "watchlist/surveillance-adjacent gear" category Mesh-Detect already
+# covers (smart glasses are also in mesh_detect_targets.conf), not a
+# distinct menu item of its own.
+if [ "$WANT_MESH" = "0" ]; then
+    LOG yellow "Smart-glasses BLE (company ID) detection: disabled (not selected in detection menu)"
+elif [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/glasses_ble_monitor.awk" ]; then
+    GLASSES_BLE_OK=1
+    LOG yellow "Smart-glasses BLE (company ID) detection: enabled, UNVERIFIED signatures (hcidump found)"
+elif [ ! -f "$SCRIPT_DIR/glasses_ble_monitor.awk" ]; then
+    LOG red "Smart-glasses BLE (company ID) detection: disabled (glasses_ble_monitor.awk not found -- looked in $SCRIPT_DIR)"
+else
+    LOG red "Smart-glasses BLE (company ID) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
 fi
 
 # The shared wlan1mon radio setup itself is gated on ANY WiFi-side category
@@ -753,6 +783,18 @@ if [ "$FLOCK_BLE_UUID_OK" = "1" ]; then
     FLOCK_BLE_MON_PID=$!
 fi
 
+# Own hcidump process, same adapter/reasoning as the readers just above --
+# see glasses_ble_monitor.awk's header for the UNVERIFIED-signature caveat
+# this detector carries.
+if [ "$GLASSES_BLE_OK" = "1" ]; then
+    mkfifo "$GLASSES_BLE_FIFO"
+    "$HCIDUMP" -i hci0 --raw > "$GLASSES_BLE_FIFO" 2>"$WORK_DIR/glasses_ble_hcidump.log" &
+    GLASSES_BLE_HCIDUMP_PID=$!
+    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/glasses_ble_monitor.awk" \
+        < "$GLASSES_BLE_FIFO" >> "$GLASSES_BLE_HITS" 2>"$WORK_DIR/glasses_ble_monitor.log" &
+    GLASSES_BLE_MON_PID=$!
+fi
+
 if [ "$WIFI_RID_OK" = "1" ]; then
     mkfifo "$WIFI_FIFO"
     # -l: line-buffer tcpdump's own text output so packets reach the awk
@@ -812,6 +854,7 @@ LOG green    "  Penguin"
 LOG magenta  "  Pigvision"
 LOG cyan     "  Other Flock (BLE name match or WiFi wildcard-probe/IE match)"
 LOG yellow   "  Flock? / Flock?? (low-confidence WiFi or UNVERIFIED BLE UUID signature)"
+LOG yellow   "  Glasses?? (UNVERIFIED BLE company-ID signature -- Meta/Snap/Bose/Vuzix/XREAL)"
 LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
 LOG red      "  Drone Remote ID / Rogue BLE Tracker / Deauth Flood / Evil-Twin AP (all same color -- distinguished by alert text)"
 LOG "----------------------------------"
@@ -828,6 +871,7 @@ FLOCK_WIFI_HITS_OFFSET=0
 MESH_WIFI_HITS_OFFSET=0
 TRACKER_HITS_OFFSET=0
 FLOCK_BLE_HITS_OFFSET=0
+GLASSES_BLE_HITS_OFFSET=0
 
 # Per (mac|protocol) tracker state -- see handle_tracker_line(). Keyed on
 # the exact string rogue_tracker_monitor.awk emits as its 3rd field
@@ -975,6 +1019,35 @@ handle_flock_ble_line() {
     DETECTIONS=$((DETECTIONS + 1))
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
+}
+
+# Parse one "ble_glasses|MAC|BRAND|cid=0xNNNN|rssi=N" line from
+# glasses_ble_monitor.awk and LOG/loot it -- see that file's header for why
+# these company-ID-to-brand mappings are UNVERIFIED (sourced from a repo
+# that itself cites no source for any of them). Log-only: no vibrate/LED,
+# same soft tier as the Flock BLE UUID hits, for the same reason -- this is
+# an unproven lead, not a confirmed signature.
+handle_glasses_ble_line() {
+    local line="$1"
+    local src mac brand kv
+    IFS='|' read -r src mac brand kv <<< "$line"
+    [ -z "$mac" ] && return
+    if echo "$SEEN_STRONG" | grep -q "$mac BLE_GLASSES"; then return; fi
+
+    local rssi_sfx=""
+    case "$kv" in
+        *rssi=*) rssi_sfx=" | rssi=${kv#*rssi=}" ;;
+    esac
+    local cid="${kv%%|rssi=*}"
+
+    local CURRENT_TIME ENTRY
+    CURRENT_TIME=$(date '+%H:%M:%S')
+    ENTRY="DECT: $CURRENT_TIME | $mac | Glasses?? ($brand, unverified signature, $cid)$rssi_sfx$GPS_TAG"
+    LOG yellow "$ENTRY"
+    echo "$ENTRY" >> "$LOG_FILE"
+    DETECTIONS=$((DETECTIONS + 1))
+    COUNTER=$((COUNTER + 1))
+    SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
 }
 
 # Vendor-specific alert labels for select Mesh-Detect OUI/MAC hits (used by
@@ -1453,6 +1526,19 @@ while true; do
                 [ -n "$line" ] && handle_flock_ble_line "$line"
             done < <(tail -c "+$((FLOCK_BLE_HITS_OFFSET + 1))" "$FLOCK_BLE_HITS")
             FLOCK_BLE_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Smart-glasses BLE (company ID): drain whatever glasses_ble_
+    # --- monitor.awk found, see that file's header for why this is an
+    # --- UNVERIFIED signature set ---
+    if [ "$GLASSES_BLE_OK" = "1" ]; then
+        NEW_SIZE=$(wc -c < "$GLASSES_BLE_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$GLASSES_BLE_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_glasses_ble_line "$line"
+            done < <(tail -c "+$((GLASSES_BLE_HITS_OFFSET + 1))" "$GLASSES_BLE_HITS")
+            GLASSES_BLE_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 
