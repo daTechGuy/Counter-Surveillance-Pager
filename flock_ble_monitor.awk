@@ -31,6 +31,11 @@
 # radio. Same hcidump reassembly / LE Advertising Report "structure of
 # arrays" parsing already hardware-verified for rid_ble_monitor.awk (see
 # that file's header for the citation).
+#
+# Each hit also carries RSSI (signal strength -- distance from the
+# transmitter, not GPS position) as "|rssi=N" dBm when available, via
+# rid_common.awk's shared ble_total_adv_len()/ble_rssi_for() helpers --
+# same trailing-per-report-RSSI layout rid_ble_monitor.awk's header cites.
 
 BEGIN {
     fbnpkt = 0
@@ -70,7 +75,7 @@ function flock_ble_throttle_ok(key,    c) {
 # Same AD-structure walk as rogue_tracker_monitor.awk's scan_tracker_adv_data,
 # narrowed to just the 16-bit Service UUID list check (AD type 0x02
 # incomplete / 0x03 complete) for UUID 0x09C8.
-function scan_flock_ble_adv_data(arr, start, len, mac,    i, adlen, adtype, u1, u2, j, key) {
+function scan_flock_ble_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, u1, u2, j, key) {
     i = start
     while (i < start + len) {
         adlen = hex2dec(arr[i])
@@ -84,7 +89,7 @@ function scan_flock_ble_adv_data(arr, start, len, mac,    i, adlen, adtype, u1, 
                 if (u1 == "C8" && u2 == "09") {   # UUID 0x09C8, little-endian
                     key = mac "|flock_uuid09c8"
                     if (flock_ble_throttle_ok(key)) {
-                        print "ble_flock|" mac "|uuid_09c8"
+                        print "ble_flock|" mac "|uuid_09c8" ((rssi != "" && rssi != 127) ? "|rssi=" rssi : "")
                         fflush()
                     }
                 }
@@ -98,7 +103,8 @@ function scan_flock_ble_adv_data(arr, start, len, mac,    i, adlen, adtype, u1, 
 # process_ble_packet() / rogue_tracker_monitor.awk's process_tracker_packet()
 # -- see rid_ble_monitor.awk's header for the Bluetooth Core Spec citation.
 function process_flock_ble_packet(    nreports, r, addr_start, len_start, \
-                                       adv_start, addr_base, lendata, mac) {
+                                       adv_start, addr_base, lendata, mac, \
+                                       rssi_start, rssi) {
     if (fbnpkt < 5) return
     if (toupper(fbpkt[1]) != "04") return   # H4 event packet
     if (toupper(fbpkt[2]) != "3E") return   # LE Meta Event
@@ -109,13 +115,15 @@ function process_flock_ble_packet(    nreports, r, addr_start, len_start, \
     addr_start = 6 + nreports + nreports   # skip Event_Types + Address_Types
     len_start  = addr_start + 6 * nreports
     adv_start  = len_start + nreports
+    rssi_start = adv_start + ble_total_adv_len(fbpkt, len_start, nreports)
 
     for (r = 0; r < nreports; r++) {
         addr_base = addr_start + 6 * r
         lendata = hex2dec(fbpkt[len_start + r])
         mac = mac_str_ble(fbpkt, addr_base)
+        rssi = ble_rssi_for(fbpkt, rssi_start, r, fbnpkt)
         if (lendata > 0 && adv_start + lendata - 1 <= fbnpkt) {
-            scan_flock_ble_adv_data(fbpkt, adv_start, lendata, mac)
+            scan_flock_ble_adv_data(fbpkt, adv_start, lendata, mac, rssi)
         }
         adv_start += lendata
     }

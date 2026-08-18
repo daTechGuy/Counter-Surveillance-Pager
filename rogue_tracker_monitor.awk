@@ -81,6 +81,11 @@
 # for the citation) -- not merged into that file via a 3rd -f, for the same
 # reason as the WiFi detectors: its rules end in `next`, which would block
 # anything appended after it in one merged awk program.
+#
+# Each hit also carries RSSI (signal strength -- distance from the
+# transmitter, not GPS position) as "|rssi=N" dBm when available, via
+# rid_common.awk's shared ble_total_adv_len()/ble_rssi_for() helpers --
+# same trailing-per-report-RSSI layout rid_ble_monitor.awk's header cites.
 
 BEGIN {
     tnpkt = 0
@@ -123,8 +128,13 @@ function tracker_throttle_ok(key,    c) {
     return (c == 1 || c % 50 == 0)
 }
 
-function scan_tracker_adv_data(arr, start, len, mac,    i, adlen, adtype, \
-                                u1, u2, b, j, key) {
+# rssi is 127 (not-available sentinel) or a signed dBm value from
+# ble_rssi_for() -- appended as its own "|rssi=N" segment, same optional-
+# trailing-field convention as rid_common.awk's emit_hit(), so it's
+# suppressed rather than printed when not meaningful.
+function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, \
+                                u1, u2, b, j, key, rssi_sfx) {
+    rssi_sfx = (rssi != "" && rssi != 127) ? "|rssi=" rssi : ""
     i = start
     while (i < start + len) {
         adlen = hex2dec(arr[i])
@@ -140,7 +150,7 @@ function scan_tracker_adv_data(arr, start, len, mac,    i, adlen, adtype, \
                 if (b == 18) {                        # 0x12 offline finding
                     key = mac "|applefindmy"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|applefindmy|status=" arr[i + 6]
+                        print "ble_tracker|" mac "|applefindmy|status=" arr[i + 6] rssi_sfx
                         fflush()
                     }
                 }
@@ -151,7 +161,7 @@ function scan_tracker_adv_data(arr, start, len, mac,    i, adlen, adtype, \
                 if (u1 == "ED" && u2 == "FE") {       # Tile (0xFEED)
                     key = mac "|tile"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|tile|"
+                        print "ble_tracker|" mac "|tile|" rssi_sfx
                         fflush()
                     }
                 }
@@ -161,7 +171,7 @@ function scan_tracker_adv_data(arr, start, len, mac,    i, adlen, adtype, \
             if (u1 == "5A" && u2 == "FD") {           # Samsung SmartTag (0xFD5A)
                 key = mac "|smarttag"
                 if (tracker_throttle_ok(key)) {
-                    print "ble_tracker|" mac "|smarttag|"
+                    print "ble_tracker|" mac "|smarttag|" rssi_sfx
                     fflush()
                 }
             } else if (u1 == "AA" && u2 == "FE" && adlen >= 4) {   # Eddystone/FMDN (0xFEAA)
@@ -169,13 +179,13 @@ function scan_tracker_adv_data(arr, start, len, mac,    i, adlen, adtype, \
                 if (b == 65) {                        # 0x41 unwanted tracking
                     key = mac "|fmdn_unwanted"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|fmdn_unwanted|"
+                        print "ble_tracker|" mac "|fmdn_unwanted|" rssi_sfx
                         fflush()
                     }
                 } else if (b == 64) {                 # 0x40 normal
                     key = mac "|fmdn_normal"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|fmdn_normal|"
+                        print "ble_tracker|" mac "|fmdn_normal|" rssi_sfx
                         fflush()
                     }
                 }
@@ -189,7 +199,8 @@ function scan_tracker_adv_data(arr, start, len, mac,    i, adlen, adtype, \
 # rid_ble_monitor.awk's process_ble_packet() -- see that file's header for
 # the Bluetooth Core Spec citation and hardware verification note.
 function process_tracker_packet(    nreports, r, addr_start, len_start, \
-                                     adv_start, addr_base, lendata, mac) {
+                                     adv_start, addr_base, lendata, mac, \
+                                     rssi_start, rssi) {
     if (tnpkt < 5) return
     if (toupper(tpkt[1]) != "04") return   # H4 event packet
     if (toupper(tpkt[2]) != "3E") return   # LE Meta Event
@@ -200,13 +211,15 @@ function process_tracker_packet(    nreports, r, addr_start, len_start, \
     addr_start = 6 + nreports + nreports   # skip Event_Types + Address_Types
     len_start  = addr_start + 6 * nreports
     adv_start  = len_start + nreports
+    rssi_start = adv_start + ble_total_adv_len(tpkt, len_start, nreports)
 
     for (r = 0; r < nreports; r++) {
         addr_base = addr_start + 6 * r
         lendata = hex2dec(tpkt[len_start + r])
         mac = mac_str_ble(tpkt, addr_base)
+        rssi = ble_rssi_for(tpkt, rssi_start, r, tnpkt)
         if (lendata > 0 && adv_start + lendata - 1 <= tnpkt) {
-            scan_tracker_adv_data(tpkt, adv_start, lendata, mac)
+            scan_tracker_adv_data(tpkt, adv_start, lendata, mac, rssi)
         }
         adv_start += lendata
     }

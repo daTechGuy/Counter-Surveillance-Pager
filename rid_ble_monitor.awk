@@ -18,6 +18,12 @@
 # Event_Types first, then all Address_Types, then all Addresses, then all
 # Length_Data, then the concatenated Data blocks, then all RSSIs -- verified
 # against a real single-report capture from this device (see conversation).
+#
+# RSSI (signal strength -- how close the transmitter is, not GPS position)
+# is read from that trailing per-report RSSI byte array and passed through
+# to emit_hit() as "|rssi=N" dBm, via rid_common.awk's shared
+# ble_total_adv_len()/ble_rssi_for() helpers -- the same two used by
+# rogue_tracker_monitor.awk and flock_ble_monitor.awk for this same layout.
 
 BEGIN {
     npkt = 0
@@ -53,7 +59,7 @@ END {
 # advertising carries exactly ONE 25-byte message per advertisement
 # (unlike the WiFi methods, which wrap a full message pack) -- confirmed
 # against transmitter-linux's hci_le_set_advertising_data().
-function scan_ble_adv_data(arr, start, len, mac,    i, adlen, adtype, u1, u2, appcode, msgbase) {
+function scan_ble_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, u1, u2, appcode, msgbase) {
     i = start
     while (i < start + len) {
         adlen = hex2dec(arr[i])
@@ -66,7 +72,7 @@ function scan_ble_adv_data(arr, start, len, mac,    i, adlen, adtype, u1, u2, ap
             if (u1 == "FA" && u2 == "FF" && appcode == 13) {
                 msgbase = i + 6   # skip len, type, uuid(2), appcode, msg_counter
                 if (start + len - msgbase >= 25) {
-                    emit_hit("ble", mac, arr, msgbase)
+                    emit_hit("ble", mac, arr, msgbase, rssi)
                 }
             }
         }
@@ -76,7 +82,7 @@ function scan_ble_adv_data(arr, start, len, mac,    i, adlen, adtype, u1, u2, ap
 
 function process_ble_packet(    nreports, r, evtype_start, addrtype_start, \
                                  addr_start, len_start, adv_start, addr_base, \
-                                 lendata, mac) {
+                                 lendata, mac, rssi_start, rssi) {
     if (npkt < 5) return
     if (toupper(pkt[1]) != "04") return   # H4 event packet
     if (toupper(pkt[2]) != "3E") return   # LE Meta Event
@@ -89,13 +95,15 @@ function process_ble_packet(    nreports, r, evtype_start, addrtype_start, \
     addr_start     = addrtype_start + nreports
     len_start      = addr_start + 6 * nreports
     adv_start      = len_start + nreports
+    rssi_start     = adv_start + ble_total_adv_len(pkt, len_start, nreports)
 
     for (r = 0; r < nreports; r++) {
         addr_base = addr_start + 6 * r
         lendata = hex2dec(pkt[len_start + r])
         mac = mac_str_ble(pkt, addr_base)
+        rssi = ble_rssi_for(pkt, rssi_start, r, npkt)
         if (lendata > 0 && adv_start + lendata - 1 <= npkt) {
-            scan_ble_adv_data(pkt, adv_start, lendata, mac)
+            scan_ble_adv_data(pkt, adv_start, lendata, mac, rssi)
         }
         adv_start += lendata
     }

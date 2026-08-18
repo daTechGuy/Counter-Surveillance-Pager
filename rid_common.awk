@@ -206,13 +206,20 @@ function decode_message_fields(arr, base,    t) {
     return ""
 }
 
-# Emit one "SRC|MAC|MSG_TYPE|k=v;k=v;..." hit line -- same format the bash
-# driver's handle_rid_line() already parses, so payload.sh needed no changes
-# on the consuming side, only in how these producer scripts are launched.
-function emit_hit(src, mac, arr, base,    mtype, fields) {
+# Emit one "SRC|MAC|MSG_TYPE|k=v;k=v;..." hit line, optionally with a
+# trailing "|rssi=N" -- same format the bash driver's handle_rid_line()
+# already parses (its $kv just absorbs the extra segment as trailing text,
+# same as flock_wifi_monitor.awk's conf=/sig= fields), so payload.sh needed
+# no changes on the consuming side. `rssi` is an optional 5th argument --
+# existing 4-argument call sites (rid_wifi_monitor.awk, which has no RSSI
+# to give; emit_message_pack below) are unaffected and get no rssi suffix.
+# 127 is the Bluetooth spec's own "not available" sentinel -- suppressed
+# here rather than printed, same reasoning as GPS_TAG staying empty on no
+# fix instead of printing "gps=0,0".
+function emit_hit(src, mac, arr, base, rssi,    mtype, fields) {
     mtype = msg_type_of(arr, base)
     fields = decode_message_fields(arr, base)
-    print src "|" mac "|" mtype "|" fields
+    print src "|" mac "|" mtype "|" fields ((rssi != "" && rssi != 127) ? "|rssi=" rssi : "")
     fflush()
 }
 
@@ -243,4 +250,27 @@ function mac_str_ble(arr, base,    i, s) {
     s = toupper(arr[base + 5])
     for (i = 4; i >= 0; i--) s = s ":" toupper(arr[base + i])
     return s
+}
+
+# Sums Length_Data[0..nreports-1] -- the total adv-data bytes across every
+# report in one HCI LE Advertising Report event. Added to that event's
+# initial adv_start, this gives the offset where the trailing per-report
+# RSSI byte array begins (Bluetooth Core Spec Vol 4 Part E 7.7.65.2's
+# "structure of arrays" layout: ..., Length_Data[N], Data (concatenated),
+# RSSI[N] -- see rid_ble_monitor.awk's header for the fuller citation).
+# Shared here since rid_ble_monitor.awk, rogue_tracker_monitor.awk, and
+# flock_ble_monitor.awk each walk this same event layout independently.
+function ble_total_adv_len(arr, len_start, nreports,    r, total) {
+    total = 0
+    for (r = 0; r < nreports; r++) total += hex2dec(arr[len_start + r])
+    return total
+}
+
+# Signed RSSI in dBm for report index r (0-based) once rssi_start (=
+# adv_start + ble_total_adv_len(...)) is known, or 127 -- the spec's own
+# "value not available" sentinel -- if the capture is truncated and doesn't
+# actually contain that byte.
+function ble_rssi_for(arr, rssi_start, r, pkt_len) {
+    if (rssi_start + r > pkt_len) return 127
+    return sign8(hex2dec(arr[rssi_start + r]))
 }
