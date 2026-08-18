@@ -446,6 +446,61 @@ wifi_channel_hop() {
 }
 
 # ---------------------------------------------------------------------------
+# Detection category selection -- "what to detect", same idea as the picker
+# cncartistsec/BluePine-WiFi-Pineapple-Pager shows before it scans. The
+# difference: BluePine runs ONE category per scan, so a single-pick LIST_
+# PICKER is enough there. This payload runs every enabled category
+# concurrently in the background for the whole session, so this is a
+# persistent on/off toggle screen instead -- select an item to flip it,
+# "Start scanning" when done. Defaults to everything ON, so hitting "Start
+# scanning" immediately (without touching anything) reproduces this
+# payload's original always-everything-on behavior exactly; this menu only
+# narrows what runs, it can't be used to enable something this hardware/
+# config can't already support (every WANT_* flag below is just one more
+# condition ANDed onto the existing capability gates further down, not a
+# replacement for them).
+# ---------------------------------------------------------------------------
+WANT_FLOCK=1
+WANT_MESH=1
+WANT_TRACKER=1
+WANT_DEAUTH=1
+WANT_DRONE=1
+
+detection_menu_item() {
+    local key="$1" name="$2" val
+    case "$key" in
+        flock) val="$WANT_FLOCK" ;;
+        mesh) val="$WANT_MESH" ;;
+        tracker) val="$WANT_TRACKER" ;;
+        deauth) val="$WANT_DEAUTH" ;;
+        drone) val="$WANT_DRONE" ;;
+    esac
+    if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
+}
+
+if command -v LIST_PICKER >/dev/null 2>&1; then
+    while true; do
+        _resp=$(LIST_PICKER "What to detect (select to toggle)" \
+            "$(detection_menu_item flock 'Flock Safety cameras')" \
+            "$(detection_menu_item mesh 'Mesh-Detect watchlist')" \
+            "$(detection_menu_item tracker 'Rogue BLE trackers')" \
+            "$(detection_menu_item deauth 'Deauth flood / Evil-Twin AP')" \
+            "$(detection_menu_item drone 'Drone Remote ID')" \
+            "Start scanning" \
+            "Start scanning")
+        case "$_resp" in
+            *"Flock Safety cameras") WANT_FLOCK=$((1 - WANT_FLOCK)) ;;
+            *"Mesh-Detect watchlist") WANT_MESH=$((1 - WANT_MESH)) ;;
+            *"Rogue BLE trackers") WANT_TRACKER=$((1 - WANT_TRACKER)) ;;
+            *"Deauth flood / Evil-Twin AP") WANT_DEAUTH=$((1 - WANT_DEAUTH)) ;;
+            *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
+            "Start scanning") break ;;
+            *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_* values rather than looping forever
+        esac
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Capability detection
 # ---------------------------------------------------------------------------
 AWK=$(command -v awk)
@@ -501,13 +556,18 @@ if [ ! -f "$SCRIPT_DIR/deauth_eviltwin_monitor.awk" ]; then
     LOG red "Deauth/evil-twin detection: disabled (deauth_eviltwin_monitor.awk not found -- looked in $SCRIPT_DIR)"
     DEAUTH_AWK_FILE_OK=0
 fi
-if [ "$MESH_BLE_OK" = "1" ]; then
+if [ "$MESH_BLE_OK" = "1" ] && [ "$WANT_MESH" = "0" ]; then
+    LOG yellow "Mesh-Detect BLE detection: disabled (not selected in detection menu)"
+    MESH_BLE_OK=0
+elif [ "$MESH_BLE_OK" = "1" ]; then
     LOG green "Mesh-Detect BLE detection: enabled (${#MESH_OUI_TARGETS[@]} oui, ${#MESH_MAC_TARGETS[@]} mac, ${#MESH_NAME_TARGETS[@]} name target(s))"
 else
     LOG yellow "Mesh-Detect BLE detection: no-op (mesh_detect_targets.conf has no oui:/mac:/name: entries yet)"
 fi
 
-if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$HCIDUMP" ]; then
+if [ "$WANT_DRONE" = "0" ]; then
+    LOG yellow "Drone BLE detection: disabled (not selected in detection menu)"
+elif [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$HCIDUMP" ]; then
     BLE_RID_OK=1
     LOG green "Drone BLE detection: enabled (hcidump found)"
 elif [ "$AWK_FILES_OK" = "1" ]; then
@@ -516,7 +576,9 @@ fi
 
 # Own file-existence gate (like FLOCK_AWK_FILE_OK / MESH_AWK_FILE_OK above) --
 # a missing rogue_tracker_monitor.awk shouldn't take down drone BLE detection.
-if [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
+if [ "$WANT_TRACKER" = "0" ]; then
+    LOG yellow "Rogue tracker BLE detection: disabled (not selected in detection menu)"
+elif [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
     TRACKER_BLE_OK=1
     LOG green "Rogue tracker BLE detection: enabled (hcidump found)"
 elif [ ! -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
@@ -529,7 +591,9 @@ fi
 # flock_ble_monitor.awk's header for why this is an UNVERIFIED signature
 # (only its awk file existing determines whether it runs; it's not gated by
 # anything else, same as rogue tracker BLE above).
-if [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/flock_ble_monitor.awk" ]; then
+if [ "$WANT_FLOCK" = "0" ]; then
+    LOG yellow "Flock BLE (UUID 0x09C8) detection: disabled (not selected in detection menu)"
+elif [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/flock_ble_monitor.awk" ]; then
     FLOCK_BLE_UUID_OK=1
     LOG yellow "Flock BLE (UUID 0x09C8) detection: enabled, UNVERIFIED signature (hcidump found)"
 elif [ ! -f "$SCRIPT_DIR/flock_ble_monitor.awk" ]; then
@@ -538,7 +602,12 @@ else
     LOG red "Flock BLE (UUID 0x09C8) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
 fi
 
-if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP" ] && iw phy phy1 info >/dev/null 2>&1; then
+# The shared wlan1mon radio setup itself is gated on ANY WiFi-side category
+# being wanted -- Flock/Mesh/Deauth WiFi and Drone WiFi each still get their
+# own individual WANT_* check further down, this just skips bringing up the
+# monitor interface at all when every WiFi-side category is turned off.
+if { [ "$WANT_DRONE" = "1" ] || [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_DEAUTH" = "1" ]; } \
+   && [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP" ] && iw phy phy1 info >/dev/null 2>&1; then
     if ! iw dev "$WIFI_IFACE" info >/dev/null 2>&1; then
         if iw phy phy1 interface add "$WIFI_IFACE" type monitor 2>>"$LOG_FILE"; then
             WIFI_IFACE_CREATED=1
@@ -547,36 +616,46 @@ if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP"
     if iw dev "$WIFI_IFACE" info >/dev/null 2>&1; then
         ip link set "$WIFI_IFACE" up 2>>"$LOG_FILE"
         iw dev "$WIFI_IFACE" set channel "${WIFI_CHANNELS%% *}" 2>>"$LOG_FILE"
-        WIFI_RID_OK=1
-        LOG green "Drone WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
         wifi_channel_hop &
         WIFI_HOP_PID=$!
-        if [ "$FLOCK_AWK_FILE_OK" = "1" ]; then
+        if [ "$WANT_DRONE" = "1" ]; then
+            WIFI_RID_OK=1
+            LOG green "Drone WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
+        else
+            LOG yellow "Drone WiFi detection: disabled (not selected in detection menu)"
+        fi
+        if [ "$WANT_FLOCK" = "0" ]; then
+            LOG yellow "Flock WiFi detection: disabled (not selected in detection menu)"
+        elif [ "$FLOCK_AWK_FILE_OK" = "1" ]; then
             FLOCK_WIFI_OK=1
             LOG green "Flock WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
         fi
-        if [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ]; then
+        if [ "$WANT_MESH" = "0" ]; then
+            LOG yellow "Mesh-Detect WiFi detection: disabled (not selected in detection menu)"
+        elif [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ]; then
             MESH_WIFI_OK=1
             LOG green "Mesh-Detect WiFi detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
         elif [ "$MESH_AWK_FILE_OK" = "1" ]; then
             LOG yellow "Mesh-Detect WiFi detection: no-op (mesh_detect_targets.conf has no oui:/mac: entries yet)"
         fi
-        if [ "$DEAUTH_AWK_FILE_OK" = "1" ]; then
+        if [ "$WANT_DEAUTH" = "0" ]; then
+            LOG yellow "Deauth/evil-twin detection: disabled (not selected in detection menu)"
+        elif [ "$DEAUTH_AWK_FILE_OK" = "1" ]; then
             DEAUTH_OK=1
             LOG green "Deauth/evil-twin detection: enabled ($WIFI_IFACE on phy1, hopping ch $WIFI_CHANNELS)"
         fi
     fi
 fi
-if [ "$WIFI_RID_OK" = "0" ] && [ "$AWK_FILES_OK" = "1" ]; then
+if [ "$WIFI_RID_OK" = "0" ] && [ "$AWK_FILES_OK" = "1" ] && [ "$WANT_DRONE" = "1" ]; then
     LOG red "Drone WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
 fi
-if [ "$FLOCK_WIFI_OK" = "0" ] && [ "$FLOCK_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
+if [ "$FLOCK_WIFI_OK" = "0" ] && [ "$FLOCK_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ] && [ "$WANT_FLOCK" = "1" ]; then
     LOG red "Flock WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
 fi
-if [ "$MESH_WIFI_OK" = "0" ] && [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
+if [ "$MESH_WIFI_OK" = "0" ] && [ "$MESH_AWK_FILE_OK" = "1" ] && [ "$MESH_WIFI_TARGETS_PRESENT" = "1" ] && [ "$WIFI_RID_OK" = "0" ] && [ "$WANT_MESH" = "1" ]; then
     LOG red "Mesh-Detect WiFi detection: disabled (need awk+iw+tcpdump and a usable phy1)"
 fi
-if [ "$DEAUTH_OK" = "0" ] && [ "$DEAUTH_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ]; then
+if [ "$DEAUTH_OK" = "0" ] && [ "$DEAUTH_AWK_FILE_OK" = "1" ] && [ "$WIFI_RID_OK" = "0" ] && [ "$WANT_DEAUTH" = "1" ]; then
     LOG red "Deauth/evil-twin detection: disabled (need awk+iw+tcpdump and a usable phy1)"
 fi
 
@@ -1103,6 +1182,15 @@ while true; do
     GPS_TAG=""
     [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
 
+    # hcitool lescan is the shared scan-enabler every hcidump-based BLE
+    # detector piggybacks on (Flock BLE name match below, Mesh-Detect BLE
+    # below, and the independent Drone/Tracker/Flock-UUID hcidump readers
+    # started earlier -- hcidump alone never enables scanning, see this
+    # file's KNOWN LIMITATIONS). Skipped entirely when no BLE-side category
+    # is wanted -- the loop's own `sleep 3` at the bottom still paces it, so
+    # this doesn't turn into a busy-loop, it just iterates faster and spends
+    # that time draining WiFi-side hits instead.
+    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ]; then
     # --- Flock Safety BLE scan cycle (unmodified from Flock-You / Flock_Detect) ---
     hciconfig hci0 down 2>>"$LOG_FILE"
     hciconfig hci0 reset 2>>"$LOG_FILE"
@@ -1112,7 +1200,7 @@ while true; do
     sleep 12
     kill $PID 2>/dev/null
     wait $PID 2>/dev/null
-    if [ -s /tmp/hci_scan.txt ]; then
+    if [ "$WANT_FLOCK" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
         grep -i "fs ext battery\|penguin\|flock\|pigvision" /tmp/hci_scan.txt | sort -u | while read -r full_line; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
@@ -1193,6 +1281,7 @@ while true; do
             SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
+    fi   # closes the WANT_FLOCK/WANT_MESH/WANT_TRACKER/WANT_DRONE BLE-scan gate above
 
     # --- Flock Safety WiFi scan: drain whatever flock_wifi_monitor.awk found ---
     # Uses process substitution (not a `cmd | while` pipe) so the SEEN_STRONG
