@@ -336,6 +336,13 @@ rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FI
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
+# Time-bounded, not permanent like tracker_allowlist.conf -- see
+# snooze_tracker.sh and load_tracker_snooze() below. Lives in WORK_DIR
+# (session-scoped /tmp), not SCRIPT_DIR, since a snooze is a reactive
+# "I know about this one right now" decision, not a saved config -- it's
+# managed entirely by the standalone snooze_tracker.sh CLI tool, never
+# written by this script itself.
+TRACKER_SNOOZE_FILE="$WORK_DIR/tracker_snooze.txt"
 TRACKER_LOG_FILE="${LOOT_DIR}/rogue_trackers_${TIMESTAMP}.txt"
 echo "Rogue BLE tracker log started at $(date)" > "$TRACKER_LOG_FILE"
 # Persistence heuristic thresholds -- see handle_tracker_line() and this
@@ -831,7 +838,25 @@ FLOCK_BLE_HITS_OFFSET=0
 declare -A TRACKER_FIRST_SEEN
 declare -A TRACKER_SIGHTINGS
 declare -A TRACKER_LAST_ALERT
+declare -A TRACKER_SNOOZE
 DEAUTH_HITS_OFFSET=0
+
+# Re-read once per main-loop tick (see the while-loop below), same cadence
+# as GPS_TAG's own refresh -- so a snooze added via snooze_tracker.sh while
+# this session is already running takes effect within one tick, no restart
+# needed. Read-only from this process's side; snooze_tracker.sh is the only
+# writer, so there's no write/write race to worry about between the two.
+# Expired entries are simply never matched (checked at lookup time in
+# handle_tracker_line()) -- nothing here prunes the file itself.
+load_tracker_snooze() {
+    TRACKER_SNOOZE=()
+    [ -f "$TRACKER_SNOOZE_FILE" ] || return
+    local mac_lc expiry note
+    while IFS='|' read -r mac_lc expiry note; do
+        [ -z "$mac_lc" ] && continue
+        TRACKER_SNOOZE["$mac_lc"]="$expiry"
+    done < "$TRACKER_SNOOZE_FILE"
+}
 
 # Per-source-MAC deauth-flood rate state (see handle_deauth_line()) and
 # per-rogue-BSSID evil-twin alert cooldown state. Both keyed simply (MAC),
@@ -1062,9 +1087,12 @@ handle_tracker_line() {
     local mac_lc="${mac,,}"
     [ -n "${TRACKER_ALLOWLIST[$mac_lc]:-}" ] && return
 
-    local key="${mac}|${protocol}"
     local now
     now=$(date +%s)
+    local snooze_until="${TRACKER_SNOOZE[$mac_lc]:-0}"
+    [ "$now" -lt "$snooze_until" ] && return
+
+    local key="${mac}|${protocol}"
     [ -z "${TRACKER_FIRST_SEEN[$key]:-}" ] && TRACKER_FIRST_SEEN[$key]=$now
     TRACKER_SIGHTINGS[$key]=$(( ${TRACKER_SIGHTINGS[$key]:-0} + 1 ))
 
@@ -1276,6 +1304,8 @@ while true; do
     GPS_FIX=$(get_gps_fix)
     GPS_TAG=""
     [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
+
+    load_tracker_snooze
 
     # hcitool lescan is the shared scan-enabler every hcidump-based BLE
     # detector piggybacks on (Flock BLE name match below, Mesh-Detect BLE
