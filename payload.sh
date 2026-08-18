@@ -12,7 +12,13 @@
 #              modeled on Esp32-oui-sniffer (part of the mesh-detect hardware
 #              family), config-driven via mesh_detect_targets.conf since that
 #              firmware's target list is itself user-configured (there's no
-#              baked-in list to port) -- combined with an Open Drone ID
+#              baked-in list to port) -- watchlist now also covers smart
+#              glasses/AR wearables (Vuzix, Snap Spectacles, Ray-Ban Meta by
+#              name; see mesh_detect_targets.conf's own header for why Meta/
+#              Amazon/Razer's OUIs are TIER 2, opt-in, not active by default)
+#              -- PLUS an experimental, explicitly UNVERIFIED BLE signature
+#              for Flock cameras (16-bit Service UUID 0x09C8, see
+#              flock_ble_monitor.awk's header) -- combined with an Open Drone ID
 #              (ASTM F3411) detector covering all three broadcast transports:
 #              BLE legacy advertising, WiFi Beacon, and WiFi NAN -- ported
 #              from the Sky-Spy ESP32 firmware's detection approach onto the
@@ -109,6 +115,35 @@
 #                        entry
 # ============================================================================
 #
+# CROSS-CUTTING FEATURES (not tied to one detector):
+#   "What to detect" menu: a LIST_PICKER toggle screen at startup (WANT_FLOCK/
+#     WANT_MESH/WANT_TRACKER/WANT_DEAUTH/WANT_DRONE), same idea as the picker
+#     cncartistsec/BluePine-WiFi-Pineapple-Pager shows before scanning --
+#     difference is this payload runs every enabled category concurrently
+#     for the whole session (BluePine scans one at a time), so it's a
+#     persistent per-category toggle, not a single pick. Defaults to
+#     everything on; falls back to all-on silently if LIST_PICKER isn't
+#     available (e.g. run outside the Pager's own UI).
+#   GPS tagging: every hit line gets an optional "| gps=LAT,LON" suffix via
+#     the Pager's own GPS_GET command (a thin wrapper over pineapd's HTTP
+#     API -- same platform-builtin convention as LOG/LED/RINGTONE, not
+#     gpsd/gpspipe talked to directly). No-op with no GPS hardware attached
+#     (GPS_GET's own "0 0 0 0" no-fix sentinel), starts tagging
+#     automatically once a GPS source (dongle or mobile2gps) exists -- see
+#     get_gps_fix()'s comment for the confirmed-live details.
+#   RSSI (signal strength): every hit line also gets an optional
+#     "|rssi=N" (dBm) -- BLE via the HCI LE Advertising Report's own
+#     trailing per-report RSSI byte (rid_common.awk's ble_rssi_for()), WiFi
+#     via a hardware-confirmed fixed radiotap byte offset (wifi_rssi()) --
+#     see both functions' comments for exactly how each was verified. Lets
+#     you tell "right next to me" from "a block away" without needing GPS.
+#   export_gps_kml.sh / export_gps_kml.awk: standalone companion tool (not
+#     run automatically) that turns a session's GPS-tagged hits into a KML
+#     file for Google Earth/My Maps, color-coded by category. Run it
+#     manually after a session once GPS hardware is attached and has
+#     actually recorded fixes -- see that script's own header.
+# ============================================================================
+#
 # WIFI RADIO: phy1/wlan1mon -- confirmed live on hardware (drove past a real
 # Flock camera, got no hit) that this is the Pager's own default-configured
 # primary recon interface (/etc/config/pineapd: `bands '2,5'`, `hop '1'`,
@@ -163,15 +198,20 @@
 #    channel outside 11/6/1, will still be missed -- same for a Mesh-Detect
 #    target whose beacon/probe traffic never lands on one of those channels.
 #  - Rogue tracker detection's persistence heuristic (see
-#    handle_tracker_line() below) has no GPS and can't tell "this tracker
-#    has followed me across locations" from "this tracker has sat 15+
-#    minutes near wherever the Pager itself is sitting" -- it's the same
-#    class of heuristic Apple/Android's own on-device detection uses, just
-#    without their location-diversity refinement. A tracker in a stationary
-#    neighboring apartment/vehicle you're not near could false-positive if
-#    you happen to stay put nearby for the persistence window; a tracker
-#    that boards a fast-moving vehicle you're not in but that happens to sit
-#    near the Pager only briefly could false-negative.
+#    handle_tracker_line() below) is still purely time/sighting-count-based,
+#    not location-diversity-based, and so still can't tell "this tracker has
+#    followed me across locations" from "this tracker has sat 15+ minutes
+#    near wherever the Pager itself is sitting" -- it's the same class of
+#    heuristic Apple/Android's own on-device detection uses, just without
+#    their location-diversity refinement. GPS tagging (added since this
+#    limitation was first written) DOES now log a lat/lon with every
+#    sighting in TRACKER_LOG_FILE -- so the raw data to add real location-
+#    diversity exists once GPS hardware is attached -- but the live
+#    eligibility decision in handle_tracker_line() doesn't consume it yet.
+#    A tracker in a stationary neighboring apartment/vehicle you're not near
+#    could still false-positive if you stay put nearby for the persistence
+#    window; a tracker that boards a fast-moving vehicle you're not in but
+#    happens to sit near the Pager only briefly could still false-negative.
 #  - Rogue tracker allowlisting (tracker_allowlist.conf) needs periodic
 #    maintenance for the three protocols with rotating MACs (Apple/Samsung/
 #    Google) -- see that file's header for why there's no "add once, forget
