@@ -11,20 +11,51 @@
 #
 # Read-only: greps/counts against the loot files, doesn't touch anything
 # live. Safe to run alongside an active payload session or after one ends.
+#
+# ARCHIVE-AWARE: see export_gps_kml.sh's header for the full explanation --
+# this Pager's "Archive Loot" web UI feature doesn't stop a running payload,
+# so using it mid-session splits that session's log files between the live
+# path and /root/loot/archive/archive-<timestamp>/. resolve_loot_file()
+# below finds both halves (if both exist) and stitches them back together.
 
 set -u
 LOOT_DIR="/root/loot/counter_surveillance_pager"
+ARCHIVE_GLOB="/root/loot/archive/archive-*/counter_surveillance_pager"
+SCRATCH_DIR="/tmp/counter_surveillance_pager"
 
-if [ ! -d "$LOOT_DIR" ]; then
-    echo "No loot directory found at $LOOT_DIR -- has this payload ever run?" >&2
-    exit 1
-fi
+resolve_loot_file() {
+    # Split across separate `local` statements deliberately: `local
+    # fname="$1" live="$LOOT_DIR/$fname"` on one line tripped `set -u`'s
+    # unbound-variable check on THIS device's bash -- $fname isn't
+    # reliably available yet for a later assignment on the same `local`
+    # line as its own declaration. Confirmed live, not theoretical.
+    local fname="$1"
+    local live="$LOOT_DIR/$fname"
+    local archived="" d candidate
+    for d in $(ls -td $ARCHIVE_GLOB/ 2>/dev/null); do
+        candidate="${d}${fname}"
+        if [ -s "$candidate" ]; then archived="$candidate"; break; fi
+    done
+    local live_has=0 archived_has=0
+    [ -s "$live" ] && live_has=1
+    [ -n "$archived" ] && archived_has=1
+    if [ "$live_has" = "1" ] && [ "$archived_has" = "1" ]; then
+        mkdir -p "$SCRATCH_DIR"
+        local combined="$SCRATCH_DIR/.resolved_${fname}"
+        cat "$archived" "$live" > "$combined"
+        echo "$combined"
+    elif [ "$live_has" = "1" ]; then
+        echo "$live"
+    elif [ "$archived_has" = "1" ]; then
+        echo "$archived"
+    fi
+}
 
 TS="${1:-}"
 if [ -z "$TS" ]; then
-    LATEST=$(ls -t "$LOOT_DIR"/surveillance_*.txt 2>/dev/null | head -1)
+    LATEST=$(ls -t "$LOOT_DIR"/surveillance_*.txt $ARCHIVE_GLOB/surveillance_*.txt 2>/dev/null | head -1)
     if [ -z "$LATEST" ]; then
-        echo "No surveillance_*.txt session logs found in $LOOT_DIR" >&2
+        echo "No surveillance_*.txt session logs found in $LOOT_DIR or $ARCHIVE_GLOB" >&2
         exit 1
     fi
     TS="$(basename "$LATEST")"
@@ -32,10 +63,10 @@ if [ -z "$TS" ]; then
     TS="${TS%.txt}"
 fi
 
-SURV="$LOOT_DIR/surveillance_${TS}.txt"
-TRACK="$LOOT_DIR/rogue_trackers_${TS}.txt"
-DEAUTH="$LOOT_DIR/deauth_eviltwin_${TS}.txt"
-DRONE="$LOOT_DIR/drone_rid_${TS}.txt"
+SURV="$(resolve_loot_file "surveillance_${TS}.txt")"
+TRACK="$(resolve_loot_file "rogue_trackers_${TS}.txt")"
+DEAUTH="$(resolve_loot_file "deauth_eviltwin_${TS}.txt")"
+DRONE="$(resolve_loot_file "drone_rid_${TS}.txt")"
 
 # Count matches of a pattern in a file, always printing a clean integer
 # (grep -c prints 0 on no match already, but exits nonzero for it under
@@ -99,7 +130,8 @@ if [ -f "$TRACK" ]; then
         echo "        sighting=N count of 3+ spread over 15+ minutes (or any"
         echo "        FMDN-unwanted sighting) would have crossed this session's"
         echo "        persistence threshold and triggered a loud alert. Check"
-        echo "        the sighting= counts above per-MAC in $TRACK directly."
+        echo "        the sighting= counts above per-MAC in this session's"
+        echo "        rogue_trackers_${TS}.txt (live and/or archived copy)."
     fi
 else
     echo "Rogue BLE trackers: no rogue_trackers_${TS}.txt found"
