@@ -25,8 +25,11 @@
 # fires on OUI + wildcard-probe alone; the signature match is reported as a
 # confidence tier (conf=high/low) instead of a hard filter, and a
 # non-matching hit's actual IE signature is logged (sig=...) so real field
-# data can grow FLOCK_SIG_PRIMARY into a confirmed set over time instead of
-# staying one static guess.
+# data can grow FLOCK_SIG_KNOWN into a confirmed set over time instead of
+# staying one static guess -- already happened once, see
+# FLOCK_SIG_FIELD_20260818A below: a second real camera, parked next to at
+# close range, turned out to use a signature with a different IE order AND
+# set than the original upstream one, not just a minor variation.
 #
 # OUI LIST REFRESH (31 -> 40 entries): flock-you's own main.cpp hadn't yet
 # picked up a newer OUI set that colonelpanichacks/oui-spy-unified-blue (his
@@ -79,7 +82,27 @@ BEGIN {
           _flock_ouis, " ")
     for (_flock_i in _flock_ouis) flock_oui[_flock_ouis[_flock_i]] = 1
 
-    FLOCK_SIG_PRIMARY = "2,12,127,221:506f9a16030103,45,191,221:0050f208000000"
+    # Known-good IE signatures -- a match against ANY of these earns
+    # conf=high; anything else stays conf=low (OUI+wildcard-probe matched,
+    # signature didn't) per this file's own field-driven design above.
+    # Starts as one guess, grows as real captures come in -- see each
+    # entry's own citation.
+    FLOCK_SIG_UPSTREAM = "2,12,127,221:506f9a16030103,45,191,221:0050f208000000"
+    # ^ flock-you's own original published fingerprint (main.cpp,
+    # FLOCK_PROBE_IE_SIG_PRIMARY) -- see this file's header.
+    FLOCK_SIG_KNOWN[FLOCK_SIG_UPSTREAM] = 1
+
+    FLOCK_SIG_FIELD_20260818A = "1,50,45,191,255,70,127,221:506f9a16030103"
+    # ^ Captured live 2026-08-18: OUI 9c:2f:9d (the Bosch-radio-module OUI
+    # already cross-referenced in mesh_detect_targets.conf), RSSI -22 to
+    # -31dBm parked directly next to the camera -- unambiguous proximity,
+    # not a coincidental nearby device on the same OUI. Different IE order
+    # AND set than FLOCK_SIG_UPSTREAM (only "127" and the vendor IE
+    # "221:506f9a16030103" are shared) -- confirms different camera
+    # hardware/firmware revisions produce genuinely different wildcard-
+    # probe signatures, exactly the divergence conf=low + sig= logging
+    # exists to surface. This is that captured data, unmodified.
+    FLOCK_SIG_KNOWN[FLOCK_SIG_FIELD_20260818A] = 1
 }
 
 # Repeat-emission throttle per transmitter MAC, same 1st + every-10th pattern
@@ -177,10 +200,10 @@ function flock_build_ie_sig(arr, start, end,   i, id, elen, sig, part, j, take) 
 # single walk expects it.
 function flock_sig_matches(arr, start, end,   sigA, sigB) {
     sigA = flock_build_ie_sig(arr, start, end)
-    if (sigA == FLOCK_SIG_PRIMARY) return 1
+    if (sigA in FLOCK_SIG_KNOWN) return 1
     if (start + 1 <= end && arr[start] == "00" && arr[start + 1] == "00") {
         sigB = flock_build_ie_sig(arr, start + 2, end)
-        if (sigB == FLOCK_SIG_PRIMARY) return 1
+        if (sigB in FLOCK_SIG_KNOWN) return 1
     }
     return 0
 }
