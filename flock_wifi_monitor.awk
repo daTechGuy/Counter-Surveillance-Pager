@@ -17,6 +17,17 @@
 # clean tcpdump/radiotap capture doesn't have that quirk; a malformed TLV
 # here just aborts that one signature attempt (see flock_build_ie_sig).
 #
+# DEVIATION FROM UPSTREAM (field-driven): upstream requires the exact IE
+# signature match to fire at all. Confirmed live (drove past real Flock
+# cameras, zero hits, zero diagnostic trail) that this is too brittle to be
+# the hard gate -- one fingerprint captured from one drive-test doesn't
+# necessarily cover every camera model/firmware revision. Detection now
+# fires on OUI + wildcard-probe alone; the signature match is reported as a
+# confidence tier (conf=high/low) instead of a hard filter, and a
+# non-matching hit's actual IE signature is logged (sig=...) so real field
+# data can grow FLOCK_SIG_PRIMARY into a confirmed set over time instead of
+# staying one static guess.
+#
 # OUI LIST REFRESH (31 -> 40 entries): flock-you's own main.cpp hadn't yet
 # picked up a newer OUI set that colonelpanichacks/oui-spy-unified-blue (his
 # own consolidated multi-detector firmware) already had, sourced from
@@ -69,6 +80,17 @@ BEGIN {
     for (_flock_i in _flock_ouis) flock_oui[_flock_ouis[_flock_i]] = 1
 
     FLOCK_SIG_PRIMARY = "2,12,127,221:506f9a16030103,45,191,221:0050f208000000"
+}
+
+# Repeat-emission throttle per transmitter MAC, same 1st + every-10th pattern
+# as deauth_eviltwin_monitor.awk's -- needed now that a match no longer
+# requires the byte-exact signature (see process_flock_packet): a real
+# camera sending wildcard probes on its own interval would otherwise get a
+# loot-log line (and a physical alert, via payload.sh) every single time.
+function flock_throttle_ok(key,    c) {
+    fcount[key]++
+    c = fcount[key]
+    return (c == 1 || c % 10 == 0)
 }
 
 /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
@@ -164,7 +186,7 @@ function flock_sig_matches(arr, start, end,   sigA, sigB) {
 }
 
 function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
-                                   oui, mac, ies_start, r, matched) {
+                                   oui, mac, ies_start, r, matched, sig) {
     if (fnpkt < 4) return
     itlen = hex2dec(fpkt[3]) + hex2dec(fpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -184,11 +206,22 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
     if (r == -1 && fnpkt - 4 >= ies_start) r = flock_is_wildcard(fpkt, ies_start, fnpkt - 4)
     if (r != 1) return
 
+    # OUI + wildcard-probe is now the hard gate; signature is a confidence
+    # tier, not a filter -- see file header's DEVIATION FROM UPSTREAM note.
+    mac = mac_str_dot11(fpkt, dot11_start + 10)
+    if (!flock_throttle_ok(mac)) return
+
     matched = flock_sig_matches(fpkt, ies_start, fnpkt)
     if (!matched && fnpkt - 4 >= ies_start) matched = flock_sig_matches(fpkt, ies_start, fnpkt - 4)
-    if (!matched) return
 
-    mac = mac_str_dot11(fpkt, dot11_start + 10)
-    print "wifi_flock|" mac "|wildcard_probe_ie_sig|oui=" oui
+    if (matched) {
+        print "wifi_flock|" mac "|wildcard_probe_ie_sig|oui=" oui "|conf=high"
+    } else {
+        sig = flock_build_ie_sig(fpkt, ies_start, fnpkt)
+        if (sig == "" && fnpkt - 4 >= ies_start) sig = flock_build_ie_sig(fpkt, ies_start, fnpkt - 4)
+        if (sig == "") sig = "unparseable"
+        gsub(/\|/, ";", sig)   # keep "|" as our own field delimiter in the loot line
+        print "wifi_flock|" mac "|wildcard_probe_oui_only|oui=" oui "|conf=low|sig=" sig
+    }
     fflush()
 }

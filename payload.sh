@@ -95,6 +95,10 @@
 #   Rogue tracker BLE scan: + awk, hcidump (own reader, alongside Drone BLE
 #                        scan's) -- no config needed to be active, but see
 #                        tracker_allowlist.conf re: your own trackers
+#   Flock BLE UUID scan: + awk, hcidump (own reader, alongside the above) --
+#                        UNVERIFIED signature (16-bit Service UUID 0x09C8),
+#                        see flock_ble_monitor.awk's header. No config needed
+#                        to be active.
 #   Drone BLE scan    : + awk, hcidump
 #   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
 #   Deauth flood scan : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
@@ -194,13 +198,15 @@
 #    check, IE-signature match) has been verified against synthetic packets
 #    built to flock-you's own documented signature, and its tcpdump-framing
 #    code reuses the byte offsets already hardware-verified for
-#    rid_wifi_monitor.awk -- but the detection logic itself has NOT yet been
-#    confirmed against a real Flock Safety camera's actual RF, only against
-#    flock-you's published fingerprint constant. If a real camera's IE
-#    signature has drifted from that constant (as it apparently already has
-#    at least once upstream), this will silently miss it the same way the
-#    unmodified BLE path can. Treat this as "ported and unit-tested," not
-#    "field-confirmed."
+#    rid_wifi_monitor.awk. CONFIRMED LIVE this was previously a real problem:
+#    drove past actual Flock cameras, got zero hits and zero diagnostic
+#    trail, because detection required an exact match against flock-you's
+#    one published fingerprint constant -- see flock_wifi_monitor.awk's
+#    "DEVIATION FROM UPSTREAM" header note for the fix (OUI+wildcard-probe is
+#    now the hard gate, IE-signature is a reported confidence tier, and
+#    non-matching hits log their actual signature for field tuning). Still
+#    "field-driven, not yet re-confirmed on the exact cameras that missed" --
+#    the next drive-by is what validates it.
 #  - mesh_wifi_monitor.awk's matching logic (OUI/MAC lookup, config-file
 #    parsing) is likewise only unit-tested against synthetic packets and a
 #    synthetic config file, not run on-device yet -- same "ported and
@@ -276,15 +282,17 @@ WIFI_HITS="$WORK_DIR/wifi_rid_hits.log"
 FLOCK_WIFI_HITS="$WORK_DIR/flock_wifi_hits.log"
 MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
 TRACKER_HITS="$WORK_DIR/tracker_hits.log"
+FLOCK_BLE_HITS="$WORK_DIR/flock_ble_hits.log"
 DEAUTH_HITS="$WORK_DIR/deauth_eviltwin_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$DEAUTH_HITS"
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$DEAUTH_HITS"
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
 WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
 FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
 MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
 TRACKER_FIFO="$WORK_DIR/tracker_raw.fifo"
+FLOCK_BLE_FIFO="$WORK_DIR/flock_ble_raw.fifo"
 DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$DEAUTH_FIFO"
+rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$DEAUTH_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
@@ -339,6 +347,8 @@ MESH_TCPDUMP_PID=""
 MESH_WIFI_MON_PID=""
 TRACKER_HCIDUMP_PID=""
 TRACKER_MON_PID=""
+FLOCK_BLE_HCIDUMP_PID=""
+FLOCK_BLE_MON_PID=""
 DEAUTH_TCPDUMP_PID=""
 DEAUTH_MON_PID=""
 WIFI_HOP_PID=""
@@ -349,10 +359,11 @@ cleanup() {
              "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" \
              "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" \
              "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" \
+             "$FLOCK_BLE_HCIDUMP_PID" "$FLOCK_BLE_MON_PID" \
              "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$DEAUTH_FIFO"
+    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$DEAUTH_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -447,6 +458,7 @@ WIFI_RID_OK=0
 FLOCK_WIFI_OK=0
 MESH_WIFI_OK=0
 TRACKER_BLE_OK=0
+FLOCK_BLE_UUID_OK=0
 DEAUTH_OK=0
 
 LOG yellow "Counter-Surveillance-Pager started at $(date)"
@@ -511,6 +523,19 @@ elif [ ! -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
     LOG red "Rogue tracker BLE detection: disabled (rogue_tracker_monitor.awk not found -- looked in $SCRIPT_DIR)"
 else
     LOG red "Rogue tracker BLE detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
+fi
+
+# Own file-existence gate, same pattern as the checks above -- see
+# flock_ble_monitor.awk's header for why this is an UNVERIFIED signature
+# (only its awk file existing determines whether it runs; it's not gated by
+# anything else, same as rogue tracker BLE above).
+if [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/flock_ble_monitor.awk" ]; then
+    FLOCK_BLE_UUID_OK=1
+    LOG yellow "Flock BLE (UUID 0x09C8) detection: enabled, UNVERIFIED signature (hcidump found)"
+elif [ ! -f "$SCRIPT_DIR/flock_ble_monitor.awk" ]; then
+    LOG red "Flock BLE (UUID 0x09C8) detection: disabled (flock_ble_monitor.awk not found -- looked in $SCRIPT_DIR)"
+else
+    LOG red "Flock BLE (UUID 0x09C8) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
 fi
 
 if [ "$AWK_FILES_OK" = "1" ] && [ -n "$AWK" ] && [ -n "$IW" ] && [ -n "$TCPDUMP" ] && iw phy phy1 info >/dev/null 2>&1; then
@@ -590,6 +615,18 @@ if [ "$TRACKER_BLE_OK" = "1" ]; then
     TRACKER_MON_PID=$!
 fi
 
+# Own hcidump process, same adapter/reasoning as the tracker BLE reader just
+# above -- see flock_ble_monitor.awk's header for the UNVERIFIED-signature
+# caveat this detector carries.
+if [ "$FLOCK_BLE_UUID_OK" = "1" ]; then
+    mkfifo "$FLOCK_BLE_FIFO"
+    "$HCIDUMP" -i hci0 --raw > "$FLOCK_BLE_FIFO" 2>"$WORK_DIR/flock_ble_hcidump.log" &
+    FLOCK_BLE_HCIDUMP_PID=$!
+    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/flock_ble_monitor.awk" \
+        < "$FLOCK_BLE_FIFO" >> "$FLOCK_BLE_HITS" 2>"$WORK_DIR/flock_ble_monitor.log" &
+    FLOCK_BLE_MON_PID=$!
+fi
+
 if [ "$WIFI_RID_OK" = "1" ]; then
     mkfifo "$WIFI_FIFO"
     # -l: line-buffer tcpdump's own text output so packets reach the awk
@@ -648,6 +685,7 @@ LOG yellow   "  FS Ext Battery"
 LOG green    "  Penguin"
 LOG magenta  "  Pigvision"
 LOG cyan     "  Other Flock (BLE name match or WiFi wildcard-probe/IE match)"
+LOG yellow   "  Flock? / Flock?? (low-confidence WiFi or UNVERIFIED BLE UUID signature)"
 LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
 LOG red      "  Drone Remote ID / Rogue BLE Tracker / Deauth Flood / Evil-Twin AP (all same color -- distinguished by alert text)"
 LOG "----------------------------------"
@@ -663,6 +701,7 @@ WIFI_HITS_OFFSET=0
 FLOCK_WIFI_HITS_OFFSET=0
 MESH_WIFI_HITS_OFFSET=0
 TRACKER_HITS_OFFSET=0
+FLOCK_BLE_HITS_OFFSET=0
 
 # Per (mac|protocol) tracker state -- see handle_tracker_line(). Keyed on
 # the exact string rogue_tracker_monitor.awk emits as its 3rd field
@@ -711,10 +750,20 @@ mesh_ble_match() {
     done
 }
 
-# Parse one "wifi_flock|MAC|wildcard_probe_ie_sig|oui=xx:xx:xx" line from
-# flock_wifi_monitor.awk and LOG/loot/vibrate it -- same session-lifetime
-# dedup (SEEN_STRONG) and physical alert as the BLE Flock hits below, so a
-# camera caught by both radios doesn't double up every cycle.
+# Parse one "wifi_flock|MAC|wildcard_probe_ie_sig|oui=xx:xx:xx|conf=high" or
+# "wifi_flock|MAC|wildcard_probe_oui_only|oui=xx:xx:xx|conf=low|sig=..." line
+# from flock_wifi_monitor.awk and LOG/loot/alert it -- same session-lifetime
+# dedup (SEEN_STRONG) as the BLE Flock hits below, so a camera caught by both
+# radios doesn't double up every cycle.
+#
+# Physical alert is tiered by confidence (see flock_wifi_monitor.awk's
+# DEVIATION FROM UPSTREAM note): conf=high (exact upstream IE signature
+# matched) gets the full vibrate+LED. conf=low (OUI+wildcard-probe matched
+# but the signature didn't, so it's either a newer/unfingerprinted camera or
+# a coincidental OUI hit) still gets logged and counted -- dropping it
+# entirely would defeat the point of loosening the match -- but stays
+# softer: log line + LOG_FILE entry only, no vibrate/LED, so a low-confidence
+# hit doesn't buzz your pocket the same as a confirmed one.
 handle_flock_wifi_line() {
     local line="$1"
     local src mac msgtype kv
@@ -722,25 +771,58 @@ handle_flock_wifi_line() {
     [ -z "$mac" ] && return
     if echo "$SEEN_STRONG" | grep -q "$mac WIFI_FLOCK"; then return; fi
 
+    local conf="high"
+    case "$kv" in *"conf=low"*) conf="low" ;; esac
+
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
-    ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)"
-    LOG cyan "$ENTRY"
+    if [ "$conf" = "low" ]; then
+        ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
+        LOG yellow "$ENTRY"
+    else
+        ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)$GPS_TAG"
+        LOG cyan "$ENTRY"
+    fi
     echo "$ENTRY" >> "$LOG_FILE"
     DETECTIONS=$((DETECTIONS + 1))
     COUNTER=$((COUNTER + 1))
-    if [ -f /sys/class/gpio/vibrator/value ]; then
-        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-        sleep 0.15
-        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-    fi
-    if ls /sys/class/leds/* >/dev/null 2>&1; then
-        LED=$(ls /sys/class/leds/* | head -1)
-        echo 1 > "${LED}/brightness" 2>/dev/null
-        sleep 0.3
-        echo 0 > "${LED}/brightness" 2>/dev/null
+    if [ "$conf" = "high" ]; then
+        if [ -f /sys/class/gpio/vibrator/value ]; then
+            echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+            sleep 0.15
+            echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+        fi
+        if ls /sys/class/leds/* >/dev/null 2>&1; then
+            LED=$(ls /sys/class/leds/* | head -1)
+            echo 1 > "${LED}/brightness" 2>/dev/null
+            sleep 0.3
+            echo 0 > "${LED}/brightness" 2>/dev/null
+        fi
     fi
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"
+}
+
+# Parse one "ble_flock|MAC|uuid_09c8" line from flock_ble_monitor.awk and
+# LOG/loot it -- see that file's header for why this signature is UNVERIFIED
+# (never demonstrated against a real camera by anyone this was sourced
+# from). Log-only: no vibrate/LED at all, even softer than a Flock WiFi
+# conf=low hit, since unlike that one this entire detector is an unproven
+# lead rather than a real signature with an unmatched fingerprint.
+handle_flock_ble_line() {
+    local line="$1"
+    local src mac msgtype kv
+    IFS='|' read -r src mac msgtype kv <<< "$line"
+    [ -z "$mac" ] && return
+    if echo "$SEEN_STRONG" | grep -q "$mac BLE_FLOCK_UUID"; then return; fi
+
+    local CURRENT_TIME ENTRY
+    CURRENT_TIME=$(date '+%H:%M:%S')
+    ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$GPS_TAG"
+    LOG yellow "$ENTRY"
+    echo "$ENTRY" >> "$LOG_FILE"
+    DETECTIONS=$((DETECTIONS + 1))
+    COUNTER=$((COUNTER + 1))
+    SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
 }
 
 # Vendor-specific alert labels for select Mesh-Detect OUI/MAC hits (used by
@@ -789,9 +871,9 @@ handle_mesh_wifi_line() {
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
     if [ -n "$vendor" ]; then
-        ENTRY="DECT: $CURRENT_TIME | $mac | $vendor detected (WiFi, $matchkind)"
+        ENTRY="DECT: $CURRENT_TIME | $mac | $vendor detected (WiFi, $matchkind)$GPS_TAG"
     else
-        ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)"
+        ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$GPS_TAG"
     fi
     LOG "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
@@ -848,7 +930,7 @@ handle_tracker_line() {
 
     local label
     label=$(tracker_protocol_label "$protocol")
-    echo "$(date '+%H:%M:%S') | $mac | $label | sighting=${TRACKER_SIGHTINGS[$key]} | $detail" >> "$TRACKER_LOG_FILE"
+    echo "$(date '+%H:%M:%S') | $mac | $label | sighting=${TRACKER_SIGHTINGS[$key]} | $detail$GPS_TAG" >> "$TRACKER_LOG_FILE"
 
     local age=$(( now - TRACKER_FIRST_SEEN[$key] ))
     local eligible=0
@@ -890,7 +972,7 @@ handle_deauth_line() {
 
     if [ "$kind" = "deauth" ]; then
         local dst="$f3" subtype="$f4" count="$f5"
-        echo "$(date '+%H:%M:%S') | deauth | $mac -> $dst | $subtype | count=$count" >> "$DEAUTH_LOG_FILE"
+        echo "$(date '+%H:%M:%S') | deauth | $mac -> $dst | $subtype | count=$count$GPS_TAG" >> "$DEAUTH_LOG_FILE"
 
         local last_count="${DEAUTH_LAST_COUNT[$mac]:-0}" last_time="${DEAUTH_LAST_TIME[$mac]:-$now}"
         local delta_count=$((count - last_count))
@@ -920,7 +1002,7 @@ handle_deauth_line() {
 
     if [ "$kind" = "eviltwin" ]; then
         local ssid="$f3"
-        echo "$(date '+%H:%M:%S') | eviltwin | bssid=$mac | ssid=$ssid" >> "$DEAUTH_LOG_FILE"
+        echo "$(date '+%H:%M:%S') | eviltwin | bssid=$mac | ssid=$ssid$GPS_TAG" >> "$DEAUTH_LOG_FILE"
 
         local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
         [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
@@ -941,7 +1023,11 @@ handle_rid_line() {
     IFS='|' read -r src mac msgtype kv <<< "$line"
     [ -z "$mac" ] && return
 
-    echo "$(date '+%H:%M:%S') | $src | $mac | $msgtype | $kv" >> "$DRONE_LOG_FILE"
+    # $kv's own lat/lon (basic_id/location/system messages) is the DRONE's
+    # or its operator's self-reported position via Remote ID -- unrelated to
+    # $GPS_TAG below, which is where the Pager itself was standing when it
+    # heard it.
+    echo "$(date '+%H:%M:%S') | $src | $mac | $msgtype | $kv$GPS_TAG" >> "$DRONE_LOG_FILE"
 
     local summary="$msgtype"
     case "$msgtype" in
@@ -984,7 +1070,39 @@ handle_rid_line() {
     fi
 }
 
+# Best-effort GPS fix via the Pager's own GPS_GET command (/usr/bin/GPS_GET,
+# a thin wrapper over pineapd's HTTP API -- same platform-builtin convention
+# already used for LOG/LED/RINGTONE/ALERT_RINGTONE elsewhere in this file,
+# rather than reinventing GPS handling by talking to gpsd/gpspipe directly).
+# Confirmed live: prints "LAT LON ALT SPEED", space-separated, and "0 0 0 0"
+# when there's no hardware or no fix yet -- the same no-fix sentinel another
+# Pager Bluetooth payload (cncartistsec/BluePine) already checks for, so
+# this isn't a guessed convention. `timeout` guards it regardless: confirmed
+# live GPS_GET's own runtime varies (roughly 2-3s with no fix in testing)
+# rather than failing instantly like a dead socket would. No GPS hardware /
+# no fix is the expected, common case, not an error -- prints nothing and
+# every call site below just omits the tag. Called once per main-loop tick
+# (below), not per hit, so a burst of several detections in one tick shares
+# one GPS_GET call instead of one each.
+get_gps_fix() {
+    local out lat lon
+    out=$(timeout 3 GPS_GET 2>/dev/null)
+    [ -z "$out" ] && return
+    [ "$out" = "0 0 0 0" ] && return
+    read -r lat lon _ <<< "$out"
+    [ -z "$lat" ] && return
+    [ -z "$lon" ] && return
+    echo "$lat,$lon"
+}
+
 while true; do
+    # Refreshed once per tick; GPS_TAG is what every hit logged this tick
+    # appends to its line (" | gps=LAT,LON", or nothing without a fix) --
+    # see get_gps_fix() above.
+    GPS_FIX=$(get_gps_fix)
+    GPS_TAG=""
+    [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
+
     # --- Flock Safety BLE scan cycle (unmodified from Flock-You / Flock_Detect) ---
     hciconfig hci0 down 2>>"$LOG_FILE"
     hciconfig hci0 reset 2>>"$LOG_FILE"
@@ -1000,7 +1118,7 @@ while true; do
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             if echo "$SEEN_STRONG" | grep -q "$MAC $NAME"; then continue; fi
             CURRENT_TIME=$(date '+%H:%M:%S')
-            ENTRY="DECT: $CURRENT_TIME | $MAC | $NAME"
+            ENTRY="DECT: $CURRENT_TIME | $MAC | $NAME$GPS_TAG"
             if echo "$NAME" | grep -qi "fs ext battery"; then
                 LOG yellow "$ENTRY"
             elif echo "$NAME" | grep -qi "penguin"; then
@@ -1053,9 +1171,9 @@ while true; do
             CURRENT_TIME=$(date '+%H:%M:%S')
             VENDOR=$(mesh_vendor_label "${MATCH#*:}")
             if [ -n "$VENDOR" ]; then
-                ENTRY="DECT: $CURRENT_TIME | $MAC | $VENDOR detected (BLE \"$NAME\", $MATCH)"
+                ENTRY="DECT: $CURRENT_TIME | $MAC | $VENDOR detected (BLE \"$NAME\", $MATCH)$GPS_TAG"
             else
-                ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)"
+                ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)$GPS_TAG"
             fi
             LOG "$ENTRY"
             echo "$ENTRY" >> "$LOG_FILE"
@@ -1109,6 +1227,18 @@ while true; do
                 [ -n "$line" ] && handle_tracker_line "$line"
             done < <(tail -c "+$((TRACKER_HITS_OFFSET + 1))" "$TRACKER_HITS")
             TRACKER_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Flock BLE (UUID 0x09C8): drain whatever flock_ble_monitor.awk found,
+    # --- see that file's header for why this is an UNVERIFIED signature ---
+    if [ "$FLOCK_BLE_UUID_OK" = "1" ]; then
+        NEW_SIZE=$(wc -c < "$FLOCK_BLE_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$FLOCK_BLE_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_flock_ble_line "$line"
+            done < <(tail -c "+$((FLOCK_BLE_HITS_OFFSET + 1))" "$FLOCK_BLE_HITS")
+            FLOCK_BLE_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 
