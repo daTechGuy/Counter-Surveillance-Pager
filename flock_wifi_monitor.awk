@@ -146,6 +146,24 @@ function flock_throttle_ok(key,    c) {
     return (c == 1 || c % 10 == 0)
 }
 
+# True if the first octet's U/L bit (bit 1, i.e. byte value mod 4 >= 2) is
+# set -- the standard IEEE-802 "locally administered" bit, set by every MAC-
+# randomization scheme (BLE private addresses, WiFi per-scan/per-network
+# randomized MACs) and never set on a real vendor-assigned OUI. Added after
+# a live diag log came back with ~540 unmatched-OUI entries in 4.5 hours --
+# almost entirely ordinary phones' randomized probe-request MACs, which can
+# never be a real Flock camera (fixed hardware, factory OUI) and were
+# drowning out the small number of entries actually worth reviewing.
+# Deliberately checked BEFORE flock_diag_throttle_ok() (and skips it
+# entirely, not just silently returning 0 hits) rather than as another
+# throttle tier -- a randomized MAC changes every scan/session anyway, so
+# "throttled" vs "not" is meaningless for it; there's nothing to throttle,
+# it's just not diagnostically useful data at all.
+function is_locally_admin_mac(byte0hex,   v) {
+    v = hex2dec(byte0hex)
+    return (v % 4) >= 2
+}
+
 # Same 1st + every-10th pattern as flock_throttle_ok above -- NOT first-
 # sighting-only-forever, which is what this used to be. Confirmed live why
 # that was wrong: field-testing near two different real cameras on
@@ -308,10 +326,13 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
         # -- never alerts, never counts as a hit, just a field-data trail
         # to review after a drive-by ("what OUI was actually broadcasting
         # near me at the time I remember passing a camera") for growing
-        # flock_oui[] above with real evidence instead of a guess. Throttled
-        # 1st + every-10th per OUI (see flock_diag_throttle_ok()) -- enough
-        # to cut the noise from ordinary wildcard-probing phones/laptops
-        # without going permanently silent on one worth watching.
+        # flock_oui[] above with real evidence instead of a guess. Skips
+        # randomized-MAC OUIs entirely first (see is_locally_admin_mac --
+        # can't ever be a real camera), then throttles what's left 1st +
+        # every-10th per OUI (see flock_diag_throttle_ok()) -- enough to cut
+        # the noise from ordinary wildcard-probing phones/laptops without
+        # going permanently silent on one worth watching.
+        if (is_locally_admin_mac(fpkt[dot11_start + 10])) return
         if (flock_diag_throttle_ok(oui)) {
             mac = mac_str_dot11(fpkt, dot11_start + 10)
             print "wifi_flock_diag|" mac "|oui=" oui
