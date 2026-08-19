@@ -83,7 +83,7 @@ if [ -z "$TS" ]; then
 fi
 
 FILES=()
-for prefix in surveillance rogue_trackers deauth_eviltwin drone_rid; do
+for prefix in surveillance rogue_trackers deauth_eviltwin drone_rid bookmarks; do
     f="$(resolve_loot_file "${prefix}_${TS}.txt")"
     [ -n "$f" ] && FILES+=("$f")
 done

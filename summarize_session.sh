@@ -67,6 +67,7 @@ SURV="$(resolve_loot_file "surveillance_${TS}.txt")"
 TRACK="$(resolve_loot_file "rogue_trackers_${TS}.txt")"
 DEAUTH="$(resolve_loot_file "deauth_eviltwin_${TS}.txt")"
 DRONE="$(resolve_loot_file "drone_rid_${TS}.txt")"
+BOOKMARKS="$(resolve_loot_file "bookmarks_${TS}.txt")"
 
 # Count matches of a pattern in a file, always printing a clean integer
 # (grep -c prints 0 on no match already, but exits nonzero for it under
@@ -178,4 +179,19 @@ if [ -f "$DRONE" ]; then
     echo "                         raw lines for lat=/lon=/operator_lat=/lon=)"
 else
     echo "Drone Remote ID: no drone_rid_${TS}.txt found"
+fi
+echo ""
+
+if [ -f "$BOOKMARKS" ]; then
+    total=$(count_of '\| bookmark #' "$BOOKMARKS")
+    gps_hits=$(count_of ' \| gps=' "$BOOKMARKS")
+    echo "Bookmarks (RIGHT button, manually flagged moments):"
+    echo "  Total bookmarks : $total"
+    echo "  GPS-tagged      : $gps_hits"
+    if [ "$total" -gt 0 ]; then
+        echo "  --- entries ---"
+        grep -E '\| bookmark #' "$BOOKMARKS" 2>/dev/null | sed 's/^/    /'
+    fi
+else
+    echo "Bookmarks: no bookmarks_${TS}.txt found"
 fi

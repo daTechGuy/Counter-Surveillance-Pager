@@ -149,6 +149,11 @@
 #     file for Google Earth/My Maps, color-coded by category. Run it
 #     manually after a session once GPS hardware is attached and has
 #     actually recorded fixes -- see that script's own header.
+#   Bookmarks: press RIGHT any time to flag the current moment (timestamp +
+#     GPS if available) to bookmarks_<timestamp>.txt, for anything you
+#     notice that the detectors should have caught (or just want to mark
+#     for review) -- see bookmark_watcher()'s comment for why this runs as
+#     its own background loop rather than inside the main one.
 # ============================================================================
 #
 # WIFI RADIO: phy1/wlan1mon -- confirmed live on hardware (drove past a real
@@ -362,6 +367,12 @@ echo "Rogue BLE tracker log started at $(date)" > "$TRACKER_LOG_FILE"
 # hits.
 FLOCK_DIAG_LOG_FILE="${LOOT_DIR}/flock_wifi_diag_${TIMESTAMP}.txt"
 echo "Flock WiFi diagnostic log (unmatched-OUI wildcard probes, never alerts) started at $(date)" > "$FLOCK_DIAG_LOG_FILE"
+# Manual "flag this moment for later analysis" -- see bookmark_watcher()
+# below. Confirmed live which DuckyScript button-name string this device's
+# RIGHT button reports (WAIT_FOR_INPUT returns "RIGHT", same command the
+# stock BUTTON_COMBO example payload uses in its own background loop).
+BOOKMARK_LOG_FILE="${LOOT_DIR}/bookmarks_${TIMESTAMP}.txt"
+echo "Bookmark log (RIGHT button = flag this moment) started at $(date)" > "$BOOKMARK_LOG_FILE"
 # Persistence heuristic thresholds -- see handle_tracker_line() and this
 # file's KNOWN LIMITATIONS section on why these are time-window-based, not
 # GPS-based, and what that does and doesn't catch.
@@ -418,6 +429,7 @@ GLASSES_BLE_MON_PID=""
 DEAUTH_TCPDUMP_PID=""
 DEAUTH_MON_PID=""
 WIFI_HOP_PID=""
+BOOKMARK_WATCHER_PID=""
 WIFI_IFACE_CREATED=0
 
 cleanup() {
@@ -427,7 +439,8 @@ cleanup() {
              "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" \
              "$FLOCK_BLE_HCIDUMP_PID" "$FLOCK_BLE_MON_PID" \
              "$GLASSES_BLE_HCIDUMP_PID" "$GLASSES_BLE_MON_PID" \
-             "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID"; do
+             "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID" \
+             "$BOOKMARK_WATCHER_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
@@ -1392,6 +1405,57 @@ get_gps_fix() {
     [ -z "$lon" ] && return
     echo "$lat,$lon"
 }
+
+# Manual "flag this moment for later analysis" -- press RIGHT on the Pager
+# any time you notice something the detectors should have caught (or just
+# want to mark for review), and it gets logged with a timestamp and GPS fix
+# (if available) to BOOKMARK_LOG_FILE. Confirmed live: WAIT_FOR_INPUT
+# returns "RIGHT" for this device's RIGHT button (same command the stock
+# BUTTON_COMBO example payload already runs in its own background loop --
+# this isn't a new pattern for this platform, just the same one applied
+# here).
+#
+# Runs as its OWN background loop, separate from the main detection loop
+# below, so a WAIT_FOR_INPUT call (which blocks until a button is pressed)
+# never stalls detection. Calls get_gps_fix() itself rather than reading
+# the main loop's $GPS_TAG -- this function is forked once at startup, so
+# it would otherwise only ever see whatever $GPS_TAG held at that exact
+# moment (bash background jobs don't see the parent's later variable
+# updates), not a fresh fix at the time of the actual button press.
+#
+# Double vibrate pulse (not the single pulse a real detection uses)
+# specifically so a bookmark press feels different from a detection alert
+# -- confirms the press registered without having to look at the screen.
+bookmark_watcher() {
+    local pressed n gps_fix gps_sfx
+    n=0
+    while true; do
+        pressed=$(WAIT_FOR_INPUT 2>/dev/null)
+        if [ "$pressed" = "RIGHT" ]; then
+            n=$((n + 1))
+            gps_fix=$(get_gps_fix)
+            gps_sfx=""
+            [ -n "$gps_fix" ] && gps_sfx=" | gps=$gps_fix"
+            echo "$(date '+%H:%M:%S') | bookmark #$n$gps_sfx" >> "$BOOKMARK_LOG_FILE"
+            if [ -f /sys/class/gpio/vibrator/value ]; then
+                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+                sleep 0.12
+                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+                sleep 0.1
+                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+                sleep 0.12
+                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+            fi
+        fi
+    done
+}
+if command -v WAIT_FOR_INPUT >/dev/null 2>&1; then
+    bookmark_watcher &
+    BOOKMARK_WATCHER_PID=$!
+    LOG green "Bookmark: enabled (press RIGHT to flag a moment for later analysis)"
+else
+    LOG red "Bookmark: disabled (WAIT_FOR_INPUT not found)"
+fi
 
 while true; do
     # Refreshed once per tick; GPS_TAG is what every hit logged this tick

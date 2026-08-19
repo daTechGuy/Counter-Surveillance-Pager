@@ -2,8 +2,8 @@
 # KML file for Google Earth/Maps, so a session's drive can be seen on a map
 # instead of read as scrolling text. Run as:
 #   awk -f export_gps_kml.awk surveillance_TS.txt rogue_trackers_TS.txt \
-#       deauth_eviltwin_TS.txt drone_rid_TS.txt > session.kml
-# (any of the four loot files can be omitted from the argument list -- awk
+#       deauth_eviltwin_TS.txt drone_rid_TS.txt bookmarks_TS.txt > session.kml
+# (any of the five loot files can be omitted from the argument list -- awk
 # just processes whichever ones exist; export_gps_kml.sh builds this list
 # for you from a session timestamp).
 #
@@ -32,6 +32,10 @@ BEGIN {
     print style_def("deauth",   "ff0000ff")   # red
     print style_def("eviltwin", "ff0080ff")   # deep orange-red
     print style_def("drone",    "ff00ffff")   # yellow
+    print style_def("bookmark", "ff00ff00")   # green -- deliberately not used
+                                               # by any detector category, so a
+                                               # manually-flagged moment always
+                                               # stands out from real hits
     print style_def("other",    "ffffffff")   # white
     total = 0
 }
@@ -53,6 +57,7 @@ function xmlesc(s) {
 
 function category_for(fname, text,    lt) {
     lt = tolower(text)
+    if (fname ~ /bookmarks/) return "bookmark"
     if (fname ~ /rogue_trackers/) return "tracker"
     if (fname ~ /deauth_eviltwin/) {
         if (lt ~ / \| eviltwin \|/) return "eviltwin"
