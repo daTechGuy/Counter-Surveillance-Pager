@@ -879,6 +879,8 @@ LOG yellow   "  Glasses?? (UNVERIFIED BLE company-ID signature -- Meta/Snap/Bose
 LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
 LOG red      "  Drone Remote ID / Rogue BLE Tracker / Deauth Flood / Evil-Twin AP (all same color -- distinguished by alert text)"
 LOG "----------------------------------"
+LOG green    "Press RIGHT any time to flag a device/moment this scan should have caught -- logged to bookmarks_${TIMESTAMP}.txt for later review."
+LOG "----------------------------------"
 
 DETECTIONS=0
 SEEN_STRONG=""
@@ -996,16 +998,19 @@ handle_flock_wifi_line() {
     if echo "$SEEN_STRONG" | grep -q "$mac WIFI_FLOCK"; then return; fi
 
     local conf="high"
-    case "$kv" in *"conf=low"*) conf="low" ;; esac
+    case "$kv" in
+        *"conf=low"*) conf="low" ;;
+        *"conf=medium"*) conf="medium" ;;
+    esac
 
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
-    if [ "$conf" = "low" ]; then
-        ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
-        LOG yellow "$ENTRY"
-    else
+    if [ "$conf" = "high" ]; then
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)$GPS_TAG"
         LOG cyan "$ENTRY"
+    else
+        ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
+        LOG yellow "$ENTRY"
     fi
     echo "$ENTRY" >> "$LOG_FILE"
     DETECTIONS=$((DETECTIONS + 1))

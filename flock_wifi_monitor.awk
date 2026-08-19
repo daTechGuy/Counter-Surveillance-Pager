@@ -39,6 +39,28 @@
 # field-data trail. See process_flock_packet() for where this branches off
 # before the OUI gate.
 #
+# BEACON / PROBE-RESPONSE MATCHING (field-driven, 2026-08-19): a real drive
+# past a known camera produced only 4 wildcard probes total from ANY device
+# in 22 minutes, none from a known OUI -- zero Flock hits, but that same day
+# a much longer session (4.5hr) at the same OUI list DID produce real
+# conf=low hits, so the matching logic itself isn't the problem. The gap is
+# that this file only ever looked at Probe Requests, which are sporadic and
+# client-initiated -- a camera might send one occasionally, not on any
+# guaranteed schedule. mesh_wifi_monitor.awk matches ANY management frame
+# (Beacon included, which an AP sends roughly 10x/sec) against its OUI list,
+# and that's exactly the mechanism that caught OUI 9c:2f:9d reliably. Ported
+# that same idea in here directly, so Flock's own (much larger, 40-entry)
+# OUI list benefits too instead of only whatever a user manually copies into
+# mesh_detect_targets.conf. Beacon/Probe-Response hits skip the wildcard/IE-
+# signature machinery entirely (those fixed-parameter fields differ from a
+# Probe Request's and aren't needed for a pure OUI match) and are tiered as
+# conf=medium: an OUI match on a periodic frame is real signal, but weaker
+# than a wildcard-probe + exact known IE signature (conf=high) since it
+# doesn't cross-check the payload contents at all. No diagnostic-log branch
+# for non-matching OUIs on this path -- unlike wildcard probes, beacons are
+# sent by every AP in range constantly, so logging every unmatched one would
+# be pure noise, not a useful field-data trail.
+#
 # OUI LIST REFRESH (31 -> 40 entries): flock-you's own main.cpp hadn't yet
 # picked up a newer OUI set that colonelpanichacks/oui-spy-unified-blue (his
 # own consolidated multi-detector firmware) already had, sourced from
@@ -242,9 +264,31 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
     b0 = hex2dec(fpkt[dot11_start])
     ftype = int(b0 / 4) % 4
     stype = int(b0 / 16) % 16
-    if (ftype != 0 || stype != 4) return   # management/Probe-Request only
+    # management only: Probe Request (4, full wildcard/IE-sig path below),
+    # or Beacon (8) / Probe Response (5) for the OUI-only path -- see this
+    # file's header, BEACON / PROBE-RESPONSE MATCHING.
+    if (ftype != 0) return
+    if (stype != 4 && stype != 8 && stype != 5) return
 
     oui = fpkt[dot11_start + 10] ":" fpkt[dot11_start + 11] ":" fpkt[dot11_start + 12]
+
+    if (stype != 4) {
+        # Beacon/Probe-Response: pure OUI match, no wildcard/IE-signature
+        # concept applies to these (different fixed-parameter layout, and
+        # the SSID they carry is the AP's real SSID, not a wildcard). Only
+        # worth anything against a KNOWN Flock OUI -- see header on why
+        # there's no diagnostic-log branch here for unmatched OUIs.
+        if (!(oui in flock_oui)) return
+        mac = mac_str_dot11(fpkt, dot11_start + 10)
+        if (!flock_throttle_ok(mac)) return
+        rssi = wifi_rssi(fpkt, itlen, fnpkt)
+        rssi_sfx = (rssi != 127) ? "|rssi=" rssi : ""
+        print "wifi_flock|" mac "|" (stype == 8 ? "beacon_oui_match" : "probe_resp_oui_match") \
+              "|oui=" oui "|conf=medium" rssi_sfx
+        fflush()
+        return
+    }
+
     ies_start = dot11_start + 24   # Probe Request has no fixed params; IEs follow the header directly
 
     # Wildcard-probe check now runs BEFORE the OUI gate (moved down from
