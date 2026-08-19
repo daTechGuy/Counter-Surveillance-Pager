@@ -124,15 +124,20 @@ function flock_throttle_ok(key,    c) {
     return (c == 1 || c % 10 == 0)
 }
 
-# First-sighting-only per OUI (not per packet, not 1st+every-10th like
-# flock_throttle_ok above) -- the diagnostic path this gates is expected to
-# be genuinely noisy (wildcard probes are common, most phones/laptops send
-# them), so once an OUI has been logged once this session there's nothing
-# more to learn from logging it again.
+# Same 1st + every-10th pattern as flock_throttle_ok above -- NOT first-
+# sighting-only-forever, which is what this used to be. Confirmed live why
+# that was wrong: field-testing near two different real cameras on
+# 2026-08-19, a real (non-randomized) OUI kept showing up while parked near
+# one of them -- but with a first-ever-only throttle, it only logged ONCE
+# for the whole session, making it impossible to tell "still here" from
+# "already throttled" on a later check without restarting. Losing exactly
+# the persistence signal that distinguishes a real lead from one-off noise
+# defeated the point. Every-10th still cuts the genuinely high volume of
+# ordinary phones/laptops sending wildcard probes, just without going
+# permanently silent on a single OUI worth watching.
 function flock_diag_throttle_ok(oui) {
-    if (oui in fdiag_seen) return 0
-    fdiag_seen[oui] = 1
-    return 1
+    fdiag_count[oui]++
+    return (fdiag_count[oui] == 1 || fdiag_count[oui] % 10 == 0)
 }
 
 /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
@@ -260,7 +265,9 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
         # to review after a drive-by ("what OUI was actually broadcasting
         # near me at the time I remember passing a camera") for growing
         # flock_oui[] above with real evidence instead of a guess. Throttled
-        # to the OUI's first sighting only per session, not per-packet.
+        # 1st + every-10th per OUI (see flock_diag_throttle_ok()) -- enough
+        # to cut the noise from ordinary wildcard-probing phones/laptops
+        # without going permanently silent on one worth watching.
         if (flock_diag_throttle_ok(oui)) {
             mac = mac_str_dot11(fpkt, dot11_start + 10)
             print "wifi_flock_diag|" mac "|oui=" oui
