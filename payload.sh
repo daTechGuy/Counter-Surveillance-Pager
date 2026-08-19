@@ -354,6 +354,14 @@ TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
 TRACKER_SNOOZE_FILE="$WORK_DIR/tracker_snooze.txt"
 TRACKER_LOG_FILE="${LOOT_DIR}/rogue_trackers_${TIMESTAMP}.txt"
 echo "Rogue BLE tracker log started at $(date)" > "$TRACKER_LOG_FILE"
+# Diagnostic-only, never alerts -- see flock_wifi_monitor.awk's header and
+# handle_flock_wifi_diag_line() below. Separate file from LOG_FILE/
+# surveillance.txt on purpose: this is expected to be noisy (most nearby
+# phones/laptops send wildcard probes too), and keeping it out of the main
+# detection log means it doesn't have to be scrolled past to review real
+# hits.
+FLOCK_DIAG_LOG_FILE="${LOOT_DIR}/flock_wifi_diag_${TIMESTAMP}.txt"
+echo "Flock WiFi diagnostic log (unmatched-OUI wildcard probes, never alerts) started at $(date)" > "$FLOCK_DIAG_LOG_FILE"
 # Persistence heuristic thresholds -- see handle_tracker_line() and this
 # file's KNOWN LIMITATIONS section on why these are time-window-based, not
 # GPS-based, and what that does and doesn't catch.
@@ -938,6 +946,21 @@ mesh_ble_match() {
     done
 }
 
+# Parse one "wifi_flock_diag|MAC|oui=xx:xx:xx" line from
+# flock_wifi_monitor.awk's diagnostic path -- a wildcard-SSID probe from an
+# OUI NOT in its known Flock list. Never alerts, never touches SEEN_STRONG/
+# DETECTIONS, doesn't even go to the same file as real hits -- purely a
+# field-data trail for reviewing after a drive-by ("what OUI was actually
+# broadcasting when I remember passing a camera") to catch a real,
+# unlisted Flock OUI that flock_wifi_monitor.awk's flock_oui[] should add.
+handle_flock_wifi_diag_line() {
+    local line="$1"
+    local src mac kv
+    IFS='|' read -r src mac kv <<< "$line"
+    [ -z "$mac" ] && return
+    echo "$(date '+%H:%M:%S') | $mac | $kv$GPS_TAG" >> "$FLOCK_DIAG_LOG_FILE"
+}
+
 # Parse one "wifi_flock|MAC|wildcard_probe_ie_sig|oui=xx:xx:xx|conf=high" or
 # "wifi_flock|MAC|wildcard_probe_oui_only|oui=xx:xx:xx|conf=low|sig=..." line
 # from flock_wifi_monitor.awk and LOG/loot/alert it -- same session-lifetime
@@ -1489,7 +1512,12 @@ while true; do
         NEW_SIZE=$(wc -c < "$FLOCK_WIFI_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
         if [ "$NEW_SIZE" -gt "$FLOCK_WIFI_HITS_OFFSET" ]; then
             while IFS= read -r line; do
-                [ -n "$line" ] && handle_flock_wifi_line "$line"
+                if [ -n "$line" ]; then
+                    case "$line" in
+                        wifi_flock_diag\|*) handle_flock_wifi_diag_line "$line" ;;
+                        *) handle_flock_wifi_line "$line" ;;
+                    esac
+                fi
             done < <(tail -c "+$((FLOCK_WIFI_HITS_OFFSET + 1))" "$FLOCK_WIFI_HITS")
             FLOCK_WIFI_HITS_OFFSET=$NEW_SIZE
         fi

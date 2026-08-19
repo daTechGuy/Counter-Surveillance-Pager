@@ -31,6 +31,14 @@
 # close range, turned out to use a signature with a different IE order AND
 # set than the original upstream one, not just a minor variation.
 #
+# DIAGNOSTIC-ONLY LOGGING (added after a session with zero Flock hits at
+# all, driving past cameras the user could see): a wildcard-SSID probe from
+# an OUI NOT in flock_oui[] below is now also logged, as "wifi_flock_diag"
+# lines payload.sh's handle_flock_wifi_diag_line() writes to its own
+# separate loot file -- never alerts, never counts as a detection, just a
+# field-data trail. See process_flock_packet() for where this branches off
+# before the OUI gate.
+#
 # OUI LIST REFRESH (31 -> 40 entries): flock-you's own main.cpp hadn't yet
 # picked up a newer OUI set that colonelpanichacks/oui-spy-unified-blue (his
 # own consolidated multi-detector firmware) already had, sourced from
@@ -114,6 +122,17 @@ function flock_throttle_ok(key,    c) {
     fcount[key]++
     c = fcount[key]
     return (c == 1 || c % 10 == 0)
+}
+
+# First-sighting-only per OUI (not per packet, not 1st+every-10th like
+# flock_throttle_ok above) -- the diagnostic path this gates is expected to
+# be genuinely noisy (wildcard probes are common, most phones/laptops send
+# them), so once an OUI has been logged once this session there's nothing
+# more to learn from logging it again.
+function flock_diag_throttle_ok(oui) {
+    if (oui in fdiag_seen) return 0
+    fdiag_seen[oui] = 1
+    return 1
 }
 
 /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
@@ -221,13 +240,34 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
     if (ftype != 0 || stype != 4) return   # management/Probe-Request only
 
     oui = fpkt[dot11_start + 10] ":" fpkt[dot11_start + 11] ":" fpkt[dot11_start + 12]
-    if (!(oui in flock_oui)) return
-
     ies_start = dot11_start + 24   # Probe Request has no fixed params; IEs follow the header directly
 
+    # Wildcard-probe check now runs BEFORE the OUI gate (moved down from
+    # where it used to sit right after that gate) so a wildcard probe from
+    # an OUI NOT in flock_oui[] can still be logged diagnostically below,
+    # instead of being silently dropped with zero trace. Confirmed live
+    # this matters: a session with zero Flock hits at all, driving past
+    # cameras the user could see, gave no way to tell "wrong OUI" from
+    # "never captured the frame at all" -- this closes that gap.
     r = flock_is_wildcard(fpkt, ies_start, fnpkt)
     if (r == -1 && fnpkt - 4 >= ies_start) r = flock_is_wildcard(fpkt, ies_start, fnpkt - 4)
-    if (r != 1) return
+    if (r != 1) return   # not a wildcard probe at all -- nothing diagnostic to say either
+
+    if (!(oui in flock_oui)) {
+        # DIAGNOSTIC ONLY, not a detection: wildcard-SSID probes are common
+        # (most phones/laptops send them), so this is expected to be noisy
+        # -- never alerts, never counts as a hit, just a field-data trail
+        # to review after a drive-by ("what OUI was actually broadcasting
+        # near me at the time I remember passing a camera") for growing
+        # flock_oui[] above with real evidence instead of a guess. Throttled
+        # to the OUI's first sighting only per session, not per-packet.
+        if (flock_diag_throttle_ok(oui)) {
+            mac = mac_str_dot11(fpkt, dot11_start + 10)
+            print "wifi_flock_diag|" mac "|oui=" oui
+            fflush()
+        }
+        return
+    }
 
     # OUI + wildcard-probe is now the hard gate; signature is a confidence
     # tier, not a filter -- see file header's DEVIATION FROM UPSTREAM note.
