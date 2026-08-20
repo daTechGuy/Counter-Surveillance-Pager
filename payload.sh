@@ -546,6 +546,76 @@ WANT_TRACKER=1
 WANT_DEAUTH=1
 WANT_DRONE=1
 
+# STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
+# suppressed, vibrator still pulses so a detection can still be felt without
+# looking at the screen), 2 stealth+silent (all physical feedback suppressed,
+# only the on-screen LOG and loot files still show a detection happened).
+# Idea from cncartistsec/BluePine-WiFi-Pineapple-Pager's Stealth Mode ("Sound
+# Effects, LEDS, Payload LED Actions Disabled") -- vibrate is deliberately its
+# own tier here rather than folded into "everything off": BluePine's own
+# description never mentions vibrate at all, and unlike a blink or a
+# ringtone, a vibrate pulse isn't visible/audible to anyone else nearby, so
+# keeping it as an optional silent alert channel is a genuine third state,
+# not just a compromise between the other two -- left as the user's choice
+# via the menu below instead of picking one on their behalf.
+STEALTH_MODE=0
+
+# Wraps the raw vibrate+LED-brightness blink pair used by several
+# detectors' soft/medium alerts. STEALTH_MODE 1: LED blink suppressed,
+# vibrate kept. STEALTH_MODE 2: both suppressed. Local var name deliberately
+# not `LED` (unlike the sysfs-path variable of that name already used
+# inline elsewhere in this file) to avoid any shadowing of the `LED`
+# platform builtin that stealth_alert() below calls directly.
+#
+# BUG FIX while porting this to a shared function (confirmed live against
+# the real device, unrelated to stealth mode itself): the original inline
+# blocks at every one of this function's call sites used
+# `LED=$(ls /sys/class/leds/* | head -1)`. On this device's actual
+# /sys/class/leds/ (16 entries: a/b-button-led, buzzer, 4 directional LEDs
+# x3 colors, mt76-phy0), that glob expands to multiple directory arguments,
+# so BusyBox ls prints a "/sys/class/leds/a-button-led:" HEADER line before
+# each directory's contents -- `head -1` was capturing that header, colon
+# included, not a usable path, so every `echo 1 > "${LED}/brightness"`
+# write silently failed (redirect error swallowed by 2>/dev/null). The LED
+# half of this blink has likely never actually lit up on real hardware.
+# Fixed with `ls -d .../*/ ` (trailing slash suppresses descending into
+# each match, so it lists directory names themselves, one per line, no
+# header) -- confirmed live this returns a clean
+# "/sys/class/leds/a-button-led/" path.
+stealth_blink() {
+    if [ "$STEALTH_MODE" != "2" ] && [ -f /sys/class/gpio/vibrator/value ]; then
+        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+        sleep 0.15
+        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+    fi
+    if [ "$STEALTH_MODE" = "0" ]; then
+        local _led_path
+        _led_path=$(ls -d /sys/class/leds/*/ 2>/dev/null | head -1)
+        if [ -n "$_led_path" ]; then
+            echo 1 > "${_led_path}brightness" 2>/dev/null
+            sleep 0.3
+            echo 0 > "${_led_path}brightness" 2>/dev/null
+        fi
+    fi
+}
+
+# Wraps the LED RED / RINGTONE warning / ALERT_RINGTONE / LED OFF sequence
+# used by the hard-alert detectors (rogue tracker, deauth flood, evil-twin,
+# drone). Both STEALTH_MODE 1 and 2 suppress this whole sequence -- LED and
+# RINGTONE/ALERT_RINGTONE are both visible/audible tells with no vibrate-only
+# path through the platform builtins, so there's no meaningful difference
+# between the two stealth tiers here (unlike stealth_blink's raw sysfs
+# vibrate, which stealth can address independently of the LED/sound).
+stealth_alert() {
+    local title="$1" body="$2"
+    if [ "$STEALTH_MODE" = "0" ]; then
+        LED RED
+        RINGTONE warning
+        ALERT_RINGTONE "$title" "$body"
+        LED OFF
+    fi
+}
+
 detection_menu_item() {
     local key="$1" name="$2" val
     case "$key" in
@@ -558,6 +628,14 @@ detection_menu_item() {
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
 }
 
+stealth_menu_item() {
+    case "$STEALTH_MODE" in
+        0) echo "[ ] Stealth Mode (off)" ;;
+        1) echo "[X] Stealth Mode (no LED/sound, vibrate stays on)" ;;
+        2) echo "[X] Stealth Mode (fully silent, no vibrate either)" ;;
+    esac
+}
+
 if command -v LIST_PICKER >/dev/null 2>&1; then
     while true; do
         _resp=$(LIST_PICKER "What to detect (select to toggle)" \
@@ -566,6 +644,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item tracker 'Rogue BLE trackers')" \
             "$(detection_menu_item deauth 'Deauth flood / Evil-Twin AP')" \
             "$(detection_menu_item drone 'Drone Remote ID')" \
+            "$(stealth_menu_item)" \
             "Start scanning" \
             "Start scanning")
         case "$_resp" in
@@ -574,8 +653,9 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Rogue BLE trackers") WANT_TRACKER=$((1 - WANT_TRACKER)) ;;
             *"Deauth flood / Evil-Twin AP") WANT_DEAUTH=$((1 - WANT_DEAUTH)) ;;
             *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
+            *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             "Start scanning") break ;;
-            *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_* values rather than looping forever
+            *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE values rather than looping forever
         esac
     done
 fi
@@ -1016,17 +1096,7 @@ handle_flock_wifi_line() {
     DETECTIONS=$((DETECTIONS + 1))
     COUNTER=$((COUNTER + 1))
     if [ "$conf" = "high" ]; then
-        if [ -f /sys/class/gpio/vibrator/value ]; then
-            echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-            sleep 0.15
-            echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-        fi
-        if ls /sys/class/leds/* >/dev/null 2>&1; then
-            LED=$(ls /sys/class/leds/* | head -1)
-            echo 1 > "${LED}/brightness" 2>/dev/null
-            sleep 0.3
-            echo 0 > "${LED}/brightness" 2>/dev/null
-        fi
+        stealth_blink
     fi
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"
 }
@@ -1158,17 +1228,7 @@ handle_mesh_wifi_line() {
     echo "$ENTRY" >> "$LOG_FILE"
     DETECTIONS=$((DETECTIONS + 1))
     COUNTER=$((COUNTER + 1))
-    if [ -f /sys/class/gpio/vibrator/value ]; then
-        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-        sleep 0.15
-        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-    fi
-    if ls /sys/class/leds/* >/dev/null 2>&1; then
-        LED=$(ls /sys/class/leds/* | head -1)
-        echo 1 > "${LED}/brightness" 2>/dev/null
-        sleep 0.3
-        echo 0 > "${LED}/brightness" 2>/dev/null
-    fi
+    stealth_blink
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
 }
 
@@ -1229,10 +1289,7 @@ handle_tracker_line() {
 
     local minutes=$(( age / 60 ))
     LOG red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
-    LED RED
-    RINGTONE warning
-    ALERT_RINGTONE "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
-    LED OFF
+    stealth_alert "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
     DETECTIONS=$((DETECTIONS + 1))
 }
 
@@ -1294,10 +1351,7 @@ handle_deauth_line() {
             [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
             DEAUTH_LAST_ALERT[$mac]=$now
             LOG red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s"
-            LED RED
-            RINGTONE warning
-            ALERT_RINGTONE "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
-            LED OFF
+            stealth_alert "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
             DETECTIONS=$((DETECTIONS + 1))
         fi
         return
@@ -1311,10 +1365,7 @@ handle_deauth_line() {
         [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
         DEAUTH_LAST_ALERT[$mac]=$now
         LOG red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID"
-        LED RED
-        RINGTONE warning
-        ALERT_RINGTONE "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
-        LED OFF
+        stealth_alert "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
         DETECTIONS=$((DETECTIONS + 1))
     fi
 }
@@ -1379,10 +1430,7 @@ handle_rid_line() {
         local label="$mac"
         [ -n "$known_id" ] && label="$mac ($known_id)"
         LOG red "DRONE [$src] $label - $summary"
-        LED RED
-        RINGTONE warning
-        ALERT_RINGTONE "DRONE REMOTE ID" "$label\n$summary\nvia $src"
-        LED OFF
+        stealth_alert "DRONE REMOTE ID" "$label\n$summary\nvia $src"
     fi
 }
 
@@ -1519,17 +1567,7 @@ while true; do
                 LOG cyan     "Other Flock"
                 LOG " "
             fi
-            if [ -f /sys/class/gpio/vibrator/value ]; then
-                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-                sleep 0.15
-                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-            fi
-            if ls /sys/class/leds/* >/dev/null 2>&1; then
-                LED=$(ls /sys/class/leds/* | head -1)
-                echo 1 > "${LED}/brightness" 2>/dev/null
-                sleep 0.3
-                echo 0 > "${LED}/brightness" 2>/dev/null
-            fi
+            stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC $NAME"
         done
     fi
@@ -1557,17 +1595,7 @@ while true; do
             echo "$ENTRY" >> "$LOG_FILE"
             DETECTIONS=$((DETECTIONS + 1))
             COUNTER=$((COUNTER + 1))
-            if [ -f /sys/class/gpio/vibrator/value ]; then
-                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-                sleep 0.15
-                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-            fi
-            if ls /sys/class/leds/* >/dev/null 2>&1; then
-                LED=$(ls /sys/class/leds/* | head -1)
-                echo 1 > "${LED}/brightness" 2>/dev/null
-                sleep 0.3
-                echo 0 > "${LED}/brightness" 2>/dev/null
-            fi
+            stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
