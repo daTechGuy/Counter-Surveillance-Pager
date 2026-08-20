@@ -545,6 +545,7 @@ WANT_MESH=1
 WANT_TRACKER=1
 WANT_DEAUTH=1
 WANT_DRONE=1
+WANT_SKIMMER=1
 
 # STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
 # suppressed, vibrator still pulses so a detection can still be felt without
@@ -624,6 +625,7 @@ detection_menu_item() {
         tracker) val="$WANT_TRACKER" ;;
         deauth) val="$WANT_DEAUTH" ;;
         drone) val="$WANT_DRONE" ;;
+        skimmer) val="$WANT_SKIMMER" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
 }
@@ -644,6 +646,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item tracker 'Rogue BLE trackers')" \
             "$(detection_menu_item deauth 'Deauth flood / Evil-Twin AP')" \
             "$(detection_menu_item drone 'Drone Remote ID')" \
+            "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(stealth_menu_item)" \
             "Start scanning" \
             "Start scanning")
@@ -653,6 +656,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Rogue BLE trackers") WANT_TRACKER=$((1 - WANT_TRACKER)) ;;
             *"Deauth flood / Evil-Twin AP") WANT_DEAUTH=$((1 - WANT_DEAUTH)) ;;
             *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
+            *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             "Start scanning") break ;;
             *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE values rather than looping forever
@@ -724,6 +728,16 @@ elif [ "$MESH_BLE_OK" = "1" ]; then
     LOG green "Mesh-Detect BLE detection: enabled (${#MESH_OUI_TARGETS[@]} oui, ${#MESH_MAC_TARGETS[@]} mac, ${#MESH_NAME_TARGETS[@]} name target(s))"
 else
     LOG yellow "Mesh-Detect BLE detection: no-op (mesh_detect_targets.conf has no oui:/mac:/name: entries yet)"
+fi
+
+# No separate _OK/capability gate needed -- same as the Flock-You BLE name
+# loop it's modeled on, this only needs the shared hcitool lescan dump
+# already captured for that loop and Mesh-Detect BLE, not its own hcidump
+# reader or awk file.
+if [ "$WANT_SKIMMER" = "0" ]; then
+    LOG yellow "BLE skimmer detection: disabled (not selected in detection menu)"
+else
+    LOG green "BLE skimmer detection: enabled"
 fi
 
 if [ "$WANT_DRONE" = "0" ]; then
@@ -956,6 +970,7 @@ LOG magenta  "  Pigvision"
 LOG cyan     "  Other Flock (BLE name match or WiFi wildcard-probe/IE match)"
 LOG yellow   "  Flock? / Flock?? (low-confidence WiFi or UNVERIFIED BLE UUID signature)"
 LOG yellow   "  Glasses?? (UNVERIFIED BLE company-ID signature -- Meta/Snap/Bose/Vuzix/XREAL)"
+LOG yellow   "  CC Skimmer? (BLE serial-module OUI/name or MAC-embedded manufacture date)"
 LOG          "  Mesh-Detect (your OUI/MAC/name watchlist -- uncolored, see mesh_detect_targets.conf)"
 LOG red      "  Drone Remote ID / Rogue BLE Tracker / Deauth Flood / Evil-Twin AP (all same color -- distinguished by alert text)"
 LOG "----------------------------------"
@@ -1039,6 +1054,45 @@ mesh_ble_match() {
     for t in "${MESH_NAME_TARGETS[@]}"; do
         if mesh_contains_ci "$name" "$t"; then echo "name:$t"; return; fi
     done
+}
+
+# Checks one "MAC NAME" BLE scan result against known BLE credit-card-
+# skimmer signatures -- ported from cncartistsec/BluePine-WiFi-Pineapple-
+# Pager's check_bt_ccskimmr(). These are generic HC-05/HC-06-style serial
+# Bluetooth modules widely reused as the wireless backend in cheap card
+# skimmers -- a name/OUI match alone is a weak signal on its own (the same
+# modules show up in countless unrelated hobbyist projects), so this also
+# checks whether the MAC's own first 4 octets decode as a plausible
+# manufacture date: many of these modules are provisioned from a batch
+# whose MAC is assigned from a scheme embedding the date (octet1+octet2 as
+# a 4-digit year, octet3 as month, octet4 as day, all read as decimal, not
+# hex). Any ONE match (OUI, name, or a valid embedded date) is enough to
+# flag, matching upstream. Echoes a short reason string ("oui" / "name:x" /
+# "date:YYYY-MM-DD") for the first match, or nothing.
+ble_skimmer_match() {
+    local mac="$1" name="$2"
+    local mac_lc="${mac,,}"
+    [ "${mac_lc:0:8}" = "00:06:66" ] && { echo "oui"; return; }
+    case "$name" in
+        HC-03|HC-05|HC-06|HC-08) echo "name:$name"; return ;;
+    esac
+    if [[ "$name" == *RNBT* ]]; then
+        echo "name:$name"
+        return
+    fi
+    if [[ "$mac" =~ ^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}: ]]; then
+        local o1="${mac:0:2}" o2="${mac:3:2}" o3="${mac:6:2}" o4="${mac:9:2}"
+        if [[ "$o1$o2" =~ ^[0-9]{4}$ ]] && [[ "$o3" =~ ^[0-9]{2}$ ]] && [[ "$o4" =~ ^[0-9]{2}$ ]]; then
+            local year=$((10#$o1$o2)) month=$((10#$o3)) day=$((10#$o4)) curyear
+            curyear=$(date +%Y)
+            if [ "$year" -ge 2013 ] && [ "$year" -le "$curyear" ] \
+               && [ "$month" -ge 1 ] && [ "$month" -le 12 ] \
+               && [ "$day" -ge 1 ] && [ "$day" -le 31 ]; then
+                echo "date:${o1}${o2}-${o3}-${o4}"
+                return
+            fi
+        fi
+    fi
 }
 
 # Parse one "wifi_flock_diag|MAC|oui=xx:xx:xx" line from
@@ -1528,7 +1582,7 @@ while true; do
     # is wanted -- the loop's own `sleep 3` at the bottom still paces it, so
     # this doesn't turn into a busy-loop, it just iterates faster and spends
     # that time draining WiFi-side hits instead.
-    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ]; then
+    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ] || [ "$WANT_SKIMMER" = "1" ]; then
     # --- Flock Safety BLE scan cycle (unmodified from Flock-You / Flock_Detect) ---
     hciconfig hci0 down 2>>"$LOG_FILE"
     hciconfig hci0 reset 2>>"$LOG_FILE"
@@ -1599,7 +1653,28 @@ while true; do
             SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
-    fi   # closes the WANT_FLOCK/WANT_MESH/WANT_TRACKER/WANT_DRONE BLE-scan gate above
+
+    # --- BLE skimmer scan: reuse the same hcitool lescan dump above, ---
+    # --- checked against ble_skimmer_match() instead of Flock/Mesh names ---
+    if [ "$WANT_SKIMMER" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
+        while read -r full_line; do
+            MAC=$(echo "$full_line" | awk '{print $1}')
+            NAME=$(echo "$full_line" | cut -d' ' -f2-)
+            [ -z "$MAC" ] && continue
+            if echo "$SEEN_STRONG" | grep -q "$MAC BLE_SKIMMER"; then continue; fi
+            MATCH=$(ble_skimmer_match "$MAC" "$NAME")
+            [ -z "$MATCH" ] && continue
+            CURRENT_TIME=$(date '+%H:%M:%S')
+            ENTRY="DECT: $CURRENT_TIME | $MAC | CC Skimmer? (BLE \"$NAME\", $MATCH)$GPS_TAG"
+            LOG yellow "$ENTRY"
+            echo "$ENTRY" >> "$LOG_FILE"
+            DETECTIONS=$((DETECTIONS + 1))
+            COUNTER=$((COUNTER + 1))
+            stealth_blink
+            SEEN_STRONG="$SEEN_STRONG $MAC BLE_SKIMMER"
+        done < <(sort -u /tmp/hci_scan.txt)
+    fi
+    fi   # closes the WANT_FLOCK/WANT_MESH/WANT_TRACKER/WANT_DRONE/WANT_SKIMMER BLE-scan gate above
 
     # --- Flock Safety WiFi scan: drain whatever flock_wifi_monitor.awk found ---
     # Uses process substitution (not a `cmd | while` pipe) so the SEEN_STRONG
