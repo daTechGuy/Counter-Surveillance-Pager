@@ -108,10 +108,10 @@
 #   Smart-glasses BLE scan: + awk, hcidump (own reader, alongside the above)
 #                        -- UNVERIFIED company-ID signatures (Meta Ray-Ban/
 #                        Snap Spectacles/Bose Frames/Vuzix/XREAL), see
-#                        glasses_ble_monitor.awk's header. Gated on
-#                        WANT_MESH, not its own menu toggle -- another
-#                        signal for the same category mesh_detect_
-#                        targets.conf's OUI/name entries already cover.
+#                        glasses_ble_monitor.awk's header. Own menu toggle
+#                        (WANT_GLASSES) -- mesh_detect_targets.conf's own
+#                        glasses OUI/name entries are still separately
+#                        covered under WANT_MESH regardless of this one.
 #   Drone BLE scan    : + awk, hcidump
 #   Drone WiFi scan   : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
 #   Deauth flood scan : + awk, iw, tcpdump, a second radio (phy1/wlan1mon)
@@ -546,6 +546,7 @@ WANT_TRACKER=1
 WANT_DEAUTH=1
 WANT_DRONE=1
 WANT_SKIMMER=1
+WANT_GLASSES=1
 
 # STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
 # suppressed, vibrator still pulses so a detection can still be felt without
@@ -626,6 +627,7 @@ detection_menu_item() {
         deauth) val="$WANT_DEAUTH" ;;
         drone) val="$WANT_DRONE" ;;
         skimmer) val="$WANT_SKIMMER" ;;
+        glasses) val="$WANT_GLASSES" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
 }
@@ -647,6 +649,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item deauth 'Deauth flood / Evil-Twin AP')" \
             "$(detection_menu_item drone 'Drone Remote ID')" \
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
+            "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
             "$(stealth_menu_item)" \
             "Start scanning" \
             "Start scanning")
@@ -657,6 +660,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Deauth flood / Evil-Twin AP") WANT_DEAUTH=$((1 - WANT_DEAUTH)) ;;
             *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
+            *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             "Start scanning") break ;;
             *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE values rather than looping forever
@@ -778,12 +782,17 @@ else
 fi
 
 # Own file-existence gate, same pattern as Flock BLE UUID above -- see
-# glasses_ble_monitor.awk's header for why this is UNVERIFIED. Gated on
-# WANT_MESH, not its own menu toggle -- this is another signal for the
-# same "watchlist/surveillance-adjacent gear" category Mesh-Detect already
-# covers (smart glasses are also in mesh_detect_targets.conf), not a
-# distinct menu item of its own.
-if [ "$WANT_MESH" = "0" ]; then
+# glasses_ble_monitor.awk's header for why this is UNVERIFIED. Own menu
+# toggle (WANT_GLASSES), separate from Mesh-Detect -- this used to piggyback
+# on WANT_MESH since smart glasses are also in mesh_detect_targets.conf, but
+# that meant no way to turn this UNVERIFIED company-ID guesser on/off
+# without also toggling the (separately verified) Mesh-Detect watchlist as
+# a whole. Note this doesn't change mesh_detect_targets.conf's own glasses
+# entries -- those are still matched under WANT_MESH like every other
+# watchlist entry in that file, since it's a general OUI/MAC/name
+# mechanism, not glasses-specific; this toggle only controls the dedicated
+# company-ID detector below.
+if [ "$WANT_GLASSES" = "0" ]; then
     LOG yellow "Smart-glasses BLE (company ID) detection: disabled (not selected in detection menu)"
 elif [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/glasses_ble_monitor.awk" ]; then
     GLASSES_BLE_OK=1
