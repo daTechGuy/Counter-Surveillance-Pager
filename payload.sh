@@ -563,6 +563,19 @@ WANT_DRONE=1
 WANT_SKIMMER=1
 WANT_GLASSES=1
 
+# ALWAYS_ALERT: 0 off (default), 1 on. Off preserves this payload's original
+# behavior -- SEEN_STRONG dedup means each MAC only alerts once per category
+# per session, so a camera you pass repeatedly (stopped at the same light,
+# driving the same route daily) doesn't buzz every single time. On disables
+# that dedup check entirely (SEEN_STRONG itself still gets updated/consulted
+# elsewhere unaffected -- only the early-return "already alerted this
+# session" guards are skipped), so the same device alerts again every time
+# it's re-detected. User-requested after a live session where the same
+# confirmed camera predictably needed a payload restart between passes to
+# alert twice -- this is the alternative to restarting: driving the same
+# route repeatedly and wanting every pass to alert, not just the first.
+ALWAYS_ALERT=0
+
 # STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
 # suppressed, vibrator still pulses so a detection can still be felt without
 # looking at the screen), 2 stealth+silent (all physical feedback suppressed,
@@ -655,6 +668,14 @@ stealth_menu_item() {
     esac
 }
 
+always_alert_menu_item() {
+    if [ "$ALWAYS_ALERT" = "1" ]; then
+        echo "[X] Always Alert (re-alert on every pass, no dedup)"
+    else
+        echo "[ ] Always Alert (re-alert on every pass, no dedup)"
+    fi
+}
+
 if command -v LIST_PICKER >/dev/null 2>&1; then
     while true; do
         _resp=$(LIST_PICKER "What to detect (select to toggle)" \
@@ -666,6 +687,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
             "$(stealth_menu_item)" \
+            "$(always_alert_menu_item)" \
             "Start scanning" \
             "Start scanning")
         case "$_resp" in
@@ -677,8 +699,9 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
+            *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
             "Start scanning") break ;;
-            *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE values rather than looping forever
+            *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE/ALWAYS_ALERT values rather than looping forever
         esac
     done
 fi
@@ -1209,7 +1232,7 @@ handle_flock_wifi_line() {
     local src mac msgtype kv
     IFS='|' read -r src mac msgtype kv <<< "$line"
     [ -z "$mac" ] && return
-    if echo "$SEEN_STRONG" | grep -q "$mac WIFI_FLOCK"; then return; fi
+    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac WIFI_FLOCK"; then return; fi
 
     local conf="high"
     case "$kv" in
@@ -1256,7 +1279,7 @@ handle_flock_ble_line() {
     local src mac msgtype kv
     IFS='|' read -r src mac msgtype kv <<< "$line"
     [ -z "$mac" ] && return
-    if echo "$SEEN_STRONG" | grep -q "$mac BLE_FLOCK_UUID"; then return; fi
+    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac BLE_FLOCK_UUID"; then return; fi
 
     # $kv is just "|rssi=N" or "" -- flock_ble_monitor.awk has no other
     # trailing fields on this line, unlike the other handlers that need to
@@ -1287,7 +1310,7 @@ handle_glasses_ble_line() {
     local src mac brand kv
     IFS='|' read -r src mac brand kv <<< "$line"
     [ -z "$mac" ] && return
-    if echo "$SEEN_STRONG" | grep -q "$mac BLE_GLASSES"; then return; fi
+    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac BLE_GLASSES"; then return; fi
 
     local rssi_sfx=""
     case "$kv" in
@@ -1350,7 +1373,7 @@ handle_mesh_wifi_line() {
     local src mac matchkind
     IFS='|' read -r src mac matchkind <<< "$line"
     [ -z "$mac" ] && return
-    if echo "$SEEN_STRONG" | grep -q "$mac WIFI_MESH\|$mac MESH_BLE"; then return; fi
+    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac WIFI_MESH\|$mac MESH_BLE"; then return; fi
 
     # wifi_mesh|MAC|matchkind was an exact 3-field fit for the 3 `read` vars
     # above before RSSI was added, so a trailing "|rssi=N" lands INSIDE
@@ -1694,7 +1717,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if echo "$SEEN_STRONG" | grep -q "$MAC $NAME"; then continue; fi
+            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC $NAME"; then continue; fi
             MATCH=$(flock_ble_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
@@ -1740,7 +1763,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if echo "$SEEN_STRONG" | grep -q "$MAC WIFI_MESH\|$MAC MESH_BLE"; then continue; fi
+            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC WIFI_MESH\|$MAC MESH_BLE"; then continue; fi
             MATCH=$(mesh_ble_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
@@ -1766,7 +1789,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if echo "$SEEN_STRONG" | grep -q "$MAC BLE_SKIMMER"; then continue; fi
+            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BLE_SKIMMER"; then continue; fi
             MATCH=$(ble_skimmer_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
