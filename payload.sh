@@ -311,6 +311,16 @@ for _candidate in "." "/root/payloads/user/reconnaissance/Counter_Surveillance_P
         break
     fi
 done
+# Date-based, bumped by hand in the VERSION file alongside each dated git
+# tag (e.g. v2026.08.19) -- not read from git itself, since the deployed
+# copy on the device is a plain file transfer (pscp), not a git checkout,
+# so there's no .git directory here to ask. Missing file (e.g. an older
+# deploy from before this existed) falls back to "unknown" rather than
+# failing -- this is purely informational, never gates anything.
+SCRIPT_VERSION="unknown"
+[ -f "$SCRIPT_DIR/VERSION" ] && SCRIPT_VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null)
+[ -z "$SCRIPT_VERSION" ] && SCRIPT_VERSION="unknown"
+
 LOOT_DIR="/root/loot/counter_surveillance_pager"
 WORK_DIR="/tmp/counter_surveillance_pager"
 mkdir -p "$LOOT_DIR" "$WORK_DIR"
@@ -326,7 +336,7 @@ DRONE_LOG_FILE="${LOOT_DIR}/drone_rid_${TIMESTAMP}.txt"
 # below start appending (2>>) diagnostic output to LOG_FILE -- writing this
 # with `>` again later would silently wipe out those first-run diagnostics
 # right when they're most useful (e.g. did `iw ... type monitor` fail?).
-echo "Counter-Surveillance-Pager started at $(date)" > "$LOG_FILE"
+echo "Counter-Surveillance-Pager v$SCRIPT_VERSION started at $(date)" > "$LOG_FILE"
 echo "Drone Remote ID log started at $(date)" > "$DRONE_LOG_FILE"
 
 BLE_HITS="$WORK_DIR/ble_rid_hits.log"
@@ -690,7 +700,7 @@ FLOCK_BLE_UUID_OK=0
 GLASSES_BLE_OK=0
 DEAUTH_OK=0
 
-LOG yellow "Counter-Surveillance-Pager started at $(date)"
+LOG yellow "Counter-Surveillance-Pager v$SCRIPT_VERSION started at $(date)"
 
 AWK_FILES_OK=1
 for _f in rid_common.awk rid_ble_monitor.awk rid_wifi_monitor.awk; do
