@@ -1229,7 +1229,17 @@ handle_flock_wifi_line() {
     echo "$ENTRY" >> "$LOG_FILE"
     DETECTIONS=$((DETECTIONS + 1))
     COUNTER=$((COUNTER + 1))
-    if [ "$conf" = "high" ]; then
+    # conf=medium now gets a physical alert too, not just conf=high --
+    # field-confirmed live 2026-08-20 (parked next to a real camera on OUI
+    # 9c:2f:9d, RSSI trending -49/-39/-38dBm as proximity increased) that
+    # conf=medium hits (Beacon/Probe-Response/addr1/any-management-frame
+    # OUI matches) are real signal on a real camera, not noise -- silent-
+    # only was the right call before any of those paths had live
+    # confirmation, staying silent now that one has would mean driving
+    # past a real hit with nothing but an easy-to-miss yellow screen line.
+    # conf=low (OUI+wildcard-probe WITHOUT a signature match) stays soft-
+    # only -- no live confirmation yet that tier specifically is reliable.
+    if [ "$conf" = "high" ] || [ "$conf" = "medium" ]; then
         stealth_blink
     fi
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"

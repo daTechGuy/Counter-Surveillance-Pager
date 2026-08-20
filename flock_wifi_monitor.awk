@@ -39,7 +39,8 @@
 # field-data trail. See process_flock_packet() for where this branches off
 # before the OUI gate.
 #
-# BEACON / PROBE-RESPONSE MATCHING (field-driven, 2026-08-19): a real drive
+# MANAGEMENT-FRAME OUI MATCHING (field-driven, 2026-08-19, widened further
+# 2026-08-20 -- see the follow-up note right after this paragraph): a real drive
 # past a known camera produced only 4 wildcard probes total from ANY device
 # in 22 minutes, none from a known OUI -- zero Flock hits, but that same day
 # a much longer session (4.5hr) at the same OUI list DID produce real
@@ -60,6 +61,21 @@
 # for non-matching OUIs on this path -- unlike wildcard probes, beacons are
 # sent by every AP in range constantly, so logging every unmatched one would
 # be pure noise, not a useful field-data trail.
+#
+# FOLLOW-UP (2026-08-20): the Beacon/Probe-Response restriction above turned
+# out to still be too narrow. Parked next to a real, RSSI-confirmed camera
+# on OUI 9c:2f:9d, mesh_wifi_monitor.awk (unrestricted to ANY management
+# subtype) caught it 3 times with a clean proximity RSSI trend (-49/-39/
+# -38dBm as the device got closer) in the same session where THIS file's
+# then-Beacon(8)/Probe-Response(5)-only gate matched nothing on that OUI at
+# all. Rather than keep guessing which specific subtype(s) a given camera
+# model actually uses (already wrong once), the gate now accepts ANY
+# management subtype other than Probe Request (which keeps its own
+# wildcard/IE-signature path) -- matching mesh_wifi_monitor.awk's already
+# field-proven permissive approach directly. The matched line now also
+# carries the raw subtype number (stype=N) specifically so future field
+# data can show which subtype(s) real cameras actually use, instead of
+# staying a guess.
 #
 # OUI LIST REFRESH (31 -> 40 entries): flock-you's own main.cpp hadn't yet
 # picked up a newer OUI set that colonelpanichacks/oui-spy-unified-blue (his
@@ -273,7 +289,7 @@ function flock_sig_matches(arr, start, end,   sigA, sigB) {
 }
 
 function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
-                                   oui, mac, ies_start, r, matched, sig, rssi, rssi_sfx) {
+                                   oui, mac, ies_start, r, matched, sig, rssi, rssi_sfx, msgtype) {
     if (fnpkt < 4) return
     itlen = hex2dec(fpkt[3]) + hex2dec(fpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -282,27 +298,42 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
     b0 = hex2dec(fpkt[dot11_start])
     ftype = int(b0 / 4) % 4
     stype = int(b0 / 16) % 16
-    # management only: Probe Request (4, full wildcard/IE-sig path below),
-    # or Beacon (8) / Probe Response (5) for the OUI-only path -- see this
-    # file's header, BEACON / PROBE-RESPONSE MATCHING.
+    # management only: Probe Request (4) gets the full wildcard/IE-sig path
+    # below; every OTHER management subtype (Beacon, Probe Response, Auth,
+    # Association Response, Action, etc.) gets the OUI-only path -- see
+    # this file's header, BEACON / PROBE-RESPONSE MATCHING (now widened to
+    # ANY non-Probe-Request management subtype as of 2026-08-20 field data).
     if (ftype != 0) return
-    if (stype != 4 && stype != 8 && stype != 5) return
 
     oui = fpkt[dot11_start + 10] ":" fpkt[dot11_start + 11] ":" fpkt[dot11_start + 12]
 
     if (stype != 4) {
-        # Beacon/Probe-Response: pure OUI match, no wildcard/IE-signature
-        # concept applies to these (different fixed-parameter layout, and
-        # the SSID they carry is the AP's real SSID, not a wildcard). Only
-        # worth anything against a KNOWN Flock OUI -- see header on why
-        # there's no diagnostic-log branch here for unmatched OUIs.
+        # Any non-Probe-Request management subtype: pure OUI match, no
+        # wildcard/IE-signature concept applies (different fixed-parameter
+        # layout per subtype, and several don't even carry an SSID IE at
+        # all). Only worth anything against a KNOWN Flock OUI -- see header
+        # on why there's no diagnostic-log branch here for unmatched OUIs
+        # (unlike wildcard probes, most management subtypes are either rare
+        # enough or tied to an existing association that OUI-only logging
+        # wouldn't be the noisy firehose a wildcard-probe diagnostic would).
+        # Widened from Beacon(8)/Probe-Response(5)-only after live field
+        # data (2026-08-20): parked next to a real, RSSI-confirmed camera
+        # on OUI 9c:2f:9d, Mesh-Detect's WiFi matcher (which accepts ANY
+        # management subtype, no restriction at all) caught it 3x with a
+        # clean proximity RSSI trend (-49/-39/-38dBm) while this file's
+        # then-Beacon/Probe-Response-only gate matched nothing on that OUI
+        # at all in the same session -- rather than keep guessing which
+        # specific subtype(s) a given camera model actually uses, matched
+        # Mesh-Detect's already-proven permissive approach directly.
         if (!(oui in flock_oui)) return
         mac = mac_str_dot11(fpkt, dot11_start + 10)
         if (!flock_throttle_ok(mac)) return
         rssi = wifi_rssi(fpkt, itlen, fnpkt)
         rssi_sfx = (rssi != 127) ? "|rssi=" rssi : ""
-        print "wifi_flock|" mac "|" (stype == 8 ? "beacon_oui_match" : "probe_resp_oui_match") \
-              "|oui=" oui "|conf=medium" rssi_sfx
+        msgtype = "mgmt_oui_match"
+        if (stype == 8) msgtype = "beacon_oui_match"
+        else if (stype == 5) msgtype = "probe_resp_oui_match"
+        print "wifi_flock|" mac "|" msgtype "|oui=" oui "|conf=medium|stype=" stype rssi_sfx
         fflush()
         return
     }
