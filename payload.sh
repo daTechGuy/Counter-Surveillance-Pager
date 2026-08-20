@@ -1056,6 +1056,36 @@ mesh_ble_match() {
     done
 }
 
+# Checks one "MAC NAME" BLE scan result for the legacy Flock-You BLE-name
+# loop below: a name match (now also including "xuntong", the manufacturer
+# behind BLE company ID 0x09C8 that flock_ble_monitor.awk treats as an
+# UNVERIFIED signature -- a literal advertised-name match on it is a much
+# stronger signal than that UUID/company-ID guess, worth catching here even
+# though this loop predates that file), OR a known Flock OUI, cross-checked
+# against cncartistsec/BluePine-WiFi-Pineapple-Pager's own active
+# FLOCKCAM_OUIS list. Kept as its own small array rather than sharing
+# flock_wifi_monitor.awk's much larger flock_oui[] (used for 802.11 WiFi
+# frames, a different transport this BLE-side loop has no reach into) --
+# this loop is deliberately self-contained, "unmodified from Flock-You /
+# Flock_Detect" per its own comment below, not wired into the newer awk-
+# based system. Deliberately excludes BluePine's own cc:cc:cc entry: every
+# other OUI in both lists is a real IEEE registration, cc:cc:cc reads like
+# a placeholder/test pattern rather than one, so it's left out here as a
+# false-positive risk rather than taken on faith. Echoes "name" or "oui".
+flock_ble_match() {
+    local mac="$1" name="$2"
+    if echo "$name" | grep -qi "fs ext battery\|penguin\|flock\|pigvision\|xuntong"; then
+        echo "name"
+        return
+    fi
+    local oui_lc="${mac,,}"
+    oui_lc="${oui_lc:0:8}"
+    case "$oui_lc" in
+        b4:1e:52|58:8e:81|ec:1b:bd|90:35:ea|04:0d:84|f0:82:c0|1c:34:f1|38:5b:44|94:34:69|b4:e3:f9|d4:11:d6)
+            echo "oui" ;;
+    esac
+}
+
 # Checks one "MAC NAME" BLE scan result against known BLE credit-card-
 # skimmer signatures -- ported from cncartistsec/BluePine-WiFi-Pineapple-
 # Pager's check_bt_ccskimmr(). These are generic HC-05/HC-06-style serial
@@ -1593,10 +1623,13 @@ while true; do
     kill $PID 2>/dev/null
     wait $PID 2>/dev/null
     if [ "$WANT_FLOCK" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
-        grep -i "fs ext battery\|penguin\|flock\|pigvision" /tmp/hci_scan.txt | sort -u | while read -r full_line; do
+        while read -r full_line; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
+            [ -z "$MAC" ] && continue
             if echo "$SEEN_STRONG" | grep -q "$MAC $NAME"; then continue; fi
+            MATCH=$(flock_ble_match "$MAC" "$NAME")
+            [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | $NAME$GPS_TAG"
             if echo "$NAME" | grep -qi "fs ext battery"; then
@@ -1605,7 +1638,12 @@ while true; do
                 LOG green "$ENTRY"
             elif echo "$NAME" | grep -qi "pigvision"; then
                 LOG magenta "$ENTRY"
-            elif echo "$NAME" | grep -qi "flock"; then
+            elif echo "$NAME" | grep -qi "flock\|xuntong"; then
+                LOG cyan "$ENTRY"
+            elif [ "$MATCH" = "oui" ]; then
+                # No recognized name, but the OUI itself matched
+                # FLOCKCAM_OUIS -- same "Other Flock" tier as a bare "flock"
+                # name match above, just reached via the MAC instead.
                 LOG cyan "$ENTRY"
             else
                 LOG "$ENTRY"
@@ -1623,7 +1661,7 @@ while true; do
             fi
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC $NAME"
-        done
+        done < <(sort -u /tmp/hci_scan.txt)
     fi
 
     # --- Mesh-Detect BLE scan: reuse the same hcitool lescan dump above, ---
