@@ -1279,6 +1279,13 @@ mesh_vendor_label() {
             # doesn't have; see rogue_tracker_monitor.awk for what that
             # kind of check looks like if this ever gets built.
             echo "Axon Cam" ;;
+        00:58:28|00:c0:d4|84:70:03)
+            # Axon's separate networking-gear OUI block (not body cams --
+            # per OSINTI4L/Fuzz_Finder, "Axon OUIs dedicated to them for
+            # networking gear"), cross-referenced against
+            # cncartistsec/BluePine-WiFi-Pineapple-Pager's own active
+            # AXONCAMS_OUI list, which credits the same source.
+            echo "Axon Networking Gear" ;;
         *) echo "" ;;
     esac
 }
