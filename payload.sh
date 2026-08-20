@@ -332,21 +332,23 @@ echo "Drone Remote ID log started at $(date)" > "$DRONE_LOG_FILE"
 BLE_HITS="$WORK_DIR/ble_rid_hits.log"
 WIFI_HITS="$WORK_DIR/wifi_rid_hits.log"
 FLOCK_WIFI_HITS="$WORK_DIR/flock_wifi_hits.log"
+FLOCK_ADDR1_HITS="$WORK_DIR/flock_addr1_hits.log"
 MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
 TRACKER_HITS="$WORK_DIR/tracker_hits.log"
 FLOCK_BLE_HITS="$WORK_DIR/flock_ble_hits.log"
 GLASSES_BLE_HITS="$WORK_DIR/glasses_ble_hits.log"
 DEAUTH_HITS="$WORK_DIR/deauth_eviltwin_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$GLASSES_BLE_HITS" "$DEAUTH_HITS"
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$FLOCK_ADDR1_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$GLASSES_BLE_HITS" "$DEAUTH_HITS"
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
 WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
 FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
+FLOCK_ADDR1_FIFO="$WORK_DIR/flock_addr1_raw.fifo"
 MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
 TRACKER_FIFO="$WORK_DIR/tracker_raw.fifo"
 FLOCK_BLE_FIFO="$WORK_DIR/flock_ble_raw.fifo"
 GLASSES_BLE_FIFO="$WORK_DIR/glasses_ble_raw.fifo"
 DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
+rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
@@ -418,6 +420,8 @@ TCPDUMP_PID=""
 WIFI_MON_PID=""
 FLOCK_TCPDUMP_PID=""
 FLOCK_WIFI_MON_PID=""
+FLOCK_ADDR1_TCPDUMP_PID=""
+FLOCK_ADDR1_MON_PID=""
 MESH_TCPDUMP_PID=""
 MESH_WIFI_MON_PID=""
 TRACKER_HCIDUMP_PID=""
@@ -435,6 +439,7 @@ WIFI_IFACE_CREATED=0
 cleanup() {
     for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$TCPDUMP_PID" "$WIFI_MON_PID" \
              "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" \
+             "$FLOCK_ADDR1_TCPDUMP_PID" "$FLOCK_ADDR1_MON_PID" \
              "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" \
              "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" \
              "$FLOCK_BLE_HCIDUMP_PID" "$FLOCK_BLE_MON_PID" \
@@ -443,7 +448,7 @@ cleanup() {
              "$BOOKMARK_WATCHER_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
+    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -703,6 +708,15 @@ if [ ! -f "$SCRIPT_DIR/flock_wifi_monitor.awk" ]; then
     LOG red "Flock WiFi detection: disabled (flock_wifi_monitor.awk not found -- looked in $SCRIPT_DIR)"
     FLOCK_AWK_FILE_OK=0
 fi
+# Own file-existence check, not its own FLOCK_AWK_FILE_OK-style hard gate --
+# see flock_wifi_addr1_monitor.awk's header for the UNVERIFIED addr1/
+# receiver-address technique this is. Missing this file only drops that one
+# extra signal, doesn't touch the main Flock WiFi detector above at all.
+if [ -f "$SCRIPT_DIR/flock_wifi_addr1_monitor.awk" ]; then
+    LOG yellow "Flock WiFi addr1 (receiver-address) detection: enabled, UNVERIFIED technique"
+else
+    LOG yellow "Flock WiFi addr1 (receiver-address) detection: disabled (flock_wifi_addr1_monitor.awk not found -- looked in $SCRIPT_DIR)"
+fi
 
 # Same idea for Mesh-Detect's WiFi matcher: file presence is one gate, but it
 # also only makes sense to run if the config actually has an oui:/mac: entry
@@ -948,6 +962,22 @@ if [ "$FLOCK_WIFI_OK" = "1" ]; then
     FLOCK_WIFI_MON_PID=$!
 fi
 
+# Own tcpdump process, "type data" instead of "type mgt" -- see
+# flock_wifi_addr1_monitor.awk's header for the technique (addr1/receiver-
+# address OUI match on Data frames, catches a camera that never transmits
+# anything itself) and its UNVERIFIED status. Gated on the same
+# FLOCK_WIFI_OK as the main Flock WiFi detector above -- this is another
+# signal for the same "is a Flock camera nearby" question, not a separate
+# menu toggle.
+if [ "$FLOCK_WIFI_OK" = "1" ] && [ -f "$SCRIPT_DIR/flock_wifi_addr1_monitor.awk" ]; then
+    mkfifo "$FLOCK_ADDR1_FIFO"
+    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type data > "$FLOCK_ADDR1_FIFO" 2>"$WORK_DIR/flock_addr1_tcpdump.log" &
+    FLOCK_ADDR1_TCPDUMP_PID=$!
+    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/flock_wifi_addr1_monitor.awk" \
+        < "$FLOCK_ADDR1_FIFO" >> "$FLOCK_ADDR1_HITS" 2>"$WORK_DIR/flock_addr1_monitor.log" &
+    FLOCK_ADDR1_MON_PID=$!
+fi
+
 # Same reasoning as the Flock WiFi pipeline above: its own tcpdump process
 # rather than a 4th -f alongside rid_wifi_monitor.awk / flock_wifi_monitor.awk.
 if [ "$MESH_WIFI_OK" = "1" ]; then
@@ -995,6 +1025,7 @@ declare -A DRONE_KNOWN
 BLE_HITS_OFFSET=0
 WIFI_HITS_OFFSET=0
 FLOCK_WIFI_HITS_OFFSET=0
+FLOCK_ADDR1_HITS_OFFSET=0
 MESH_WIFI_HITS_OFFSET=0
 TRACKER_HITS_OFFSET=0
 FLOCK_BLE_HITS_OFFSET=0
@@ -1746,6 +1777,22 @@ while true; do
                 fi
             done < <(tail -c "+$((FLOCK_WIFI_HITS_OFFSET + 1))" "$FLOCK_WIFI_HITS")
             FLOCK_WIFI_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Flock addr1 (receiver-address) scan: drain whatever ---
+    # --- flock_wifi_addr1_monitor.awk found -- see that file's header for ---
+    # --- the UNVERIFIED technique this is. Output is the same "wifi_flock|
+    # --- ...|conf=medium" shape flock_wifi_monitor.awk's own Beacon/Probe-
+    # --- Response match uses, so it reuses handle_flock_wifi_line() as-is,
+    # --- no new handler needed.
+    if [ "$FLOCK_WIFI_OK" = "1" ] && [ -f "$SCRIPT_DIR/flock_wifi_addr1_monitor.awk" ]; then
+        NEW_SIZE=$(wc -c < "$FLOCK_ADDR1_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$FLOCK_ADDR1_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_flock_wifi_line "$line"
+            done < <(tail -c "+$((FLOCK_ADDR1_HITS_OFFSET + 1))" "$FLOCK_ADDR1_HITS")
+            FLOCK_ADDR1_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 
