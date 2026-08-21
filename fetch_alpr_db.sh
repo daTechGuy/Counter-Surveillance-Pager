@@ -125,3 +125,25 @@ done
 
 rm -f "$TMP_JSON" /tmp/fetch_alpr_count.tmp
 echo "DONE: $total_cells cells, $total_nodes nodes written to $OUT_CSV, $failed_cells cells failed"
+
+# Also build the indexed .sqlite database payload.sh actually reads --
+# see ALPR_DB_FILE's comment in payload.sh for why: a real on-device timing
+# test (100k synthetic rows, this exact device) showed a full awk scan of
+# the CSV takes 3m42s, an indexed sqlite3 range query takes well under a
+# second to a few seconds depending on box size. The CSV stays the
+# canonical, human-inspectable output of the fetch itself; this is a
+# derived build artifact from it, rebuilt fresh each run rather than
+# updated in place.
+if command -v sqlite3 >/dev/null 2>&1; then
+    DB_FILE="${OUT_CSV%.csv}.sqlite"
+    rm -f "$DB_FILE"
+    sqlite3 "$DB_FILE" <<SQL
+CREATE TABLE cameras (id INTEGER, lat REAL, lon REAL);
+.mode csv
+.import --skip 1 $OUT_CSV cameras
+CREATE INDEX idx_lat ON cameras(lat);
+SQL
+    echo "DB: $DB_FILE built ($(sqlite3 "$DB_FILE" 'SELECT COUNT(*) FROM cameras;') rows indexed)"
+else
+    echo "WARN: sqlite3 not found on this machine -- $OUT_CSV was written, but the .sqlite payload.sh actually reads was NOT built. Install sqlite3 and re-run, or build it manually (see this script's own sqlite3 invocation above)." >&2
+fi

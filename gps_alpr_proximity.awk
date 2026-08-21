@@ -1,7 +1,10 @@
-# gps_alpr_proximity.awk -- checks the current GPS position against a local
-# CSV of known ALPR camera locations (id,lat,lon -- see fetch_alpr_db.sh),
-# run as:
-#   awk -v clat=LAT -v clon=LON -v radius_mi=25 -f gps_alpr_proximity.awk alpr_camera_db.csv
+# gps_alpr_proximity.awk -- stage 2 of the GPS-database ALPR proximity
+# check: precise haversine distance filtering on a SMALL candidate set of
+# known ALPR camera locations (id,lat,lon), run as:
+#   sqlite3 -csv alpr_camera_db.sqlite "SELECT id,lat,lon FROM cameras WHERE ..." \
+#     | awk -v clat=LAT -v clon=LON -v radius_mi=0.0947 -f gps_alpr_proximity.awk
+# (no filename operand -- reads the candidate rows from stdin, piped in by
+# check_alpr_gps_proximity() in payload.sh)
 #
 # Purely geographic, no RF involved at all -- this is meant to catch a
 # camera regardless of whether it emits anything any of this project's other
@@ -10,19 +13,22 @@
 # shows up here as long as it's in the database and you have a GPS fix,
 # while a real but unmapped camera only ever shows up via RF.
 #
-# TWO-STAGE FILTER, not a straight per-row haversine call: the source
-# database can realistically be tens of thousands of rows nationwide (a
-# single ~1x1.5 degree test cell over one Texas metro area alone returned
-# 918 real ALPR nodes -- see fetch_alpr_db.sh's header). Computing sin/cos/
-# atan2 for every row on every GPS cycle would be wasteful when the
-# overwhelming majority of rows are nowhere near the current position. Each
-# row is first checked with cheap plain-arithmetic lat/lon deltas (no trig)
-# against a bounding box sized to the requested radius (with a small margin,
-# and a longitude delta that accounts for the current latitude -- a degree
-# of longitude covers much less ground near the poles than at the equator,
-# so a fixed-degree box would either be too tight at low latitudes or
-# wastefully large at high ones). Only rows that pass that cheap filter get
-# the real haversine distance computed.
+# TWO-STAGE FILTER OVERALL, this file is only stage 2: the source database
+# can realistically be tens of thousands of rows nationwide (a single
+# ~1x1.5 degree test cell over one Texas metro area alone returned 918 real
+# ALPR nodes -- see fetch_alpr_db.sh's header), and a live on-device timing
+# test (100k synthetic rows, this exact hardware) confirmed a full awk scan
+# of that many rows takes 3m42s -- too slow to run every GPS cycle without
+# stalling the whole detection loop. Stage 1 (sqlite3, in payload.sh) does
+# an INDEXED bounding-box pre-filter -- 0.38-2.51s measured on that same
+# 100k-row dataset depending on box size, 90-470x faster than the full
+# scan -- and only pipes its small result set in here. This file still
+# keeps its own cheap plain-arithmetic bbox check below (radius_mi here is
+# the tight real alert radius, e.g. 500ft -- much smaller than stage 1's
+# deliberately wide pre-filter margin) before computing real haversine
+# distance, so most rows stage 1 passes through still get filtered
+# without needing trig at all -- just against a far smaller candidate set
+# than the full nationwide table.
 #
 # Confirmed live on this device before relying on it: BusyBox awk's sin(),
 # cos(), atan2(), and sqrt() all return correct values (checked against
