@@ -774,6 +774,21 @@ FLOCK_BLE_UUID_OK=0
 GLASSES_BLE_OK=0
 DEAUTH_OK=0
 
+# Payload-scoped "branding" -- deliberately not a device theme change (see
+# git history for why: this platform's payload-log screen background is
+# one fixed theme-wide asset shared by every payload, no per-payload
+# override field exists in its own JSON schema, confirmed by reading it
+# directly). An ASCII banner printed via LOG, by contrast, genuinely is
+# scoped to just this payload -- it's our own script's output, appears in
+# the same console the rest of this file already logs to, costs nothing
+# to add/remove, and needs zero device firmware files touched. Kept under
+# the payload-log screen's own max_chars: 50 -- verified before picking
+# this design, not assumed.
+LOG cyan   ' _____ ___ ___'
+LOG cyan   '|  ___/ __/ __|'
+LOG cyan   '| |__ \__ \__ \'
+LOG cyan   '|_____|___/___/  Counter-Surveillance-Pager'
+
 LOG yellow "Counter-Surveillance-Pager v$SCRIPT_VERSION started at $(date)"
 
 AWK_FILES_OK=1
