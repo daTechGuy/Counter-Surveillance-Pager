@@ -1,145 +1,92 @@
 #!/bin/bash
-# fetch_alpr_db.sh -- pulls the full OpenStreetMap ALPR camera dataset (the
-# same data DeFlock's map at https://deflock.org renders) via the public
-# Overpass API, and writes it to alpr_camera_db.csv for gps_proximity_check()
-# in payload.sh to use.
+# fetch_alpr_db.sh -- pulls ALPR camera locations (the same data DeFlock's
+# own map at https://deflock.org / maps.deflock.org renders) and writes a
+# region-filtered id,lat,lon CSV, then builds the indexed .sqlite database
+# payload.sh actually reads.
 #
-# WHY OVERPASS DIRECTLY, NOT DEFLOCK'S OWN SITE: DeFlock (FoggedLens/deflock
-# on GitHub) is itself built on OpenStreetMap data -- its own README lists
-# "OpenStreetMap - Overpass API" under Services, and deflock.org returned
-# HTTP 403 to a direct fetch anyway (no public export endpoint found). The
-# underlying data is the standardized OSM tagging scheme documented on the
-# OSM wiki: `man_made=surveillance` + `surveillance:type=ALPR` on a node --
-# querying that directly is both the actual data source and doesn't depend
-# on DeFlock's own infrastructure staying up or exposing an API.
+# DATA SOURCE, 2nd revision: a single static GeoJSON download --
+# https://data.dontgetflocked.com/cameras.geojson.gz -- found by reading
+# deflockhopper_maps (FoggedLens/deflockhopper_maps, the DeFlock map
+# frontend's own repo, split out from the main deflock repo -- see its
+# CLAUDE.md's "Data Sources" section) rather than guessing. This is
+# DeFlock's own pre-aggregated, deduplicated dataset (132k+ US+Canada
+# cameras as of a live pull on 2026-08-20, more current than the ~114k
+# figure in that repo's own docs), served from Cloudflare -- confirmed
+# live: full file downloads in ~1.5s, vs. the gridded-Overpass-query
+# approach this script used to take (see git history), which depended on
+# ~975 sequential queries against shared, unreliable public Overpass
+# mirrors. A live check the same night found ALL of overpass-api.de,
+# overpass.kumi.systems, overpass.private.coffee, and 4 more public
+# instances either down or serving stale/incomplete data (one returned
+# HTTP 200 with valid-looking JSON but 0 nodes for a query independently
+# confirmed to have 918 real matches elsewhere) -- crowdsourced community
+# Overpass mirrors are not a reliable foundation for something meant to
+# run reliably. DeFlock's own CDN-backed static file doesn't have that
+# problem, and it's the same underlying OSM data either way (both this
+# file's earlier Overpass-based approach and DeFlock's own pipeline trace
+# back to the same `man_made=surveillance` / `surveillance:type=ALPR` OSM
+# tagging scheme -- this isn't a different, less-authoritative source).
 #
-# WHY GRIDDED, NOT ONE NATIONWIDE QUERY: confirmed live against the public
-# overpass-api.de instance -- a single query bounded to the whole continental
-# US timed out at 55s with zero results, twice (once via an admin-boundary
-# area lookup, once via a direct bbox). A single small test bbox (roughly
-# the Austin/San Antonio, TX area, ~1.0 x 1.4 degrees) returned 918 nodes in
-# a few seconds with no issue, confirming the query itself is correct and
-# that density alone (not query correctness) is what breaks a nationwide
-# single request. Grid cells here are sized similarly to that confirmed-
-# working test cell.
+# GeoJSON, not the compressed .gz extension the URL implies: confirmed
+# live the server/CDN already serves it decompressed (or curl's automatic
+# content-encoding handling did) -- `file` on the downloaded content
+# reports plain ASCII text, and it parses directly as JSON with no
+# decompression step needed.
 #
-# WHY SEQUENTIAL WITH A DELAY, NOT PARALLEL: overpass-api.de is a shared,
-# free public resource with a documented fair-use expectation of not
-# hammering it with concurrent/rapid requests. ~975 cells at roughly 3-5s
-# each plus a respectful pause between requests means this realistically
-# takes on the order of an hour for full continental-US coverage -- run it
-# in the background, it's a one-time (or occasional refresh) pull, not
-# something that needs to be fast.
+# Coordinate order is [lon, lat] (GeoJSON's own convention), NOT [lat,
+# lon] -- easy to get backwards, double-checked against real entries
+# before trusting it (e.g. a Georgia camera at lon=-83.15, lat=34.28 --
+# a lon of +34 would place it in the Mediterranean, not Georgia).
 set -u
 
 OUT_CSV="${1:-alpr_camera_db.csv}"
-# Multiple public mirrors, tried in order per cell -- confirmed live this
-# matters: the primary instance alone hit a >55% failure rate (HTTP 429
-# rate-limits and outright connection failures) partway into a first
-# attempt at this pull, even at a 2s delay between requests, and a later
-# attempt found overpass-api.de/kumi.systems/private.coffee ALL down/
-# erroring at once (checked directly, not assumed) while overpass.osm.ch
-# responded correctly -- listed first now since it was the one actually
-# confirmed working most recently, but kept as a rotation, not hardcoded
-# as the sole target, since public mirror uptime clearly isn't stable.
-OVERPASS_MIRRORS=(
-    "https://overpass.osm.ch/api/interpreter"
-    "https://overpass-api.de/api/interpreter"
-    "https://overpass.kumi.systems/api/interpreter"
-    "https://overpass.private.coffee/api/interpreter"
-)
-CELL_LAT=1.0
-CELL_LON=1.5
-DELAY_SECONDS=4
-MAX_RETRIES_PER_CELL=3
+SOURCE_URL="https://data.dontgetflocked.com/cameras.geojson.gz"
 
-# Continental US bounding rectangle by default -- override with
-# LAT_MIN/LAT_MAX/LON_MIN/LON_MAX env vars to scope a single state/region
-# instead (e.g. a Kansas pull while the full nationwide fetch is blocked
-# on public-mirror availability). Deliberately not Alaska/Hawaii/PR in the
-# default -- easy to extend with more bbox ranges later if needed, kept
-# out for now to bound the default pull's runtime.
+# Same override convention as before: defaults to the continental US, set
+# LAT_MIN/LAT_MAX/LON_MIN/LON_MAX to scope a single state/region instead.
 LAT_MIN="${LAT_MIN:-24.5}"
 LAT_MAX="${LAT_MAX:-49.5}"
 LON_MIN="${LON_MIN:--125.0}"
 LON_MAX="${LON_MAX:--66.9}"
 
-# Tries each mirror in turn, MAX_RETRIES_PER_CELL times each, with a short
-# growing backoff between attempts (2s, 4s, 6s...) before moving to the
-# next mirror -- a burst of retries against the SAME already-overloaded
-# server just adds to its load without improving the odds; rotating targets
-# is what actually helps. Writes to $TMP_JSON, returns 0 on a 200 with a
-# non-empty body, 1 if every mirror/attempt failed.
-fetch_cell() {
-    local bbox_lat1="$1" bbox_lon1="$2" bbox_lat2="$3" bbox_lon2="$4"
-    local query="[out:json][timeout:25];node[\"man_made\"=\"surveillance\"][\"surveillance:type\"=\"ALPR\"](${bbox_lat1},${bbox_lon1},${bbox_lat2},${bbox_lon2});out;"
-    local mirror attempt http_code
-    for mirror in "${OVERPASS_MIRRORS[@]}"; do
-        for attempt in $(seq 1 "$MAX_RETRIES_PER_CELL"); do
-            http_code=$(curl -s --max-time 30 -o "$TMP_JSON" -w "%{http_code}" \
-                -X POST "$mirror" --data-urlencode "data=${query}" 2>/dev/null)
-            if [ "$http_code" = "200" ] && [ -s "$TMP_JSON" ]; then
-                return 0
-            fi
-            echo "  retry: mirror=$mirror attempt=$attempt http=$http_code" >&2
-            sleep $((attempt * 2))
-        done
-    done
-    return 1
-}
+RAW_JSON=$(mktemp)
+echo "Downloading $SOURCE_URL ..."
+http_code=$(curl -s --max-time 120 -o "$RAW_JSON" -w "%{http_code}" "$SOURCE_URL")
+if [ "$http_code" != "200" ] || [ ! -s "$RAW_JSON" ]; then
+    echo "FATAL: download failed (http=$http_code)" >&2
+    rm -f "$RAW_JSON"
+    exit 1
+fi
+raw_size=$(wc -c < "$RAW_JSON")
+echo "Downloaded $raw_size bytes."
 
-echo "id,lat,lon" > "$OUT_CSV"
-TMP_JSON=$(mktemp)
-total_cells=0
-total_nodes=0
-failed_cells=0
+# RS trick: each awk "record" after the first is one GeoJSON Feature's
+# raw text (the whole file is a handful of very long lines, not one
+# Feature per line, so a normal per-line parser doesn't apply here the
+# way it did for tcpdump/hcidump/Overpass's own multi-line JSON output).
+awk -v RS='{"type":"Feature"' -v latmin="$LAT_MIN" -v latmax="$LAT_MAX" -v lonmin="$LON_MIN" -v lonmax="$LON_MAX" '
+    BEGIN { print "id,lat,lon" }
+    NR > 1 {
+        if (!match($0, /"coordinates":\[(-?[0-9.]+),(-?[0-9.]+)\]/, m)) next
+        lon = m[1] + 0; lat = m[2] + 0
+        if (!match($0, /"osmId":([0-9]+)/, m2)) next
+        id = m2[1]
+        if (lat >= latmin && lat <= latmax && lon >= lonmin && lon <= lonmax) {
+            print id "," lat "," lon
+            count++
+        }
+    }
+    END { print "matched: " count+0 > "/dev/stderr" }
+' "$RAW_JSON" > "$OUT_CSV"
 
-lat=$LAT_MIN
-while awk -v a="$lat" -v b="$LAT_MAX" 'BEGIN{exit !(a<b)}'; do
-    lat_next=$(awk -v a="$lat" -v c="$CELL_LAT" 'BEGIN{print a+c}')
-    lon=$LON_MIN
-    while awk -v a="$lon" -v b="$LON_MAX" 'BEGIN{exit !(a<b)}'; do
-        lon_next=$(awk -v a="$lon" -v c="$CELL_LON" 'BEGIN{print a+c}')
-        total_cells=$((total_cells + 1))
+rm -f "$RAW_JSON"
+node_count=$(($(wc -l < "$OUT_CSV") - 1))
+echo "DONE: $node_count nodes in region written to $OUT_CSV"
 
-        if fetch_cell "$lat" "$lon" "$lat_next" "$lon_next"; then
-            awk '
-                /"type": "node"/ { in_node=1 }
-                in_node && /"id":/ { gsub(/[^0-9]/,"",$0); id=$0 }
-                in_node && /"lat":/ { gsub(/[^0-9.\-]/,"",$0); lat=$0 }
-                in_node && /"lon":/ {
-                    gsub(/[^0-9.\-]/,"",$0); lon=$0
-                    print id","lat","lon
-                    in_node=0
-                    count++
-                }
-                END { print count+0 > "/tmp/fetch_alpr_count.tmp" }
-            ' "$TMP_JSON" >> "$OUT_CSV"
-            n=$(cat /tmp/fetch_alpr_count.tmp 2>/dev/null); n=${n:-0}
-            total_nodes=$((total_nodes + n))
-        else
-            failed_cells=$((failed_cells + 1))
-            echo "WARN: cell (${lat},${lon})-(${lat_next},${lon_next}) failed after all mirrors/retries -- see retry lines above" >&2
-        fi
-
-        echo "cell $total_cells: (${lat},${lon}) running total=${total_nodes} failed=${failed_cells}"
-        sleep "$DELAY_SECONDS"
-        lon=$lon_next
-    done
-    lat=$lat_next
-done
-
-rm -f "$TMP_JSON" /tmp/fetch_alpr_count.tmp
-echo "DONE: $total_cells cells, $total_nodes nodes written to $OUT_CSV, $failed_cells cells failed"
-
-# Also build the indexed .sqlite database payload.sh actually reads --
-# see ALPR_DB_FILE's comment in payload.sh for why: a real on-device timing
-# test (100k synthetic rows, this exact device) showed a full awk scan of
-# the CSV takes 3m42s, an indexed sqlite3 range query takes well under a
-# second to a few seconds depending on box size. The CSV stays the
-# canonical, human-inspectable output of the fetch itself; this is a
-# derived build artifact from it, rebuilt fresh each run rather than
-# updated in place.
+# Same final step as before: build the indexed .sqlite database
+# payload.sh actually reads -- see ALPR_DB_FILE's comment in payload.sh
+# for why a plain CSV scan isn't fast enough for a live per-GPS-cycle
+# check at any real dataset size.
 if command -v sqlite3 >/dev/null 2>&1; then
     DB_FILE="${OUT_CSV%.csv}.sqlite"
     rm -f "$DB_FILE"

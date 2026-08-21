@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+# Built from alpr_camera_db.csv by fetch_alpr_db.sh -- regenerable, and a
+# binary format not worth diffing in git; the CSV stays the versioned
+# canonical data.
+*.sqlite
