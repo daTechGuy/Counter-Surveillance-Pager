@@ -36,11 +36,14 @@ OUT_CSV="${1:-alpr_camera_db.csv}"
 # Multiple public mirrors, tried in order per cell -- confirmed live this
 # matters: the primary instance alone hit a >55% failure rate (HTTP 429
 # rate-limits and outright connection failures) partway into a first
-# attempt at this pull, even at a 2s delay between requests. Rotating to a
-# different mirror on failure, rather than just retrying the same
-# overloaded one, is what actually recovers a cell instead of burning
-# retries against a server that's already refusing requests.
+# attempt at this pull, even at a 2s delay between requests, and a later
+# attempt found overpass-api.de/kumi.systems/private.coffee ALL down/
+# erroring at once (checked directly, not assumed) while overpass.osm.ch
+# responded correctly -- listed first now since it was the one actually
+# confirmed working most recently, but kept as a rotation, not hardcoded
+# as the sole target, since public mirror uptime clearly isn't stable.
 OVERPASS_MIRRORS=(
+    "https://overpass.osm.ch/api/interpreter"
     "https://overpass-api.de/api/interpreter"
     "https://overpass.kumi.systems/api/interpreter"
     "https://overpass.private.coffee/api/interpreter"
@@ -50,13 +53,16 @@ CELL_LON=1.5
 DELAY_SECONDS=4
 MAX_RETRIES_PER_CELL=3
 
-# Continental US bounding rectangle. Deliberately not Alaska/Hawaii/PR --
-# easy to extend with more bbox ranges later if needed, kept out for now to
-# bound the initial pull's runtime.
-LAT_MIN=24.5
-LAT_MAX=49.5
-LON_MIN=-125.0
-LON_MAX=-66.9
+# Continental US bounding rectangle by default -- override with
+# LAT_MIN/LAT_MAX/LON_MIN/LON_MAX env vars to scope a single state/region
+# instead (e.g. a Kansas pull while the full nationwide fetch is blocked
+# on public-mirror availability). Deliberately not Alaska/Hawaii/PR in the
+# default -- easy to extend with more bbox ranges later if needed, kept
+# out for now to bound the default pull's runtime.
+LAT_MIN="${LAT_MIN:-24.5}"
+LAT_MAX="${LAT_MAX:-49.5}"
+LON_MIN="${LON_MIN:--125.0}"
+LON_MAX="${LON_MAX:--66.9}"
 
 # Tries each mirror in turn, MAX_RETRIES_PER_CELL times each, with a short
 # growing backoff between attempts (2s, 4s, 6s...) before moving to the
