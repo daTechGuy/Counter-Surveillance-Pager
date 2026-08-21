@@ -603,6 +603,13 @@ WANT_DEAUTH=1
 WANT_DRONE=1
 WANT_SKIMMER=1
 WANT_GLASSES=1
+# Menu label "Known ALPR Cameras (GPS Database)" -- deliberately not
+# grouped under the "Flock Safety cameras" toggle even though there's
+# overlap in what each can catch: this one is GPS+database, completely
+# independent of every RF detector above, and each ~2.7-2.8s measured
+# real-world cycle cost (see check_alpr_gps_proximity()) is worth being
+# able to turn off on its own, not bundled with an unrelated RF toggle.
+WANT_ALPR_GPS=1
 
 # ALWAYS_ALERT: 0 off (default), 1 on. Off preserves this payload's original
 # behavior -- SEEN_STRONG dedup means each MAC only alerts once per category
@@ -697,6 +704,7 @@ detection_menu_item() {
         drone) val="$WANT_DRONE" ;;
         skimmer) val="$WANT_SKIMMER" ;;
         glasses) val="$WANT_GLASSES" ;;
+        alpr_gps) val="$WANT_ALPR_GPS" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
 }
@@ -727,6 +735,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item drone 'Drone Remote ID')" \
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
+            "$(detection_menu_item alpr_gps 'Known ALPR Cameras (GPS Database)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
             "Start scanning" \
@@ -739,6 +748,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
+            *"Known ALPR Cameras"*) WANT_ALPR_GPS=$((1 - WANT_ALPR_GPS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
             "Start scanning") break ;;
@@ -889,6 +899,22 @@ elif [ ! -f "$SCRIPT_DIR/glasses_ble_monitor.awk" ]; then
     LOG red "Smart-glasses BLE (company ID) detection: disabled (glasses_ble_monitor.awk not found -- looked in $SCRIPT_DIR)"
 else
     LOG red "Smart-glasses BLE (company ID) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
+fi
+
+# No hardware/awk-file dependency to check here the way every RF detector
+# above has -- this one's dependencies (sqlite3, the .sqlite database, a
+# GPS fix) are checked live every cycle inside check_alpr_gps_proximity()
+# itself instead, since a GPS fix specifically can come and go during a
+# single run (tunnel, parking garage, etc.) in a way none of the other
+# gates here do.
+if [ "$WANT_ALPR_GPS" = "0" ]; then
+    LOG yellow "Known ALPR Cameras (GPS Database): disabled (not selected in detection menu)"
+elif ! command -v sqlite3 >/dev/null 2>&1; then
+    LOG red "Known ALPR Cameras (GPS Database): disabled (sqlite3 not found)"
+elif [ ! -f "$ALPR_DB_FILE" ]; then
+    LOG yellow "Known ALPR Cameras (GPS Database): no-op ($ALPR_DB_FILE not found -- see fetch_alpr_db.sh)"
+else
+    LOG green "Known ALPR Cameras (GPS Database): enabled ($ALPR_RADIUS_MI mi radius, sqlite3 found, database present -- still needs a live GPS fix each cycle to actually check)"
 fi
 
 # The shared wlan1mon radio setup itself is gated on ANY WiFi-side category
@@ -1182,6 +1208,7 @@ declare -A ALPR_GPS_SEEN
 # this project has, deliberately treated at least as seriously as the
 # tightest RF match tier.
 check_alpr_gps_proximity() {
+    [ "$WANT_ALPR_GPS" = "1" ] || return
     [ -z "$GPS_FIX" ] && return
     [ -f "$ALPR_DB_FILE" ] || return
     command -v sqlite3 >/dev/null 2>&1 || return
