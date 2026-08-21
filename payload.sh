@@ -361,6 +361,17 @@ DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
 rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
+# Local copy of the OpenStreetMap ALPR camera dataset (the same data
+# DeFlock's own map at deflock.org renders), fetched by fetch_alpr_db.sh --
+# see that file's header and gps_alpr_proximity.awk's header. Purely
+# geographic: no RF involved, so a known camera in this database alerts
+# regardless of whether it emits anything any other detector here could
+# see. Optional -- silently no-ops with no GPS hardware (same as every
+# other GPS-tagged feature already in this file) and just as silently
+# no-ops if this CSV isn't present, same reasoning as every other
+# config-file-driven detector degrading independently.
+ALPR_DB_FILE="$SCRIPT_DIR/alpr_camera_db.csv"
+ALPR_RADIUS_MI=25
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
 # Time-bounded, not permanent like tracker_allowlist.conf -- see
 # snooze_tracker.sh and load_tracker_snooze() below. Lives in WORK_DIR
@@ -1129,6 +1140,38 @@ mesh_ble_match() {
     done
 }
 
+declare -A ALPR_GPS_SEEN
+# Checks the current GPS position against ALPR_DB_FILE via
+# gps_alpr_proximity.awk and LOG/loot/alerts every match within
+# ALPR_RADIUS_MI, once per camera id per session (own dedup array, not
+# SEEN_STRONG -- there's no MAC here, an OSM node id is the natural key).
+# Silently no-ops without a GPS fix or without the CSV present -- see
+# ALPR_DB_FILE's own comment for why both are optional. Hard alert
+# (stealth_alert, not stealth_blink) since this is database-confirmed
+# ground truth, not an RF heuristic -- the strongest-confidence category
+# this project has, deliberately treated at least as seriously as the
+# tightest RF match tier.
+check_alpr_gps_proximity() {
+    [ -z "$GPS_FIX" ] && return
+    [ -f "$ALPR_DB_FILE" ] || return
+    local lat="${GPS_FIX%%,*}" lon="${GPS_FIX##*,}"
+    if [ -z "$lat" ] || [ -z "$lon" ]; then return; fi
+    local line id clat2 clon2 dist
+    while IFS=',' read -r id clat2 clon2 dist; do
+        [ -z "$id" ] && continue
+        if [ "$ALWAYS_ALERT" != "1" ] && [ -n "${ALPR_GPS_SEEN[$id]:-}" ]; then continue; fi
+        local CURRENT_TIME ENTRY
+        CURRENT_TIME=$(date '+%H:%M:%S')
+        ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
+        LOG red "$ENTRY"
+        echo "$ENTRY" >> "$LOG_FILE"
+        DETECTIONS=$((DETECTIONS + 1))
+        COUNTER=$((COUNTER + 1))
+        stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
+        ALPR_GPS_SEEN[$id]=1
+    done < <(awk -v clat="$lat" -v clon="$lon" -v radius_mi="$ALPR_RADIUS_MI" -f "$SCRIPT_DIR/gps_alpr_proximity.awk" "$ALPR_DB_FILE" 2>/dev/null)
+}
+
 # Checks one "MAC NAME" BLE scan result for the legacy Flock-You BLE-name
 # loop below: a name match (now also including "xuntong", the manufacturer
 # behind BLE company ID 0x09C8 that flock_ble_monitor.awk treats as an
@@ -1691,6 +1734,8 @@ while true; do
     GPS_FIX=$(get_gps_fix)
     GPS_TAG=""
     [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
+
+    check_alpr_gps_proximity
 
     load_tracker_snooze
 
