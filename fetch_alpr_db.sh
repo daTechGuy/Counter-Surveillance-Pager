@@ -33,10 +33,22 @@
 set -u
 
 OUT_CSV="${1:-alpr_camera_db.csv}"
-OVERPASS_URL="https://overpass-api.de/api/interpreter"
+# Multiple public mirrors, tried in order per cell -- confirmed live this
+# matters: the primary instance alone hit a >55% failure rate (HTTP 429
+# rate-limits and outright connection failures) partway into a first
+# attempt at this pull, even at a 2s delay between requests. Rotating to a
+# different mirror on failure, rather than just retrying the same
+# overloaded one, is what actually recovers a cell instead of burning
+# retries against a server that's already refusing requests.
+OVERPASS_MIRRORS=(
+    "https://overpass-api.de/api/interpreter"
+    "https://overpass.kumi.systems/api/interpreter"
+    "https://overpass.private.coffee/api/interpreter"
+)
 CELL_LAT=1.0
 CELL_LON=1.5
-DELAY_SECONDS=2
+DELAY_SECONDS=4
+MAX_RETRIES_PER_CELL=3
 
 # Continental US bounding rectangle. Deliberately not Alaska/Hawaii/PR --
 # easy to extend with more bbox ranges later if needed, kept out for now to
@@ -45,6 +57,30 @@ LAT_MIN=24.5
 LAT_MAX=49.5
 LON_MIN=-125.0
 LON_MAX=-66.9
+
+# Tries each mirror in turn, MAX_RETRIES_PER_CELL times each, with a short
+# growing backoff between attempts (2s, 4s, 6s...) before moving to the
+# next mirror -- a burst of retries against the SAME already-overloaded
+# server just adds to its load without improving the odds; rotating targets
+# is what actually helps. Writes to $TMP_JSON, returns 0 on a 200 with a
+# non-empty body, 1 if every mirror/attempt failed.
+fetch_cell() {
+    local bbox_lat1="$1" bbox_lon1="$2" bbox_lat2="$3" bbox_lon2="$4"
+    local query="[out:json][timeout:25];node[\"man_made\"=\"surveillance\"][\"surveillance:type\"=\"ALPR\"](${bbox_lat1},${bbox_lon1},${bbox_lat2},${bbox_lon2});out;"
+    local mirror attempt http_code
+    for mirror in "${OVERPASS_MIRRORS[@]}"; do
+        for attempt in $(seq 1 "$MAX_RETRIES_PER_CELL"); do
+            http_code=$(curl -s --max-time 30 -o "$TMP_JSON" -w "%{http_code}" \
+                -X POST "$mirror" --data-urlencode "data=${query}" 2>/dev/null)
+            if [ "$http_code" = "200" ] && [ -s "$TMP_JSON" ]; then
+                return 0
+            fi
+            echo "  retry: mirror=$mirror attempt=$attempt http=$http_code" >&2
+            sleep $((attempt * 2))
+        done
+    done
+    return 1
+}
 
 echo "id,lat,lon" > "$OUT_CSV"
 TMP_JSON=$(mktemp)
@@ -60,12 +96,7 @@ while awk -v a="$lat" -v b="$LAT_MAX" 'BEGIN{exit !(a<b)}'; do
         lon_next=$(awk -v a="$lon" -v c="$CELL_LON" 'BEGIN{print a+c}')
         total_cells=$((total_cells + 1))
 
-        query="[out:json][timeout:25];node[\"man_made\"=\"surveillance\"][\"surveillance:type\"=\"ALPR\"](${lat},${lon},${lat_next},${lon_next});out;"
-
-        http_code=$(curl -s --max-time 30 -o "$TMP_JSON" -w "%{http_code}" \
-            -X POST "$OVERPASS_URL" --data-urlencode "data=${query}" 2>/dev/null)
-
-        if [ "$http_code" = "200" ] && [ -s "$TMP_JSON" ]; then
+        if fetch_cell "$lat" "$lon" "$lat_next" "$lon_next"; then
             awk '
                 /"type": "node"/ { in_node=1 }
                 in_node && /"id":/ { gsub(/[^0-9]/,"",$0); id=$0 }
@@ -82,7 +113,7 @@ while awk -v a="$lat" -v b="$LAT_MAX" 'BEGIN{exit !(a<b)}'; do
             total_nodes=$((total_nodes + n))
         else
             failed_cells=$((failed_cells + 1))
-            echo "WARN: cell (${lat},${lon})-(${lat_next},${lon_next}) failed (http=$http_code)" >&2
+            echo "WARN: cell (${lat},${lon})-(${lat_next},${lon_next}) failed after all mirrors/retries -- see retry lines above" >&2
         fi
 
         echo "cell $total_cells: (${lat},${lon}) running total=${total_nodes} failed=${failed_cells}"
