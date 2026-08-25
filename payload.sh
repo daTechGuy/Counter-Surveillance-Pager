@@ -64,7 +64,7 @@
 # upstream reference implementation the way the tracker protocols did. See
 # that file's header for the detection logic and trusted_networks.conf's
 # header for the evil-twin config format.
-# Original Flock-You Contributors: colonelpanichacks, Claude (Anthropic), Grok (xAI), Brandon Starkweather
+# Original Flock-You Contributors: colonelpanichacks, Grok (xAI), Brandon Starkweather
 # Remote ID spec/byte-offset sources (see rid_common.awk header for citations):
 #   opendroneid/opendroneid-core-c, opendroneid/transmitter-linux
 # Category: Reconnaissance
