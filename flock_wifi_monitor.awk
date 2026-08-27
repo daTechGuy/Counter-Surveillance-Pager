@@ -96,7 +96,18 @@
 #     in the curated tracker doc (i.e. same evidentiary tier as several
 #     already-existing entries below marked "low confidence" /
 #     "WiGLE crowdsource" / "still verifying"): 04:0d:84, f0:82:c0, 1c:34:f1,
-#     38:5b:44, 94:34:69, b4:e3:f9, b4:1e:52, d4:11:d6.
+#     38:5b:44, 94:34:69, b4:e3:f9, b4:1e:52.
+#   - REMOVED d4:11:d6 -- pulled in by that same cross-reference pass
+#     without being individually identity-verified. Direct IEEE OUI lookup
+#     shows it's registered to ShotSpotter, Inc. (now SoundThinking), not
+#     Flock Safety -- a completely different vendor/surveillance category
+#     (acoustic gunshot detection, not ALPR). Sourced per Doug Borg's PR
+#     to marekbujko/flock-you ("Add OUI prefixes for Flock WiFi cameras,
+#     Flock Safety direct, and ShotSpotter"), whose own commit message
+#     notes ShotSpotter's sensors use this OUI for BLE diagnostics/
+#     provisioning, not WiFi -- wrong protocol for this detector even
+#     setting the mislabeling aside. Re-added correctly, as ShotSpotter,
+#     in mesh_detect_targets.conf instead.
 #
 # Deliberately its OWN tcpdump process rather than a 3rd -f alongside
 # rid_wifi_monitor.awk: every one of that file's line rules ends in `next`,
@@ -124,7 +135,7 @@ BEGIN {
           "90:35:ea 5c:93:a2 64:6e:69 48:27:ea a4:cf:12 82:6b:f2 " \
           "e0:0a:f6 14:b5:cd " \
           "04:0d:84 f0:82:c0 1c:34:f1 38:5b:44 94:34:69 " \
-          "b4:e3:f9 b4:1e:52 d4:11:d6", \
+          "b4:e3:f9 b4:1e:52", \
           _flock_ouis, " ")
     for (_flock_i in _flock_ouis) flock_oui[_flock_ouis[_flock_i]] = 1
 

@@ -1272,6 +1272,12 @@ check_alpr_gps_proximity() {
 # other OUI in both lists is a real IEEE registration, cc:cc:cc reads like
 # a placeholder/test pattern rather than one, so it's left out here as a
 # false-positive risk rather than taken on faith. Echoes "name" or "oui".
+# d4:11:d6 was pulled at the same time as the rest of this list but has
+# since been removed: direct IEEE OUI lookup shows it's registered to
+# ShotSpotter, Inc. (now SoundThinking) -- an acoustic gunshot-detection
+# vendor, not Flock Safety. Re-added correctly, as ShotSpotter, in
+# mesh_detect_targets.conf's BLE-matching pass instead -- see that file's
+# header for the same sourcing note as flock_wifi_monitor.awk's.
 flock_ble_match() {
     local mac="$1" name="$2"
     if echo "$name" | grep -qi "fs ext battery\|penguin\|flock\|pigvision\|xuntong"; then
@@ -1281,7 +1287,7 @@ flock_ble_match() {
     local oui_lc="${mac,,}"
     oui_lc="${oui_lc:0:8}"
     case "$oui_lc" in
-        b4:1e:52|58:8e:81|ec:1b:bd|90:35:ea|04:0d:84|f0:82:c0|1c:34:f1|38:5b:44|94:34:69|b4:e3:f9|d4:11:d6)
+        b4:1e:52|58:8e:81|ec:1b:bd|90:35:ea|04:0d:84|f0:82:c0|1c:34:f1|38:5b:44|94:34:69|b4:e3:f9)
             echo "oui" ;;
     esac
 }
