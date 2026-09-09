@@ -71,6 +71,32 @@
 # beacon", which is what drives the alert. A future refinement could add
 # battery-level / rotation-state decoding on top of this.
 #
+# GENERIC RETAIL/MARKETING BEACONS (iBeacon, Eddystone-UID, Eddystone-URL):
+# these are NOT anti-stalking tracker protocols -- they're stationary
+# proximity-marketing/indoor-positioning beacons (in-store navigation, shelf
+# tags, ad-targeting) commonly deployed in retail stores. They share the
+# exact same AD type + company/service ID as two of the four protocols
+# above (Apple 4C-00 manufacturer data, and the FEAA Eddystone service UUID)
+# but a DIFFERENT type byte, so they were already flowing through this same
+# capture and silently falling through the filter before this addition:
+#   - iBeacon: AD type 0xFF, company 4C 00 (Apple), type byte 0x02 (not
+#     0x12/Find My), length byte 0x15 (21), 16-byte proximity UUID, then
+#     major/minor/tx-power -- only the UUID is decoded here (same
+#     header-only philosophy as the SCOPE NOTE above; major/minor are a
+#     possible future refinement).
+#   - Eddystone-UID / Eddystone-URL: AD type 0x16, UUID 0xFEAA (bytes AA FE
+#     on the wire -- same UUID as Google's FMDN protocol above, disambiguated
+#     by frame-type byte instead): 0x00 = UID (namespace+instance, Google's
+#     original static beacon format), 0x10 = URL (a compressed URL, Google's
+#     "Physical Web" format). Header-only here too -- the namespace/instance
+#     bytes and the URL's token-compressed encoding are not decoded.
+# Emitted as "ble_beacon|..." (a distinct line prefix from "ble_tracker|"
+# above) specifically so payload.sh can route these to their own, much
+# softer handler (handle_beacon_line(), no persistence window, no
+# LED/vibrate alert) -- a stationary store beacon isn't a "is this
+# following me" signal the way a rogue tracker is, and treating it as one
+# would be a category error, not just a false positive.
+#
 # Same architecture as flock_wifi_monitor.awk / mesh_wifi_monitor.awk: own
 # capture process (here, its own `hcidump -i hci0 --raw`, running alongside
 # the existing drone-RID BLE reader and the Flock BLE hcitool lescan cycle
@@ -133,7 +159,7 @@ function tracker_throttle_ok(key,    c) {
 # trailing-field convention as rid_common.awk's emit_hit(), so it's
 # suppressed rather than printed when not meaningful.
 function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, \
-                                u1, u2, b, j, key, rssi_sfx) {
+                                u1, u2, b, j, key, rssi_sfx, m, uuid_raw, uuid) {
     rssi_sfx = (rssi != "" && rssi != 127) ? "|rssi=" rssi : ""
     i = start
     while (i < start + len) {
@@ -151,6 +177,16 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                     key = mac "|applefindmy"
                     if (tracker_throttle_ok(key)) {
                         print "ble_tracker|" mac "|applefindmy|status=" arr[i + 6] rssi_sfx
+                        fflush()
+                    }
+                } else if (b == 2 && adlen >= 25) {    # 0x02 iBeacon (retail beacon, not a tracker)
+                    uuid_raw = ""
+                    for (m = 0; m < 16; m++) uuid_raw = uuid_raw toupper(arr[i + 6 + m])
+                    uuid = substr(uuid_raw, 1, 8) "-" substr(uuid_raw, 9, 4) "-" \
+                           substr(uuid_raw, 13, 4) "-" substr(uuid_raw, 17, 4) "-" substr(uuid_raw, 21, 12)
+                    key = mac "|ibeacon"
+                    if (tracker_throttle_ok(key)) {
+                        print "ble_beacon|" mac "|ibeacon|uuid=" uuid rssi_sfx
                         fflush()
                     }
                 }
@@ -186,6 +222,18 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                     key = mac "|fmdn_normal"
                     if (tracker_throttle_ok(key)) {
                         print "ble_tracker|" mac "|fmdn_normal|" rssi_sfx
+                        fflush()
+                    }
+                } else if (b == 0) {                  # 0x00 Eddystone-UID (retail beacon, not a tracker)
+                    key = mac "|eddystone_uid"
+                    if (tracker_throttle_ok(key)) {
+                        print "ble_beacon|" mac "|eddystone_uid|" rssi_sfx
+                        fflush()
+                    }
+                } else if (b == 16) {                 # 0x10 Eddystone-URL (retail beacon, not a tracker)
+                    key = mac "|eddystone_url"
+                    if (tracker_throttle_ok(key)) {
+                        print "ble_beacon|" mac "|eddystone_url|" rssi_sfx
                         fflush()
                     }
                 }

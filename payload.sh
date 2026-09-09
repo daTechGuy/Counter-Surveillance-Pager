@@ -412,6 +412,13 @@ TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
 TRACKER_SNOOZE_FILE="$WORK_DIR/tracker_snooze.txt"
 TRACKER_LOG_FILE="${LOOT_DIR}/rogue_trackers_${TIMESTAMP}.txt"
 echo "Rogue BLE tracker log started at $(date)" > "$TRACKER_LOG_FILE"
+# Separate file from TRACKER_LOG_FILE on purpose, even though both are fed
+# by the same rogue_tracker_monitor.awk process -- these are a different
+# category (stationary retail beacons, not stalking trackers, see
+# handle_beacon_line()) and keeping them out of the tracker log means that
+# file stays exclusively "things that might be following me."
+BEACON_LOG_FILE="${LOOT_DIR}/retail_beacons_${TIMESTAMP}.txt"
+echo "Retail BLE beacon log started at $(date)" > "$BEACON_LOG_FILE"
 # Diagnostic-only, never alerts -- see flock_wifi_monitor.awk's header and
 # handle_flock_wifi_diag_line() below. Separate file from LOG_FILE/
 # surveillance.txt on purpose: this is expected to be noisy (most nearby
@@ -610,6 +617,16 @@ WANT_GLASSES=1
 # real-world cycle cost (see check_alpr_gps_proximity()) is worth being
 # able to turn off on its own, not bundled with an unrelated RF toggle.
 WANT_ALPR_GPS=1
+# Off by default, unlike every WANT_* above -- this piggybacks entirely on
+# the Rogue BLE trackers' scan process (rogue_tracker_monitor.awk's iBeacon/
+# Eddystone-UID/Eddystone-URL branches, see that file's header), so it's
+# inert unless WANT_TRACKER=1 too (a LOG line at startup says so if you
+# enable this without that). Default-off because stationary retail beacons
+# aren't a "following you" threat the way a rogue tracker is -- this is
+# ambient environmental info (which stores/venues are running proximity
+# marketing), not a security detection -- and in a mall or big-box store it
+# can be genuinely noisy. See handle_beacon_line().
+WANT_RETAIL_BEACONS=0
 
 # ALWAYS_ALERT: 0 off (default), 1 on. Off preserves this payload's original
 # behavior -- SEEN_STRONG dedup means each MAC only alerts once per category
@@ -705,6 +722,7 @@ detection_menu_item() {
         skimmer) val="$WANT_SKIMMER" ;;
         glasses) val="$WANT_GLASSES" ;;
         alpr_gps) val="$WANT_ALPR_GPS" ;;
+        retail_beacons) val="$WANT_RETAIL_BEACONS" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
 }
@@ -736,6 +754,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
             "$(detection_menu_item alpr_gps 'Known ALPR Cameras (GPS Database)')" \
+            "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
             "Start scanning" \
@@ -749,6 +768,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
             *"Known ALPR Cameras"*) WANT_ALPR_GPS=$((1 - WANT_ALPR_GPS)) ;;
+            *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
             "Start scanning") break ;;
@@ -877,6 +897,15 @@ elif [ ! -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" ]; then
     LOG red "Rogue tracker BLE detection: disabled (rogue_tracker_monitor.awk not found -- looked in $SCRIPT_DIR)"
 else
     LOG red "Rogue tracker BLE detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
+fi
+
+# Retail beacon detection (iBeacon/Eddystone-UID/Eddystone-URL) has no radio
+# or awk-file gate of its own -- it shares rogue_tracker_monitor.awk's scan
+# process entirely (see that file's header), so it's only ever as available
+# as Rogue BLE trackers already is. This just tells you when the toggle
+# you picked won't actually do anything.
+if [ "$WANT_RETAIL_BEACONS" = "1" ] && [ "$TRACKER_BLE_OK" != "1" ]; then
+    LOG yellow "Retail beacon (iBeacon/Eddystone) detection: enabled in menu but inert -- Rogue BLE trackers (which it shares a scan process with) is disabled or unavailable"
 fi
 
 # Own file-existence gate, same pattern as the checks above -- see
@@ -1600,6 +1629,52 @@ handle_tracker_line() {
     DETECTIONS=$((DETECTIONS + 1))
 }
 
+# Human-readable label per ble_beacon protocol tag emitted by
+# rogue_tracker_monitor.awk's generic-beacon branches -- separate from
+# tracker_protocol_label() above since iBeacon/Eddystone-UID/Eddystone-URL
+# aren't stalking-tracker protocols, see that file's header.
+beacon_protocol_label() {
+    case "$1" in
+        ibeacon)       echo "iBeacon" ;;
+        eddystone_uid) echo "Eddystone-UID" ;;
+        eddystone_url) echo "Eddystone-URL" ;;
+        *)             echo "$1" ;;
+    esac
+}
+
+# Parse one "ble_beacon|MAC|protocol|detail" line from
+# rogue_tracker_monitor.awk's generic-beacon branches. Deliberately soft,
+# same tier as handle_flock_ble_line()'s unverified-signature hits: LOG +
+# BEACON_LOG_FILE only, no vibrate/LED, no persistence window, and NOT
+# counted in DETECTIONS/COUNTER -- those drive the session summary
+# (summarize_session.sh) and this isn't a security detection the way a
+# rogue tracker or a camera is, it's ambient environmental info. Still
+# respects TRACKER_ALLOWLIST/TRACKER_SNOOZE since it shares
+# rogue_tracker_monitor.awk's MAC space -- a beacon you've allowlisted or
+# snoozed as a tracker stays suppressed here too. Gated on
+# WANT_RETAIL_BEACONS itself (not just at the awk-process level) since the
+# awk process it shares with rogue trackers may be running for tracker
+# detection alone with this toggle off.
+handle_beacon_line() {
+    [ "$WANT_RETAIL_BEACONS" = "1" ] || return
+    local line="$1"
+    local src mac protocol detail
+    IFS='|' read -r src mac protocol detail <<< "$line"
+    [ -z "$mac" ] && return
+
+    local mac_lc="${mac,,}"
+    [ -n "${TRACKER_ALLOWLIST[$mac_lc]:-}" ] && return
+    local now
+    now=$(date +%s)
+    local snooze_until="${TRACKER_SNOOZE[$mac_lc]:-0}"
+    [ "$now" -lt "$snooze_until" ] && return
+
+    local label
+    label=$(beacon_protocol_label "$protocol")
+    echo "$(date '+%H:%M:%S') | $mac | $label | $detail$GPS_TAG" >> "$BEACON_LOG_FILE"
+    LOG "BEACON: $mac | $label$GPS_TAG"
+}
+
 # Parse one line from deauth_eviltwin_monitor.awk -- either
 # "deauth|SRC|DST|deauth|COUNT" / "...|disassoc|COUNT", or
 # "eviltwin|BSSID|SSID|rogue_bssid". Every sighting is logged (loot never
@@ -1986,11 +2061,17 @@ while true; do
     fi
 
     # --- Rogue BLE tracker: drain whatever rogue_tracker_monitor.awk found ---
+    # (also carries "ble_beacon|..." lines from that same file's generic
+    # iBeacon/Eddystone branches -- routed to handle_beacon_line() instead,
+    # see rogue_tracker_monitor.awk's header for why they're one process.)
     if [ "$TRACKER_BLE_OK" = "1" ]; then
         NEW_SIZE=$(wc -c < "$TRACKER_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
         if [ "$NEW_SIZE" -gt "$TRACKER_HITS_OFFSET" ]; then
             while IFS= read -r line; do
-                [ -n "$line" ] && handle_tracker_line "$line"
+                case "$line" in
+                    ble_beacon\|*) [ -n "$line" ] && handle_beacon_line "$line" ;;
+                    *)             [ -n "$line" ] && handle_tracker_line "$line" ;;
+                esac
             done < <(tail -c "+$((TRACKER_HITS_OFFSET + 1))" "$TRACKER_HITS")
             TRACKER_HITS_OFFSET=$NEW_SIZE
         fi
