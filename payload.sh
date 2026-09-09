@@ -641,6 +641,13 @@ WANT_RETAIL_BEACONS=0
 # route repeatedly and wanting every pass to alert, not just the first.
 ALWAYS_ALERT=0
 
+# DISPLAY_MODE: 0 dashboard (default), 1 scrolling hit log (the legacy
+# screen). Declared here rather than beside the rest of the dashboard code
+# further down because the startup menu toggles it, and the menu runs
+# first -- see render_dashboard() for what the two modes actually look
+# like and why the legacy one is still reachable.
+DISPLAY_MODE=0
+
 # STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
 # suppressed, vibrator still pulses so a detection can still be felt without
 # looking at the screen), 2 stealth+silent (all physical feedback suppressed,
@@ -735,6 +742,14 @@ stealth_menu_item() {
     esac
 }
 
+display_mode_menu_item() {
+    if [ "$DISPLAY_MODE" = "0" ]; then
+        echo "[X] Dashboard screen (live panel, hits go to loot only)"
+    else
+        echo "[ ] Dashboard screen (off: scrolling hit log, legacy)"
+    fi
+}
+
 always_alert_menu_item() {
     if [ "$ALWAYS_ALERT" = "1" ]; then
         echo "[X] Always Alert (re-alert on every pass, no dedup)"
@@ -757,6 +772,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
+            "$(display_mode_menu_item)" \
             "Start scanning" \
             "Start scanning")
         case "$_resp" in
@@ -771,6 +787,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
+            *"Dashboard screen"*) DISPLAY_MODE=$((1 - DISPLAY_MODE)) ;;
             "Start scanning") break ;;
             *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE/ALWAYS_ALERT values rather than looping forever
         esac
@@ -1164,46 +1181,256 @@ DETECTIONS=0
 SEEN_STRONG=""
 COUNTER=0
 
-# Live on-screen detection counter. This device's payload API (see
-# /usr/bin: LOG/LED/RINGTONE/ALERT/VIBRATE/DPADLED and friends) has no
-# dedicated status-bar/badge/dashboard-widget command -- LOG's scrolling
-# text area is the only "live" surface a running payload can write to, so
-# the running total rides along on the hit lines themselves as a short
-# " [#N]" tag rather than costing a second line per hit on a screen that
-# only scrolls.
+# ---------------------------------------------------------------------------
+# Live on-screen dashboard
+# ---------------------------------------------------------------------------
+# This device's payload API (see /usr/bin: LOG/LED/RINGTONE/ALERT/VIBRATE/
+# DPADLED and friends) has no status-bar, badge or dashboard-widget command
+# -- LOG's text area is the only surface a running payload can write to.
+# What it DOES have is `clear`: the official library's live_probe payload
+# (library/user/reconnaissance/live_probe/payload.sh) drives a live display
+# by calling `clear` and reprinting its whole block every cycle, so a
+# full-screen repaint is an established pattern on this platform rather
+# than something invented here. render_dashboard() below is that pattern,
+# with a detector-count panel instead of a probe list.
 #
-# Counts UNIQUE DEVICES, not alerts: $1 is the device key (a MAC, or
-# "osm:<id>" for a GPS-database ALPR camera, which has no MAC). A tracker
-# that re-alerts every cooldown, or a camera seen on both the WiFi and BLE
-# paths, moves the total once and then stops -- so "[#7]" reads as "7
-# distinct things found so far", which is the number worth knowing while
-# standing somewhere. Keying on the MAC alone (not mac+category) is what
-# makes the cross-path case collapse; the tradeoff is that BLE MAC
-# rotation (AirTag/SmartTag/FMDN, see TRACKER_FIRST_SEEN's header) still
-# reads as a new device, which no counter on this device can fix.
+# In dashboard mode the per-hit lines stop going to the screen entirely --
+# they still go to their loot files exactly as before, so nothing about
+# what gets recorded changes, and summarize_session.sh / export_gps_kml.sh
+# read the same bytes they always did. The screen becomes state ("what is
+# around me right now") instead of history ("what scrolled past").
+#
+# DISPLAY_MODE 1 restores the old scrolling-log screen. It exists because
+# `clear` is the one piece of this taken on the strength of live_probe
+# rather than verified on this hardware -- if it turns out to be a no-op
+# on some firmware the dashboard would append forever instead of
+# repainting, and this toggle is the way back without an edit.
+DASH_RECENT_LINES=5     # how many recent hits the dashboard body shows
+DASH_MAX_TEXT=31        # recent-hit text truncated to this, to match the
+                        # 32-char rules and never wrap onto a second row
+SESSION_START=$(date +%s)
+
+# Unique-device bookkeeping behind the counts.
+#
+# DETECTED_DEVICES is keyed on the device key alone (a MAC, or "osm:<id>"
+# for a GPS-database ALPR camera, which has no MAC), so it counts DISTINCT
+# DEVICES rather than alerts: a tracker that re-alerts every cooldown, or
+# a camera caught on both the WiFi and BLE paths, moves the total once and
+# then stops. CAT_SEEN is keyed on "category|key" instead, so that same
+# camera still shows up under both the categories that found it. The
+# tradeoff of MAC-keying is that BLE MAC rotation (AirTag/SmartTag/FMDN,
+# see TRACKER_FIRST_SEEN's header) reads as a new device, which nothing on
+# this hardware can fix.
+declare -A DETECTED_DEVICES
+declare -A CAT_SEEN
+declare -A CAT_COUNT
+RECENT_HITS=()
+DASH_LAST_PAINT=0
+
+# Order the dashboard lists categories in. Kept as a space-separated
+# string rather than an associative array so the display order is fixed
+# and readable; the panel only prints the ones actually enabled.
+DASH_CATS="flock drone tracker mesh deauth alpr skimmer glasses"
+
+dash_cat_label() {
+    case "$1" in
+        flock)   echo "Flock" ;;
+        drone)   echo "Drone" ;;
+        tracker) echo "Tracker" ;;
+        mesh)    echo "Mesh" ;;
+        deauth)  echo "Deauth" ;;
+        alpr)    echo "ALPR" ;;
+        skimmer) echo "Skimmer" ;;
+        glasses) echo "Glasses" ;;
+    esac
+}
+
+# Three-letter tag the Recent panel prefixes each hit with. The full
+# labels are too wide there: a line is "HH:MM TAG <mac>" = 5+1+3+1+17 =
+# 27 of the ~31 usable columns, which leaves a few spare for a qualifier
+# and still shows every octet of the MAC. Truncating a MAC mid-octet, the
+# way the full labels forced, makes it useless for telling two devices
+# apart, which is the one job this panel has.
+dash_cat_tag() {
+    case "$1" in
+        flock)   echo "FLK" ;;
+        drone)   echo "UAS" ;;
+        tracker) echo "TRK" ;;
+        mesh)    echo "MSH" ;;
+        deauth)  echo "ATK" ;;
+        alpr)    echo "ALP" ;;
+        skimmer) echo "SKM" ;;
+        glasses) echo "GLS" ;;
+    esac
+}
+
+# Whether a category's detector was actually turned on for this run -- a
+# disabled detector's permanent 0 is noise on a screen this small, so the
+# panel leaves it out rather than showing a zero that can never move.
+dash_cat_enabled() {
+    case "$1" in
+        flock)   [ "$WANT_FLOCK" = "1" ] ;;
+        drone)   [ "$WANT_DRONE" = "1" ] ;;
+        tracker) [ "$WANT_TRACKER" = "1" ] ;;
+        mesh)    [ "$WANT_MESH" = "1" ] ;;
+        deauth)  [ "$WANT_DEAUTH" = "1" ] ;;
+        alpr)    [ "$WANT_ALPR_GPS" = "1" ] ;;
+        skimmer) [ "$WANT_SKIMMER" = "1" ] ;;
+        glasses) [ "$WANT_GLASSES" = "1" ] ;;
+        *)       false ;;
+    esac
+}
+
+# Colour each recent-hit line by the same language the scrolling log used:
+# red for the categories that mean someone is acting on you right now,
+# yellow for the unverified-signature tiers, cyan for confirmed Flock,
+# uncoloured for the watchlist you configured yourself.
+dash_cat_color() {
+    case "$1" in
+        tracker|deauth|drone|alpr) echo "red" ;;
+        glasses|skimmer)           echo "yellow" ;;
+        flock)                     echo "cyan" ;;
+        *)                         echo "" ;;
+    esac
+}
+
+# The one-line "how is this rig configured right now" strip under the
+# title: GPS fix if there is one, and stealth state, since both change
+# what you should expect the device to do and neither is visible anywhere
+# else once the startup banner is cleared.
+dash_status_line() {
+    local gps stealth
+    if [ -n "$GPS_FIX" ]; then gps="gps ok"; else gps="no gps"; fi
+    case "$STEALTH_MODE" in
+        1) stealth="stealth:vib" ;;
+        2) stealth="stealth:off" ;;
+        *) stealth="alerts on" ;;
+    esac
+    echo "$gps  |  $stealth"
+}
+
+# Repaints the whole screen. Fixed-height block, so it lands the same way
+# every time instead of drifting down the display as counts change.
+render_dashboard() {
+    [ "$DISPLAY_MODE" = "0" ] || return 0
+    DASH_LAST_PAINT=$(date +%s)
+
+    local up_s up_h up_m up_sec cat lbl n row pending i entry c txt col
+    up_s=$(( DASH_LAST_PAINT - SESSION_START ))
+    up_h=$(printf '%02d' $(( up_s / 3600 )))
+    up_m=$(printf '%02d' $(( (up_s % 3600) / 60 )))
+    up_sec=$(printf '%02d' $(( up_s % 60 )))
+
+    clear
+
+    LOG cyan "== COUNTER-SURVEILLANCE == v$SCRIPT_VERSION"
+    LOG "up $up_h:$up_m:$up_sec  |  $(dash_status_line)"
+    LOG "--------------------------------"
+
+    # Two categories per row: counts stay aligned on a narrow screen, and
+    # all eight fit in four lines instead of eight.
+    row=""; pending=0
+    for cat in $DASH_CATS; do
+        dash_cat_enabled "$cat" || continue
+        lbl=$(dash_cat_label "$cat")
+        n=${CAT_COUNT[$cat]:-0}
+        row="$row$(printf '%-8s%-6s' "$lbl" "$n")"
+        pending=1
+        if [ ${#row} -ge 28 ]; then
+            LOG "${row%"${row##*[![:space:]]}"}"
+            row=""; pending=0
+        fi
+    done
+    [ "$pending" = "1" ] && LOG "${row%"${row##*[![:space:]]}"}"
+
+    LOG "--------------------------------"
+    if [ "$DETECTIONS" = "0" ]; then
+        LOG green "No devices detected yet"
+    else
+        LOG red "UNIQUE DEVICES: $DETECTIONS"
+    fi
+
+    # Fixed number of body lines whether or not there are that many hits
+    # yet, so the footer doesn't walk up and down the screen.
+    i=0
+    while [ "$i" -lt "$DASH_RECENT_LINES" ]; do
+        entry="${RECENT_HITS[$i]:-}"
+        if [ -n "$entry" ]; then
+            c="${entry%%|*}"
+            txt="${entry#*|}"
+            # Hard-truncate rather than let a long line (a drone carrying
+            # its reported position, say) wrap onto a second row -- a wrap
+            # pushes the footer down and costs the block its fixed height,
+            # which is the whole point of repainting in place.
+            [ ${#txt} -gt "$DASH_MAX_TEXT" ] && txt="${txt:0:$((DASH_MAX_TEXT - 1))}>"
+            col=$(dash_cat_color "$c")
+            if [ -n "$col" ]; then LOG "$col" " $txt"; else LOG " $txt"; fi
+        else
+            LOG " "
+        fi
+        i=$((i + 1))
+    done
+
+    LOG "--------------------------------"
+    LOG green "RIGHT = bookmark this moment"
+}
+
+# Records one detection and repaints. $1 category, $2 device key, $3 the
+# short "what/who" text the dashboard's Recent panel shows for it.
+#
+# MUST be called before the caller's own LOG line, because it sets
+# $DETECT_TAG (" [#N]") for scrolling-log mode to append. That tag is
+# deliberately screen-only and never reaches $LOG_FILE: export_gps_kml.awk
+# anchors its " | gps=LAT,LON" match to end-of-line, so a suffix on the
+# persisted line would silently drop every GPS-tagged hit from the KML
+# export, and summarize_session.sh reads the same file positionally.
 #
 # Called by every real detection across every category (Flock, drone
 # Remote ID, Mesh-Detect, rogue trackers, deauth/evil-twin, known ALPR
 # cameras, skimmers, glasses) -- NOT by handle_beacon_line(), which
 # deliberately isn't a security detection, see that function's own header
 # for why.
-#
-# Sets $DETECT_TAG for the caller to append to its LOG line, and MUST be
-# called before that LOG so the tag is current. The tag is deliberately
-# screen-only and never reaches $LOG_FILE: export_gps_kml.awk anchors its
-# " | gps=LAT,LON" match to end-of-line, so a suffix on the persisted line
-# would silently drop every GPS-tagged hit from the KML export, and
-# summarize_session.sh reads the same file positionally.
-declare -A DETECTED_DEVICES
-DETECT_TAG=""
+# Per-hit screen line. In dashboard mode the screen IS the dashboard, so
+# these are suppressed entirely -- the hit is already in its loot file and
+# already counted in the panel, and letting it scroll would push the
+# dashboard off the display it just repainted. In scrolling-log mode this
+# is the old behaviour unchanged, " [#N]" tag and all. "-" means "no
+# colour", since LOG takes the colour as a separate leading argument.
+hit_log() {
+    [ "$DISPLAY_MODE" = "0" ] && return 0
+    if [ -n "$1" ] && [ "$1" != "-" ]; then LOG "$1" "$2"; else LOG "$2"; fi
+}
+
 bump_counter() {
-    local key
-    key=$(echo "$1" | tr 'A-Z' 'a-z')
+    local cat="$1" key hit now
+    key=$(echo "$2" | tr 'A-Z' 'a-z')
+
     if [ -n "$key" ] && [ -z "${DETECTED_DEVICES[$key]}" ]; then
         DETECTED_DEVICES["$key"]=1
         DETECTIONS=$((DETECTIONS + 1))
     fi
+    if [ -n "$key" ] && [ -z "${CAT_SEEN[$cat|$key]}" ]; then
+        CAT_SEEN["$cat|$key"]=1
+        CAT_COUNT["$cat"]=$(( ${CAT_COUNT[$cat]:-0} + 1 ))
+    fi
     DETECT_TAG=" [#$DETECTIONS]"
+
+    hit="$(date '+%H:%M') $(dash_cat_tag "$cat") ${3:-$2}"
+    RECENT_HITS+=("$cat|$hit")
+    # Ring buffer, same trim live_probe uses on its own display list.
+    if [ ${#RECENT_HITS[@]} -gt "$DASH_RECENT_LINES" ]; then
+        RECENT_HITS=("${RECENT_HITS[@]:1}")
+    fi
+
+    # Repaint straight away so a hit that just buzzed is on screen by the
+    # time you look down, rather than waiting out the main loop's sleep.
+    # Rate-limited to 1/sec so a burst arriving in one drain cycle doesn't
+    # repaint once per hit; the loop's own repaint at the bottom of every
+    # cycle picks up whatever the limiter skipped.
+    if [ "$DISPLAY_MODE" = "0" ]; then
+        now=$(date +%s)
+        [ "$now" != "$DASH_LAST_PAINT" ] && render_dashboard
+    fi
 }
 
 declare -A DRONE_LAST_ALERT
@@ -1316,8 +1543,8 @@ check_alpr_gps_proximity() {
         local CURRENT_TIME ENTRY
         CURRENT_TIME=$(date '+%H:%M:%S')
         ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
-        bump_counter "osm:$id"
-        LOG red "$ENTRY$DETECT_TAG"
+        bump_counter alpr "osm:$id" "osm:$id ${dist}mi"
+        hit_log red "$ENTRY$DETECT_TAG"
         echo "$ENTRY" >> "$LOG_FILE"
         COUNTER=$((COUNTER + 1))
         stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
@@ -1446,13 +1673,13 @@ handle_flock_wifi_line() {
 
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
-    bump_counter "$mac"
+    bump_counter flock "$mac" "$mac W/$conf"
     if [ "$conf" = "high" ]; then
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)$GPS_TAG"
-        LOG cyan "$ENTRY$DETECT_TAG"
+        hit_log cyan "$ENTRY$DETECT_TAG"
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
-        LOG yellow "$ENTRY$DETECT_TAG"
+        hit_log yellow "$ENTRY$DETECT_TAG"
     fi
     echo "$ENTRY" >> "$LOG_FILE"
     COUNTER=$((COUNTER + 1))
@@ -1496,8 +1723,8 @@ handle_flock_ble_line() {
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
-    bump_counter "$mac"
-    LOG yellow "$ENTRY$DETECT_TAG"
+    bump_counter flock "$mac" "$mac B?"
+    hit_log yellow "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
@@ -1525,8 +1752,8 @@ handle_glasses_ble_line() {
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Glasses?? ($brand, unverified signature, $cid)$rssi_sfx$GPS_TAG"
-    bump_counter "$mac"
-    LOG yellow "$ENTRY$DETECT_TAG"
+    bump_counter glasses "$mac" "$mac $brand"
+    hit_log yellow "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
@@ -1602,8 +1829,8 @@ handle_mesh_wifi_line() {
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
     fi
-    bump_counter "$mac"
-    LOG "$ENTRY$DETECT_TAG"
+    bump_counter mesh "$mac" "$mac W"
+    hit_log - "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
     COUNTER=$((COUNTER + 1))
     stealth_blink
@@ -1666,8 +1893,8 @@ handle_tracker_line() {
     TRACKER_LAST_ALERT[$key]=$now
 
     local minutes=$(( age / 60 ))
-    bump_counter "$mac"
-    LOG red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min$DETECT_TAG"
+    bump_counter tracker "$mac" "$mac $label"
+    hit_log red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min$DETECT_TAG"
     stealth_alert "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
 }
 
@@ -1686,10 +1913,10 @@ beacon_protocol_label() {
 
 # Parse one "ble_beacon|MAC|protocol|detail" line from
 # rogue_tracker_monitor.awk's generic-beacon branches. Deliberately soft,
-# same tier as handle_flock_ble_line()'s unverified-signature hits: LOG +
+# same tier as handle_flock_ble_line()'s unverified-signature hits:
 # BEACON_LOG_FILE only, no vibrate/LED, no persistence window, and NOT
-# counted in DETECTIONS/COUNTER -- those drive the session summary
-# (summarize_session.sh) and this isn't a security detection the way a
+# passed to bump_counter() -- so it stays out of the dashboard's counts
+# and its Recent panel both. This isn't a security detection the way a
 # rogue tracker or a camera is, it's ambient environmental info. Still
 # respects TRACKER_ALLOWLIST/TRACKER_SNOOZE since it shares
 # rogue_tracker_monitor.awk's MAC space -- a beacon you've allowlisted or
@@ -1714,7 +1941,12 @@ handle_beacon_line() {
     local label
     label=$(beacon_protocol_label "$protocol")
     echo "$(date '+%H:%M:%S') | $mac | $label | $detail$GPS_TAG" >> "$BEACON_LOG_FILE"
-    LOG "BEACON: $mac | $label$GPS_TAG"
+    # hit_log, not LOG: in dashboard mode this would otherwise be the one
+    # thing still scrolling, and it would clobber the panel on every
+    # passing shop beacon -- the noisiest source here by a wide margin,
+    # and the one category deliberately not counted in the panel either.
+    # BEACON_LOG_FILE still gets every one of them, unchanged.
+    hit_log - "BEACON: $mac | $label$GPS_TAG"
 }
 
 # Parse one line from deauth_eviltwin_monitor.awk -- either
@@ -1774,8 +2006,8 @@ handle_deauth_line() {
             local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
             [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
             DEAUTH_LAST_ALERT[$mac]=$now
-            bump_counter "$mac"
-            LOG red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s$DETECT_TAG"
+            bump_counter deauth "$mac" "$mac flood"
+            hit_log red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s$DETECT_TAG"
             stealth_alert "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
         fi
         return
@@ -1788,8 +2020,8 @@ handle_deauth_line() {
         local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
         [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
         DEAUTH_LAST_ALERT[$mac]=$now
-        bump_counter "$mac"
-        LOG red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID$DETECT_TAG"
+        bump_counter deauth "$mac" "$mac twin"
+        hit_log red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID$DETECT_TAG"
         stealth_alert "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
     fi
 }
@@ -1853,8 +2085,8 @@ handle_rid_line() {
         local known_id="${DRONE_KNOWN[$mac|id]}"
         local label="$mac"
         [ -n "$known_id" ] && label="$mac ($known_id)"
-        bump_counter "$mac"
-        LOG red "DRONE [$src] $label - $summary$DETECT_TAG"
+        bump_counter drone "$mac" "$mac"
+        hit_log red "DRONE [$src] $label - $summary$DETECT_TAG"
         stealth_alert "DRONE REMOTE ID" "$label\n$summary\nvia $src"
     fi
 }
@@ -1975,26 +2207,30 @@ while true; do
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | $NAME$GPS_TAG"
-            bump_counter "$MAC"
+            bump_counter flock "$MAC" "$MAC"
             if echo "$NAME" | grep -qi "fs ext battery"; then
-                LOG yellow "$ENTRY$DETECT_TAG"
+                hit_log yellow "$ENTRY$DETECT_TAG"
             elif echo "$NAME" | grep -qi "penguin"; then
-                LOG green "$ENTRY$DETECT_TAG"
+                hit_log green "$ENTRY$DETECT_TAG"
             elif echo "$NAME" | grep -qi "pigvision"; then
-                LOG magenta "$ENTRY$DETECT_TAG"
+                hit_log magenta "$ENTRY$DETECT_TAG"
             elif echo "$NAME" | grep -qi "flock\|xuntong"; then
-                LOG cyan "$ENTRY$DETECT_TAG"
+                hit_log cyan "$ENTRY$DETECT_TAG"
             elif [ "$MATCH" = "oui" ]; then
                 # No recognized name, but the OUI itself matched
                 # FLOCKCAM_OUIS -- same "Other Flock" tier as a bare "flock"
                 # name match above, just reached via the MAC instead.
-                LOG cyan "$ENTRY$DETECT_TAG"
+                hit_log cyan "$ENTRY$DETECT_TAG"
             else
-                LOG "$ENTRY$DETECT_TAG"
+                hit_log - "$ENTRY$DETECT_TAG"
             fi
             echo "$ENTRY" >> "$LOG_FILE"
             COUNTER=$((COUNTER + 1))
-            if [ $((COUNTER % 10)) -eq 0 ]; then
+            # Colour legend, reprinted every 10th hit so it stays reachable
+            # as hits scroll it off. Scrolling-log mode only: in dashboard
+            # mode nothing scrolls, the hit lines it decodes aren't on the
+            # screen at all, and printing it would just clobber the panel.
+            if [ "$DISPLAY_MODE" = "1" ] && [ $((COUNTER % 10)) -eq 0 ]; then
                 LOG " "
                 LOG yellow   "FS Ext Battery"
                 LOG green    "Penguin"
@@ -2026,8 +2262,8 @@ while true; do
             else
                 ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)$GPS_TAG"
             fi
-            bump_counter "$MAC"
-            LOG "$ENTRY$DETECT_TAG"
+            bump_counter mesh "$MAC" "$MAC B"
+            hit_log - "$ENTRY$DETECT_TAG"
             echo "$ENTRY" >> "$LOG_FILE"
             COUNTER=$((COUNTER + 1))
             stealth_blink
@@ -2047,8 +2283,8 @@ while true; do
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | CC Skimmer? (BLE \"$NAME\", $MATCH)$GPS_TAG"
-            bump_counter "$MAC"
-            LOG yellow "$ENTRY$DETECT_TAG"
+            bump_counter skimmer "$MAC" "$MAC"
+            hit_log yellow "$ENTRY$DETECT_TAG"
             echo "$ENTRY" >> "$LOG_FILE"
             COUNTER=$((COUNTER + 1))
             stealth_blink
@@ -2180,6 +2416,12 @@ while true; do
             WIFI_HITS_OFFSET=$NEW_SIZE
         fi
     fi
+
+    # Unconditional repaint once per cycle, on top of the immediate one
+    # bump_counter() does per hit. This is what keeps the clock, the GPS
+    # and stealth strip, and anything the per-hit rate limiter skipped
+    # moving on a screen where nothing else changes between detections.
+    render_dashboard
 
     sleep 3
 done
