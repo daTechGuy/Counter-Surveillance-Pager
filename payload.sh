@@ -1168,16 +1168,42 @@ COUNTER=0
 # /usr/bin: LOG/LED/RINGTONE/ALERT/VIBRATE/DPADLED and friends) has no
 # dedicated status-bar/badge/dashboard-widget command -- LOG's scrolling
 # text area is the only "live" surface a running payload can write to, so
-# that's what a running total uses too. Called immediately after every
-# real detection across every category (Flock, Mesh-Detect, rogue
-# trackers, deauth/evil-twin, known ALPR cameras, skimmers, glasses) --
-# NOT by handle_beacon_line(), which deliberately isn't a security
-# detection, see that function's own header for why. Distinct cyan so it
-# reads as a running tally, not another hit line, without being alarming
-# the way red is reserved for.
+# the running total rides along on the hit lines themselves as a short
+# " [#N]" tag rather than costing a second line per hit on a screen that
+# only scrolls.
+#
+# Counts UNIQUE DEVICES, not alerts: $1 is the device key (a MAC, or
+# "osm:<id>" for a GPS-database ALPR camera, which has no MAC). A tracker
+# that re-alerts every cooldown, or a camera seen on both the WiFi and BLE
+# paths, moves the total once and then stops -- so "[#7]" reads as "7
+# distinct things found so far", which is the number worth knowing while
+# standing somewhere. Keying on the MAC alone (not mac+category) is what
+# makes the cross-path case collapse; the tradeoff is that BLE MAC
+# rotation (AirTag/SmartTag/FMDN, see TRACKER_FIRST_SEEN's header) still
+# reads as a new device, which no counter on this device can fix.
+#
+# Called by every real detection across every category (Flock, drone
+# Remote ID, Mesh-Detect, rogue trackers, deauth/evil-twin, known ALPR
+# cameras, skimmers, glasses) -- NOT by handle_beacon_line(), which
+# deliberately isn't a security detection, see that function's own header
+# for why.
+#
+# Sets $DETECT_TAG for the caller to append to its LOG line, and MUST be
+# called before that LOG so the tag is current. The tag is deliberately
+# screen-only and never reaches $LOG_FILE: export_gps_kml.awk anchors its
+# " | gps=LAT,LON" match to end-of-line, so a suffix on the persisted line
+# would silently drop every GPS-tagged hit from the KML export, and
+# summarize_session.sh reads the same file positionally.
+declare -A DETECTED_DEVICES
+DETECT_TAG=""
 bump_counter() {
-    DETECTIONS=$((DETECTIONS + 1))
-    LOG cyan "Total detections this session: $DETECTIONS"
+    local key
+    key=$(echo "$1" | tr 'A-Z' 'a-z')
+    if [ -n "$key" ] && [ -z "${DETECTED_DEVICES[$key]}" ]; then
+        DETECTED_DEVICES["$key"]=1
+        DETECTIONS=$((DETECTIONS + 1))
+    fi
+    DETECT_TAG=" [#$DETECTIONS]"
 }
 
 declare -A DRONE_LAST_ALERT
@@ -1290,9 +1316,9 @@ check_alpr_gps_proximity() {
         local CURRENT_TIME ENTRY
         CURRENT_TIME=$(date '+%H:%M:%S')
         ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
-        LOG red "$ENTRY"
+        bump_counter "osm:$id"
+        LOG red "$ENTRY$DETECT_TAG"
         echo "$ENTRY" >> "$LOG_FILE"
-        bump_counter
         COUNTER=$((COUNTER + 1))
         stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
         ALPR_GPS_SEEN[$id]=1
@@ -1420,15 +1446,15 @@ handle_flock_wifi_line() {
 
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
+    bump_counter "$mac"
     if [ "$conf" = "high" ]; then
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)$GPS_TAG"
-        LOG cyan "$ENTRY"
+        LOG cyan "$ENTRY$DETECT_TAG"
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
-        LOG yellow "$ENTRY"
+        LOG yellow "$ENTRY$DETECT_TAG"
     fi
     echo "$ENTRY" >> "$LOG_FILE"
-    bump_counter
     COUNTER=$((COUNTER + 1))
     # conf=medium now gets a physical alert too, not just conf=high --
     # field-confirmed live 2026-08-20 (parked next to a real camera on OUI
@@ -1470,9 +1496,9 @@ handle_flock_ble_line() {
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
-    LOG yellow "$ENTRY"
+    bump_counter "$mac"
+    LOG yellow "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
-    bump_counter
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
 }
@@ -1499,9 +1525,9 @@ handle_glasses_ble_line() {
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Glasses?? ($brand, unverified signature, $cid)$rssi_sfx$GPS_TAG"
-    LOG yellow "$ENTRY"
+    bump_counter "$mac"
+    LOG yellow "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
-    bump_counter
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
 }
@@ -1576,9 +1602,9 @@ handle_mesh_wifi_line() {
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
     fi
-    LOG "$ENTRY"
+    bump_counter "$mac"
+    LOG "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
-    bump_counter
     COUNTER=$((COUNTER + 1))
     stealth_blink
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
@@ -1640,9 +1666,9 @@ handle_tracker_line() {
     TRACKER_LAST_ALERT[$key]=$now
 
     local minutes=$(( age / 60 ))
-    LOG red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
+    bump_counter "$mac"
+    LOG red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min$DETECT_TAG"
     stealth_alert "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
-    bump_counter
 }
 
 # Human-readable label per ble_beacon protocol tag emitted by
@@ -1748,9 +1774,9 @@ handle_deauth_line() {
             local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
             [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
             DEAUTH_LAST_ALERT[$mac]=$now
-            LOG red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s"
+            bump_counter "$mac"
+            LOG red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s$DETECT_TAG"
             stealth_alert "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
-            bump_counter
         fi
         return
     fi
@@ -1762,9 +1788,9 @@ handle_deauth_line() {
         local last_alert="${DEAUTH_LAST_ALERT[$mac]:-0}"
         [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
         DEAUTH_LAST_ALERT[$mac]=$now
-        LOG red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID"
+        bump_counter "$mac"
+        LOG red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID$DETECT_TAG"
         stealth_alert "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
-        bump_counter
     fi
 }
 
@@ -1827,7 +1853,8 @@ handle_rid_line() {
         local known_id="${DRONE_KNOWN[$mac|id]}"
         local label="$mac"
         [ -n "$known_id" ] && label="$mac ($known_id)"
-        LOG red "DRONE [$src] $label - $summary"
+        bump_counter "$mac"
+        LOG red "DRONE [$src] $label - $summary$DETECT_TAG"
         stealth_alert "DRONE REMOTE ID" "$label\n$summary\nvia $src"
     fi
 }
@@ -1948,24 +1975,24 @@ while true; do
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | $NAME$GPS_TAG"
+            bump_counter "$MAC"
             if echo "$NAME" | grep -qi "fs ext battery"; then
-                LOG yellow "$ENTRY"
+                LOG yellow "$ENTRY$DETECT_TAG"
             elif echo "$NAME" | grep -qi "penguin"; then
-                LOG green "$ENTRY"
+                LOG green "$ENTRY$DETECT_TAG"
             elif echo "$NAME" | grep -qi "pigvision"; then
-                LOG magenta "$ENTRY"
+                LOG magenta "$ENTRY$DETECT_TAG"
             elif echo "$NAME" | grep -qi "flock\|xuntong"; then
-                LOG cyan "$ENTRY"
+                LOG cyan "$ENTRY$DETECT_TAG"
             elif [ "$MATCH" = "oui" ]; then
                 # No recognized name, but the OUI itself matched
                 # FLOCKCAM_OUIS -- same "Other Flock" tier as a bare "flock"
                 # name match above, just reached via the MAC instead.
-                LOG cyan "$ENTRY"
+                LOG cyan "$ENTRY$DETECT_TAG"
             else
-                LOG "$ENTRY"
+                LOG "$ENTRY$DETECT_TAG"
             fi
             echo "$ENTRY" >> "$LOG_FILE"
-            bump_counter
             COUNTER=$((COUNTER + 1))
             if [ $((COUNTER % 10)) -eq 0 ]; then
                 LOG " "
@@ -1999,9 +2026,9 @@ while true; do
             else
                 ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)$GPS_TAG"
             fi
-            LOG "$ENTRY"
+            bump_counter "$MAC"
+            LOG "$ENTRY$DETECT_TAG"
             echo "$ENTRY" >> "$LOG_FILE"
-            bump_counter
             COUNTER=$((COUNTER + 1))
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
@@ -2020,9 +2047,9 @@ while true; do
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | CC Skimmer? (BLE \"$NAME\", $MATCH)$GPS_TAG"
-            LOG yellow "$ENTRY"
+            bump_counter "$MAC"
+            LOG yellow "$ENTRY$DETECT_TAG"
             echo "$ENTRY" >> "$LOG_FILE"
-            bump_counter
             COUNTER=$((COUNTER + 1))
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC BLE_SKIMMER"
