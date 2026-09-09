@@ -1164,6 +1164,22 @@ DETECTIONS=0
 SEEN_STRONG=""
 COUNTER=0
 
+# Live on-screen detection counter. This device's payload API (see
+# /usr/bin: LOG/LED/RINGTONE/ALERT/VIBRATE/DPADLED and friends) has no
+# dedicated status-bar/badge/dashboard-widget command -- LOG's scrolling
+# text area is the only "live" surface a running payload can write to, so
+# that's what a running total uses too. Called immediately after every
+# real detection across every category (Flock, Mesh-Detect, rogue
+# trackers, deauth/evil-twin, known ALPR cameras, skimmers, glasses) --
+# NOT by handle_beacon_line(), which deliberately isn't a security
+# detection, see that function's own header for why. Distinct cyan so it
+# reads as a running tally, not another hit line, without being alarming
+# the way red is reserved for.
+bump_counter() {
+    DETECTIONS=$((DETECTIONS + 1))
+    LOG cyan "Total detections this session: $DETECTIONS"
+}
+
 declare -A DRONE_LAST_ALERT
 declare -A DRONE_KNOWN
 BLE_HITS_OFFSET=0
@@ -1276,7 +1292,7 @@ check_alpr_gps_proximity() {
         ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
         LOG red "$ENTRY"
         echo "$ENTRY" >> "$LOG_FILE"
-        DETECTIONS=$((DETECTIONS + 1))
+        bump_counter
         COUNTER=$((COUNTER + 1))
         stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
         ALPR_GPS_SEEN[$id]=1
@@ -1412,7 +1428,7 @@ handle_flock_wifi_line() {
         LOG yellow "$ENTRY"
     fi
     echo "$ENTRY" >> "$LOG_FILE"
-    DETECTIONS=$((DETECTIONS + 1))
+    bump_counter
     COUNTER=$((COUNTER + 1))
     # conf=medium now gets a physical alert too, not just conf=high --
     # field-confirmed live 2026-08-20 (parked next to a real camera on OUI
@@ -1456,7 +1472,7 @@ handle_flock_ble_line() {
     ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
     LOG yellow "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
-    DETECTIONS=$((DETECTIONS + 1))
+    bump_counter
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
 }
@@ -1485,7 +1501,7 @@ handle_glasses_ble_line() {
     ENTRY="DECT: $CURRENT_TIME | $mac | Glasses?? ($brand, unverified signature, $cid)$rssi_sfx$GPS_TAG"
     LOG yellow "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
-    DETECTIONS=$((DETECTIONS + 1))
+    bump_counter
     COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
 }
@@ -1562,7 +1578,7 @@ handle_mesh_wifi_line() {
     fi
     LOG "$ENTRY"
     echo "$ENTRY" >> "$LOG_FILE"
-    DETECTIONS=$((DETECTIONS + 1))
+    bump_counter
     COUNTER=$((COUNTER + 1))
     stealth_blink
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
@@ -1626,7 +1642,7 @@ handle_tracker_line() {
     local minutes=$(( age / 60 ))
     LOG red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
     stealth_alert "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
-    DETECTIONS=$((DETECTIONS + 1))
+    bump_counter
 }
 
 # Human-readable label per ble_beacon protocol tag emitted by
@@ -1734,7 +1750,7 @@ handle_deauth_line() {
             DEAUTH_LAST_ALERT[$mac]=$now
             LOG red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s"
             stealth_alert "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
-            DETECTIONS=$((DETECTIONS + 1))
+            bump_counter
         fi
         return
     fi
@@ -1748,7 +1764,7 @@ handle_deauth_line() {
         DEAUTH_LAST_ALERT[$mac]=$now
         LOG red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID"
         stealth_alert "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
-        DETECTIONS=$((DETECTIONS + 1))
+        bump_counter
     fi
 }
 
@@ -1949,7 +1965,7 @@ while true; do
                 LOG "$ENTRY"
             fi
             echo "$ENTRY" >> "$LOG_FILE"
-            DETECTIONS=$((DETECTIONS + 1))
+            bump_counter
             COUNTER=$((COUNTER + 1))
             if [ $((COUNTER % 10)) -eq 0 ]; then
                 LOG " "
@@ -1985,7 +2001,7 @@ while true; do
             fi
             LOG "$ENTRY"
             echo "$ENTRY" >> "$LOG_FILE"
-            DETECTIONS=$((DETECTIONS + 1))
+            bump_counter
             COUNTER=$((COUNTER + 1))
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
@@ -2006,7 +2022,7 @@ while true; do
             ENTRY="DECT: $CURRENT_TIME | $MAC | CC Skimmer? (BLE \"$NAME\", $MATCH)$GPS_TAG"
             LOG yellow "$ENTRY"
             echo "$ENTRY" >> "$LOG_FILE"
-            DETECTIONS=$((DETECTIONS + 1))
+            bump_counter
             COUNTER=$((COUNTER + 1))
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC BLE_SKIMMER"
