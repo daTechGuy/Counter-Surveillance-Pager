@@ -431,6 +431,11 @@ echo "Flock WiFi diagnostic log (unmatched-OUI wildcard probes, never alerts) st
 # below. Confirmed live which DuckyScript button-name string this device's
 # RIGHT button reports (WAIT_FOR_INPUT returns "RIGHT", same command the
 # stock BUTTON_COMBO example payload uses in its own background loop).
+# Stats-screen source data, rebuilt each main-loop cycle and read by
+# bookmark_watcher when LEFT is pressed. Work dir, not loot: it is a
+# snapshot of live state, not session evidence, and it lives on tmpfs.
+DASH_STATE_FILE="${WORK_DIR}/dash_state"
+
 BOOKMARK_LOG_FILE="${LOOT_DIR}/bookmarks_${TIMESTAMP}.txt"
 echo "Bookmark log (RIGHT button = flag this moment) started at $(date)" > "$BOOKMARK_LOG_FILE"
 # Persistence heuristic thresholds -- see handle_tracker_line() and this
@@ -644,7 +649,7 @@ ALWAYS_ALERT=0
 # DISPLAY_MODE: 0 dashboard (default), 1 scrolling hit log (the legacy
 # screen). Declared here rather than beside the rest of the dashboard code
 # further down because the startup menu toggles it, and the menu runs
-# first -- see render_dashboard() for what the two modes actually look
+# first -- see write_dash_state() for what the two modes actually look
 # like and why the legacy one is still reachable.
 DISPLAY_MODE=0
 
@@ -1184,61 +1189,39 @@ COUNTER=0
 # ---------------------------------------------------------------------------
 # Live on-screen dashboard
 # ---------------------------------------------------------------------------
-# The payload log is APPEND-ONLY, and there is no way around that. LOG is
-# a symlink to /usr/bin/hak5cmd, a compiled binary that hands the line to
-# the Pager UI over IPC -- verified on the device: `LOG text` writes zero
-# bytes to its own stdout, and its usage string calls itself "Send data to
-# the currently running payload log". So the shell's `clear`, which just
-# emits ESC[H ESC[J (6 bytes, confirmed by hexdump on the device) to
-# stdout, goes somewhere the screen never reads. None of hak5cmd's 68
-# verbs clears or rewrites the log either.
+# The stats screen is a LIST_PICKER, not text painted into the payload
+# log. That follows the two projects this payload already borrows from:
+# hak5's own bt-bluepine builds every one of its screens out of dialogs and
+# pickers (120 CONFIRMATION_DIALOG calls, 7 dynamically-built LIST_PICKERs,
+# and not one dashboard painted into the log), and jbohack/nyanBOX reaches
+# its stats the same way, through a menu.
 #
-# That rules out an in-place repaint. The official library's live_probe
-# payload does call `clear` between redraws, which is what this was
-# originally built on, but on this hardware that call cannot be doing
-# anything to the display.
+# Painting it into the log was tried first and does not work here. The log
+# is append-only -- LOG is a symlink to /usr/bin/hak5cmd, a compiled binary
+# that hands each line to the UI over /tmp/api.sock, writing zero bytes to
+# its own stdout, so the shell's `clear` goes somewhere the screen never
+# reads and none of hak5cmd's 68 verbs clears the view. What that leaves is
+# appending a block, and a block that fills the window tears: the view
+# repaints on its own 0.75s timer (payload_log.json "refresh_interval")
+# and was caught mid-update, which showed up on the device as the screen
+# flipping between the log and a half-drawn second panel. Emitting the
+# block as a single newline-separated LOG call did not fix it either.
 #
-# So the dashboard is a BLOCK THAT GETS APPENDED, not a screen that gets
-# repainted, and the design follows from that: print it rarely enough that
-# it stays readable, and make the newest block the thing at the bottom of
-# the log, which is what the screen shows. Three things print it:
+# A picker has none of those problems. It is a real UI component: it owns
+# the screen, renders in one go, holds until dismissed, and scrolls under
+# the user's control rather than on a timer.
 #
-#   - a new detection (rate-limited to DASH_MIN_GAP, so a burst arriving
-#     in one drain cycle prints one block rather than one per hit)
-#   - LEFT on the D-pad, for "tell me the state right now" -- the idea is
-#     lifted from jbohack/nyanBOX, whose OLED menu has exactly this ("Hit
-#     RIGHT in the main menu to check your stats"). An on-demand stats
-#     screen is the one part of nyanBOX's UI that ports to an append-only
-#     log, since a block printed when you ask for it lands at the bottom
-#     where you're already looking. RIGHT is already the bookmark key here,
-#     so this takes LEFT.
-#   - a slow DASH_AUTO_SEC heartbeat, so the clock and the GPS/stealth
-#     strip don't go stale while nothing is being detected.
-#
-# Per-hit lines stay off the screen in this mode (see hit_log) -- they'd
-# push the block out of view, and they all still go to their loot files
-# exactly as before, byte for byte. DISPLAY_MODE 1 turns the whole thing
-# off and gives back the plain scrolling hit log, each line carrying its
-# " [#N]" running total.
-# Screen geometry is NOT guesswork -- it's read off the device, from the
-# payload-log view's own theme component (/lib/pager/themes/<theme>/
-# components/payload_log.json): "visible_lines": 14, "max_chars": 50,
-# "text_size": "small", "refresh_interval": 0.75. The whole block has to
-# fit inside those 14 lines or the top of it scrolls away the instant it
-# prints, which is exactly what an earlier 17-line version of this did.
-#
-# Current budget, worst case (all 8 detectors enabled):
-#   title 1 + status 1 + rule 1 + counts 3 + total 1 + rule 1
-#   + recent 4 + footer 1  =  13 lines, one to spare.
-DASH_VISIBLE_LINES=14   # from payload_log.json "visible_lines"
-DASH_COLS=50            # from payload_log.json "max_chars"
-DASH_RECENT_LINES=3     # recent hits shown -- fewer glyphs for the
-                        # view's repaint to cross, see render_dashboard
-DASH_MAX_TEXT=48        # recent-hit text cap, inside DASH_COLS with the
-                        # leading indent -- wrapping would cost a line and
-                        # push the footer out of the window
-DASH_MIN_GAP=10         # min seconds between detection-triggered blocks
-DASH_AUTO_SEC=60        # heartbeat: reprint at least this often
+# So the main loop paints nothing at all. It writes the panel's lines to a
+# state file every cycle, and the button watcher -- a separate process,
+# already sitting in WAIT_FOR_INPUT -- reads that file and raises the
+# picker when LEFT is pressed. The state file is also what makes the
+# watcher's copy of the counters correct: it is forked once at startup, so
+# anything it reads from memory froze there (the same reason it re-fetches
+# its own GPS fix rather than reading $GPS_TAG).
+DASH_RECENT_LINES=3     # recent hits carried in the stats screen
+DASH_MAX_TEXT=36        # picker rows are narrower than log lines -- see
+                        # bt-bluepine's header note on setting max_chars to
+                        # 38/40 in the option_dialog_string templates
 SESSION_START=$(date +%s)
 
 # Unique-device bookkeeping behind the counts.
@@ -1256,7 +1239,6 @@ declare -A DETECTED_DEVICES
 declare -A CAT_SEEN
 declare -A CAT_COUNT
 RECENT_HITS=()
-DASH_LAST_PAINT=0
 
 # Order the dashboard lists categories in. Kept as a space-separated
 # string rather than an associative array so the display order is fixed
@@ -1330,43 +1312,24 @@ dash_status_line() {
 
 # Repaints the whole screen. Fixed-height block, so it lands the same way
 # every time instead of drifting down the display as counts change.
-render_dashboard() {
-    [ "$DISPLAY_MODE" = "0" ] || return 0
-    DASH_LAST_PAINT=$(date +%s)
-
-    local up_s up_h up_m cat tag n row i entry c txt blob e
+# Rebuilds the stats screen's lines into $DASH_STATE_FILE. Cheap enough to
+# run every main-loop cycle: a handful of string appends and one small
+# write to tmpfs, and crucially NOTHING to the screen.
+write_dash_state() {
+    # No DISPLAY_MODE guard: this only writes a file, never the screen, so
+    # LEFT gives the same stats screen in the legacy scrolling-log mode too.
+    local up_s up_h up_m cat tag n row i entry txt
     local -a out=()
-    up_s=$(( DASH_LAST_PAINT - SESSION_START ))
+    up_s=$(( $(date +%s) - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
     up_m=$(printf '%02d' $(( (up_s % 3600) / 60 )))
 
-    # Built into an array first, then emitted and padded to exactly
-    # DASH_VISIBLE_LINES. Two reasons, both about the sweep:
-    #
-    # The payload-log view repaints every line it is showing on its own
-    # timer (payload_log.json "refresh_interval": 0.75) whether or not
-    # anything changed -- confirmed on the device by setting that value to
-    # 3 and watching the sweep slow to match. A scrolling log hides this,
-    # because moving text masks a repaint; a static panel does not, so the
-    # only lever left on the payload side is giving the repaint less to
-    # draw.
-    #
-    # Padding to a full screen is the other half: emit 8 lines and the view
-    # still shows 6 lines of whatever came before, which get repainted too.
-    # Filling the window with blanks means the sweep has nothing to cross
-    # but this block's own text.
-    #
-    # Hence also no horizontal rules anywhere below. A 40-char run of "-"
-    # is the worst case for this: an unbroken horizontal line is exactly
-    # the shape that lets the eye follow a left-to-right repaint. Blank
-    # lines separate sections instead, and cost nothing to draw.
-    _o() { out+=("$1|$2"); }
+    _o() { out+=("$1"); }
 
-    _o cyan "CSP v$SCRIPT_VERSION  up $up_h:$up_m  $(dash_status_line)"
-    _o "" ""
+    _o "up $up_h:$up_m   $(dash_status_line)"
 
-    # 3-letter tags, not the full labels: 8 chars a cell against 14, so a
-    # row of three is 24 columns of glyphs instead of 42.
+    # 3-letter tags, three to a row -- keeps each row inside the narrower
+    # width a picker option gets.
     row=""
     for cat in $DASH_CATS; do
         dash_cat_enabled "$cat" || continue
@@ -1374,66 +1337,56 @@ render_dashboard() {
         n=${CAT_COUNT[$cat]:-0}
         row="$row$(printf '%-4s%-4s' "$tag" "$n")"
         if [ ${#row} -ge 24 ]; then
-            _o "" "${row%"${row##*[![:space:]]}"}"
+            _o "${row%"${row##*[![:space:]]}"}"
             row=""
         fi
     done
-    [ -n "$row" ] && _o "" "${row%"${row##*[![:space:]]}"}"
+    [ -n "$row" ] && _o "${row%"${row##*[![:space:]]}"}"
 
-    _o "" ""
     if [ "$DETECTIONS" = "0" ]; then
-        _o green "nothing detected yet"
+        _o "nothing detected yet"
     else
-        _o red "UNIQUE DEVICES: $DETECTIONS"
+        _o "UNIQUE DEVICES: $DETECTIONS"
     fi
 
     i=0
     while [ "$i" -lt "$DASH_RECENT_LINES" ]; do
         entry="${RECENT_HITS[$i]:-}"
         if [ -n "$entry" ]; then
-            c="${entry%%|*}"
             txt="${entry#*|}"
-            # Truncate rather than wrap: a wrapped line costs a row and
-            # pushes the footer past the bottom of the window.
             [ ${#txt} -gt "$DASH_MAX_TEXT" ] && txt="${txt:0:$((DASH_MAX_TEXT - 1))}>"
-            _o "" "$txt"
+            _o "$txt"
         fi
         i=$((i + 1))
     done
 
-    _o "" ""
-    _o green "LEFT stats   RIGHT bookmark"
-
-    # Pad to a full window so no older text survives underneath.
-    while [ ${#out[@]} -lt "$DASH_VISIBLE_LINES" ]; do out+=("|"); done
-
-    # ONE LOG call for the whole block, newline-separated -- NOT one call
-    # per line. Each LOG is a separate message to the UI socket
-    # (/tmp/api.sock) and the view samples on its own 0.75s timer, so a
-    # 14-message burst gets caught half-delivered: some old log lines, then
-    # the first few lines of the block. That half-drawn frame is what read
-    # from the device as "it keeps switching from the log to the dashboard"
-    # and as a second, briefer dashboard with fewer rows.
-    #
-    # Multi-line in a single LOG is this platform's own idiom, not a trick:
-    # see LOG "\n$LOG_BUFFER" in the official library's FullPullPRUpload
-    # payload, among others.
-    #
-    # The cost is colour. A LOG call carries one colour for everything it
-    # prints, so the block is uncoloured and the 3-letter category tag now
-    # carries what red/yellow/cyan used to say. Worth it: a colour that
-    # only renders correctly half the time isn't telling you anything.
-    blob=""
-    i=0
-    while [ "$i" -lt "$DASH_VISIBLE_LINES" ]; do
-        e="${out[$i]}"
-        txt="${e#*|}"
-        [ -z "$txt" ] && txt=" "
-        if [ "$i" = "0" ]; then blob="$txt"; else blob="$blob\n$txt"; fi
-        i=$((i + 1))
-    done
-    LOG "$blob"
+    # Written whole then moved into place, so the watcher can never read a
+    # half-written file -- it runs in its own process and is not
+    # synchronised with this one in any way.
+    : > "$DASH_STATE_FILE.tmp"
+    for txt in "${out[@]}"; do printf '%s\n' "$txt" >> "$DASH_STATE_FILE.tmp"; done
+    mv -f "$DASH_STATE_FILE.tmp" "$DASH_STATE_FILE" 2>/dev/null
     unset -f _o
+}
+
+# Raises the stats screen. Called ONLY from bookmark_watcher's process:
+# LIST_PICKER blocks until the user dismisses it, and blocking the main
+# loop would stall every detector for as long as the screen is up.
+show_dash_picker() {
+    local line
+    local -a args=()
+    if [ ! -s "$DASH_STATE_FILE" ]; then
+        ERROR_DIALOG "No stats yet -- still starting up" >/dev/null 2>&1
+        return
+    fi
+    while IFS= read -r line; do
+        [ -n "$line" ] && args+=("$line")
+    done < "$DASH_STATE_FILE"
+    args+=("Close")
+    # Trailing "Close" twice is the platform's calling convention, not a
+    # mistake: LIST_PICKER's last argument is the pre-selected default
+    # (see its own usage string, and bt-bluepine's dynamic picker builder).
+    LIST_PICKER "Counter-Surveillance v$SCRIPT_VERSION" "${args[@]}" "Close" >/dev/null 2>&1
 }
 
 # Records one detection and repaints. $1 category, $2 device key, $3 the
@@ -1483,15 +1436,10 @@ bump_counter() {
         RECENT_HITS=("${RECENT_HITS[@]:1}")
     fi
 
-    # Print a fresh block so a hit that just buzzed is at the bottom of the
-    # log by the time you look down. Rate-limited to DASH_MIN_GAP: every
-    # block is DASH_RECENT_LINES+9 lines of append-only screen, so one per
-    # hit during a burst would bury the very thing it's reporting. The
-    # heartbeat below picks up anything the limiter skipped.
-    if [ "$DISPLAY_MODE" = "0" ]; then
-        now=$(date +%s)
-        [ $(( now - DASH_LAST_PAINT )) -ge "$DASH_MIN_GAP" ] && render_dashboard
-    fi
+    # Deliberately draws nothing. The stats screen is raised by LEFT, and
+    # the physical alert (vibrate/LED/ringtone) is what tells you a hit
+    # happened without looking. The main loop refreshes the state file on
+    # its next cycle, within about 3 seconds.
 }
 
 declare -A DRONE_LAST_ALERT
@@ -2197,19 +2145,21 @@ get_gps_fix() {
 # Double vibrate pulse (not the single pulse a real detection uses)
 # specifically so a bookmark press feels different from a detection alert
 # -- confirms the press registered without having to look at the screen.
-# LEFT asks for a stats block. It has to be done by signalling the main
-# loop rather than rendering here: this function is forked once at startup,
-# so its copy of DETECTIONS/CAT_COUNT/RECENT_HITS froze at that moment and
-# would render an all-zero panel forever (the same reason the GPS fix is
-# re-fetched below instead of read from $GPS_TAG). SIGUSR1 is trapped in
-# the parent, which has the live counters.
+# LEFT raises the stats screen, and it is raised from HERE rather than
+# from the main loop on purpose: LIST_PICKER blocks until dismissed, so
+# putting it in the loop would stall every detector for as long as the
+# screen is up. This function is forked once at startup, so its copy of
+# DETECTIONS/CAT_COUNT/RECENT_HITS froze there -- which is exactly why
+# show_dash_picker reads the state file the main loop keeps current,
+# rather than reading those variables (the same reason the GPS fix below
+# is re-fetched instead of read from $GPS_TAG).
 bookmark_watcher() {
     local pressed n gps_fix gps_sfx
     n=0
     while true; do
         pressed=$(WAIT_FOR_INPUT 2>/dev/null)
         if [ "$pressed" = "LEFT" ]; then
-            kill -USR1 "$MAIN_PID" 2>/dev/null
+            show_dash_picker
             continue
         fi
         if [ "$pressed" = "RIGHT" ]; then
@@ -2230,18 +2180,11 @@ bookmark_watcher() {
         fi
     done
 }
-# Captured before the fork so bookmark_watcher's child knows where to send
-# SIGUSR1. The handler renders on demand; DASH_LAST_PAINT moving also
-# pushes the heartbeat out, so asking for stats doesn't get you a second
-# block a moment later.
-MAIN_PID=$$
-trap 'render_dashboard' USR1
-
 if command -v WAIT_FOR_INPUT >/dev/null 2>&1; then
     bookmark_watcher &
     BOOKMARK_WATCHER_PID=$!
     LOG green "Bookmark: enabled (press RIGHT to flag a moment for later analysis)"
-    [ "$DISPLAY_MODE" = "0" ] && LOG green "Stats: press LEFT for a detection summary any time"
+    LOG green "Stats: press LEFT for the detection summary any time"
 else
     LOG red "Bookmark: disabled (WAIT_FOR_INPUT not found)"
 fi
@@ -2496,15 +2439,10 @@ while true; do
         fi
     fi
 
-    # Heartbeat. Not every cycle -- the loop turns over every 3s and each
-    # block is a dozen-odd lines appended to a log that cannot be cleared,
-    # so a per-cycle reprint would scroll itself into uselessness. Every
-    # DASH_AUTO_SEC keeps the clock and the GPS/stealth strip current
-    # without doing that.
-    if [ "$DISPLAY_MODE" = "0" ] && \
-       [ $(( $(date +%s) - DASH_LAST_PAINT )) -ge "$DASH_AUTO_SEC" ]; then
-        render_dashboard
-    fi
+    # Refresh the stats screen's source data every cycle. No heartbeat
+    # paint any more, and nothing reaches the screen here at all -- LEFT
+    # is what puts the panel up, whenever you want it.
+    write_dash_state
 
     sleep 3
 done
