@@ -1232,7 +1232,8 @@ COUNTER=0
 #   + recent 4 + footer 1  =  13 lines, one to spare.
 DASH_VISIBLE_LINES=14   # from payload_log.json "visible_lines"
 DASH_COLS=50            # from payload_log.json "max_chars"
-DASH_RECENT_LINES=4     # recent hits shown; 13-line block, see budget above
+DASH_RECENT_LINES=3     # recent hits shown -- fewer glyphs for the
+                        # view's repaint to cross, see render_dashboard
 DASH_MAX_TEXT=48        # recent-hit text cap, inside DASH_COLS with the
                         # leading indent -- wrapping would cost a line and
                         # push the footer out of the window
@@ -1330,13 +1331,13 @@ dash_cat_color() {
 # else once the startup banner is cleared.
 dash_status_line() {
     local gps stealth
-    if [ -n "$GPS_FIX" ]; then gps="gps ok"; else gps="no gps"; fi
+    if [ -n "$GPS_FIX" ]; then gps="gps"; else gps="nogps"; fi
     case "$STEALTH_MODE" in
-        1) stealth="stealth:vib" ;;
-        2) stealth="stealth:off" ;;
-        *) stealth="alerts on" ;;
+        1) stealth="vib" ;;
+        2) stealth="silent" ;;
+        *) stealth="alerts" ;;
     esac
-    echo "$gps  |  $stealth"
+    echo "$gps $stealth"
 }
 
 # Repaints the whole screen. Fixed-height block, so it lands the same way
@@ -1345,65 +1346,89 @@ render_dashboard() {
     [ "$DISPLAY_MODE" = "0" ] || return 0
     DASH_LAST_PAINT=$(date +%s)
 
-    local up_s up_h up_m up_sec cat lbl n row pending i entry c txt col
+    local up_s up_h up_m cat tag n row i entry c txt col e
+    local -a out=()
     up_s=$(( DASH_LAST_PAINT - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
     up_m=$(printf '%02d' $(( (up_s % 3600) / 60 )))
-    up_sec=$(printf '%02d' $(( up_s % 60 )))
 
-    # No clear() here: it cannot touch this screen (see the header above).
-    # No leading blank line either -- at 14 visible lines a spacer costs
-    # more than it buys, and the title line already reads as a break.
-    LOG cyan "== COUNTER-SURVEILLANCE == v$SCRIPT_VERSION"
-    LOG "up $up_h:$up_m:$up_sec  |  $(dash_status_line)"
-    LOG "----------------------------------------"
+    # Built into an array first, then emitted and padded to exactly
+    # DASH_VISIBLE_LINES. Two reasons, both about the sweep:
+    #
+    # The payload-log view repaints every line it is showing on its own
+    # timer (payload_log.json "refresh_interval": 0.75) whether or not
+    # anything changed -- confirmed on the device by setting that value to
+    # 3 and watching the sweep slow to match. A scrolling log hides this,
+    # because moving text masks a repaint; a static panel does not, so the
+    # only lever left on the payload side is giving the repaint less to
+    # draw.
+    #
+    # Padding to a full screen is the other half: emit 8 lines and the view
+    # still shows 6 lines of whatever came before, which get repainted too.
+    # Filling the window with blanks means the sweep has nothing to cross
+    # but this block's own text.
+    #
+    # Hence also no horizontal rules anywhere below. A 40-char run of "-"
+    # is the worst case for this: an unbroken horizontal line is exactly
+    # the shape that lets the eye follow a left-to-right repaint. Blank
+    # lines separate sections instead, and cost nothing to draw.
+    _o() { out+=("$1|$2"); }
 
-    # Three categories per row: 14 chars a cell, 42 of the 50 columns, so
-    # all eight land in 3 lines instead of the 4 that two-per-row cost.
-    row=""; pending=0
+    _o cyan "CSP v$SCRIPT_VERSION  up $up_h:$up_m  $(dash_status_line)"
+    _o "" ""
+
+    # 3-letter tags, not the full labels: 8 chars a cell against 14, so a
+    # row of three is 24 columns of glyphs instead of 42.
+    row=""
     for cat in $DASH_CATS; do
         dash_cat_enabled "$cat" || continue
-        lbl=$(dash_cat_label "$cat")
+        tag=$(dash_cat_tag "$cat")
         n=${CAT_COUNT[$cat]:-0}
-        row="$row$(printf '%-9s%-5s' "$lbl" "$n")"
-        pending=1
-        if [ ${#row} -ge 42 ]; then
-            LOG "${row%"${row##*[![:space:]]}"}"
-            row=""; pending=0
+        row="$row$(printf '%-4s%-4s' "$tag" "$n")"
+        if [ ${#row} -ge 24 ]; then
+            _o "" "${row%"${row##*[![:space:]]}"}"
+            row=""
         fi
     done
-    [ "$pending" = "1" ] && LOG "${row%"${row##*[![:space:]]}"}"
+    [ -n "$row" ] && _o "" "${row%"${row##*[![:space:]]}"}"
 
-    LOG "----------------------------------------"
+    _o "" ""
     if [ "$DETECTIONS" = "0" ]; then
-        LOG green "No devices detected yet"
+        _o green "nothing detected yet"
     else
-        LOG red "UNIQUE DEVICES: $DETECTIONS"
+        _o red "UNIQUE DEVICES: $DETECTIONS"
     fi
 
-    # Fixed number of body lines whether or not there are that many hits
-    # yet, so the footer doesn't walk up and down the screen.
     i=0
     while [ "$i" -lt "$DASH_RECENT_LINES" ]; do
         entry="${RECENT_HITS[$i]:-}"
         if [ -n "$entry" ]; then
             c="${entry%%|*}"
             txt="${entry#*|}"
-            # Hard-truncate rather than let a long line (a drone carrying
-            # its reported position, say) wrap onto a second row -- a wrap
-            # pushes the footer down and costs the block its fixed height,
-            # which is the whole point of repainting in place.
+            # Truncate rather than wrap: a wrapped line costs a row and
+            # pushes the footer past the bottom of the window.
             [ ${#txt} -gt "$DASH_MAX_TEXT" ] && txt="${txt:0:$((DASH_MAX_TEXT - 1))}>"
             col=$(dash_cat_color "$c")
-            if [ -n "$col" ]; then LOG "$col" " $txt"; else LOG " $txt"; fi
-        else
-            LOG " "
+            _o "$col" "$txt"
         fi
         i=$((i + 1))
     done
 
-    LOG "----------------------------------------"
-    LOG green "LEFT = stats   RIGHT = bookmark"
+    _o "" ""
+    _o green "LEFT stats   RIGHT bookmark"
+
+    # Pad to a full window so no older text survives underneath, then emit.
+    while [ ${#out[@]} -lt "$DASH_VISIBLE_LINES" ]; do out+=("|"); done
+    i=0
+    while [ "$i" -lt "$DASH_VISIBLE_LINES" ]; do
+        e="${out[$i]}"
+        c="${e%%|*}"
+        txt="${e#*|}"
+        [ -z "$txt" ] && txt=" "
+        if [ -n "$c" ]; then LOG "$c" "$txt"; else LOG "$txt"; fi
+        i=$((i + 1))
+    done
+    unset -f _o
 }
 
 # Records one detection and repaints. $1 category, $2 device key, $3 the
