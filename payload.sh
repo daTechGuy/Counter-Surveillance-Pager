@@ -798,7 +798,20 @@ MESH_WIFI_OK=0
 TRACKER_BLE_OK=0
 FLOCK_BLE_UUID_OK=0
 GLASSES_BLE_OK=0
+BTCLASSIC_OK=0
 DEAUTH_OK=0
+
+# Bluetooth Classic inquiry needs nothing the BLE side doesn't already
+# have -- no awk decoder, no second radio, just hcitool and the adapter.
+# So it is available whenever hcitool is, which is also why it has no
+# WANT_ toggle of its own: it rides the same scan cycle.
+if command -v hcitool >/dev/null 2>&1; then
+    BTCLASSIC_OK=1
+    LOG green "BT Classic inquiry: enabled (7s per cycle, bt-bluepine's method)"
+else
+    BTCLASSIC_OK=0
+    LOG red "BT Classic inquiry: disabled (hcitool not found)"
+fi
 
 # Payload-scoped "branding" -- deliberately not a device theme change (see
 # git history for why: this platform's payload-log screen background is
@@ -2174,6 +2187,72 @@ while true; do
     # this doesn't turn into a busy-loop, it just iterates faster and spends
     # that time draining WiFi-side hits instead.
     if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ] || [ "$WANT_SKIMMER" = "1" ]; then
+    # --- Bluetooth Classic inquiry -------------------------------------
+    # Everything else on the Bluetooth side here is BLE: hcitool lescan and
+    # the hcidump readers that piggyback on it only ever see advertising
+    # packets. Classic inquiry reaches a different population entirely --
+    # older speakers and headsets, car kits, and body-worn cameras that
+    # never advertise over BLE -- so without this those devices are not
+    # merely missed, they are invisible to every detector in this payload.
+    #
+    # Command and duration are bt-bluepine's, observed live on this device
+    # rather than read from its source: it runs
+    #   timeout --signal=SIGINT 7s hcitool -i hci0 scan --length=7
+    # inside a btmon capture window, alternating Classic then LE at 7s
+    # each. SIGINT rather than SIGTERM matters: hcitool leaves the
+    # controller mid-inquiry on a hard kill, and the next scan then starts
+    # against a busy adapter.
+    #
+    # btmon is deliberately NOT used. BluePine needs it because it wants
+    # RSSI and class-of-device out of the Extended Inquiry Result events,
+    # which hcitool's own stdout does not carry. The matchers here
+    # (flock_ble_match / mesh_ble_match / ble_skimmer_match) take a MAC and
+    # a name, which is exactly what that stdout gives, and adding a btmon
+    # decoder would mean new unverified parsing for data nothing consumes.
+    #
+    # This ADDS ~7s to the cycle rather than taking it from the LE window.
+    # Shortening the existing 12s lescan would degrade every BLE detector
+    # that piggybacks on it (Flock BLE, drone Remote ID, trackers, glasses,
+    # skimmers, Mesh-Detect) to buy this one, which is not a trade worth
+    # making silently.
+    : > /tmp/hci_classic.txt
+    timeout --signal=SIGINT 7s hcitool -i hci0 scan --length=7 \
+        > /tmp/hci_classic.txt 2>>"$LOG_FILE"
+    killall hcitool 2>/dev/null
+
+    # hcitool scan prints a "Scanning ..." banner then tab-indented
+    # "MAC\tname" rows; the banner has no colon in it, which is what the
+    # case below filters on.
+    if [ -s /tmp/hci_classic.txt ]; then
+        while read -r full_line; do
+            MAC=$(echo "$full_line" | awk '{print $1}')
+            case "$MAC" in *:*:*) ;; *) continue ;; esac
+            NAME=$(echo "$full_line" | cut -f2-)
+            [ "$NAME" = "$full_line" ] && NAME=""
+            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BTCLASSIC"; then continue; fi
+
+            CURRENT_TIME=$(date '+%H:%M:%S')
+            MATCH=""
+            CAT=""
+            if [ "$WANT_FLOCK" = "1" ]; then
+                MATCH=$(flock_ble_match "$MAC" "$NAME"); [ -n "$MATCH" ] && CAT=flock
+            fi
+            if [ -z "$CAT" ] && [ "$MESH_BLE_OK" = "1" ]; then
+                MATCH=$(mesh_ble_match "$MAC" "$NAME"); [ -n "$MATCH" ] && CAT=mesh
+            fi
+            if [ -z "$CAT" ] && [ "$WANT_SKIMMER" = "1" ]; then
+                MATCH=$(ble_skimmer_match "$MAC" "$NAME"); [ -n "$MATCH" ] && CAT=skimmer
+            fi
+            [ -z "$CAT" ] && continue
+
+            ENTRY="DECT: $CURRENT_TIME | $MAC | ${NAME:-(no name)} (BT Classic, $MATCH)$GPS_TAG"
+            bump_counter "$CAT" "$MAC" "$MAC BTC"
+            echo "$ENTRY" >> "$LOG_FILE"
+            stealth_blink
+            SEEN_STRONG="$SEEN_STRONG $MAC BTCLASSIC"
+        done < <(sort -u /tmp/hci_classic.txt)
+    fi
+
     # --- Flock Safety BLE scan cycle (unmodified from Flock-You / Flock_Detect) ---
     hciconfig hci0 down 2>>"$LOG_FILE"
     hciconfig hci0 reset 2>>"$LOG_FILE"
@@ -2428,7 +2507,8 @@ screen_detectors() {
         "Tracker BLE:$WANT_TRACKER:$TRACKER_BLE_OK" \
         "Mesh WiFi:$WANT_MESH:$MESH_WIFI_OK" \
         "Glasses BLE:$WANT_GLASSES:$GLASSES_BLE_OK" \
-        "Deauth WiFi:$WANT_DEAUTH:$DEAUTH_OK"; do
+        "Deauth WiFi:$WANT_DEAUTH:$DEAUTH_OK" \
+        "BT Classic:1:$BTCLASSIC_OK"; do
         want="${row#*:}"; ok="${want#*:}"; want="${want%%:*}"
         if [ "$want" != "1" ]; then
             LOG "${row%%:*}: off"
