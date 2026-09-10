@@ -1220,9 +1220,22 @@ COUNTER=0
 # exactly as before, byte for byte. DISPLAY_MODE 1 turns the whole thing
 # off and gives back the plain scrolling hit log, each line carrying its
 # " [#N]" running total.
-DASH_RECENT_LINES=5     # how many recent hits the dashboard body shows
-DASH_MAX_TEXT=31        # recent-hit text truncated to this, to match the
-                        # 32-char rules and never wrap onto a second row
+# Screen geometry is NOT guesswork -- it's read off the device, from the
+# payload-log view's own theme component (/lib/pager/themes/<theme>/
+# components/payload_log.json): "visible_lines": 14, "max_chars": 50,
+# "text_size": "small", "refresh_interval": 0.75. The whole block has to
+# fit inside those 14 lines or the top of it scrolls away the instant it
+# prints, which is exactly what an earlier 17-line version of this did.
+#
+# Current budget, worst case (all 8 detectors enabled):
+#   title 1 + status 1 + rule 1 + counts 3 + total 1 + rule 1
+#   + recent 4 + footer 1  =  13 lines, one to spare.
+DASH_VISIBLE_LINES=14   # from payload_log.json "visible_lines"
+DASH_COLS=50            # from payload_log.json "max_chars"
+DASH_RECENT_LINES=4     # recent hits shown; 13-line block, see budget above
+DASH_MAX_TEXT=48        # recent-hit text cap, inside DASH_COLS with the
+                        # leading indent -- wrapping would cost a line and
+                        # push the footer out of the window
 DASH_MIN_GAP=10         # min seconds between detection-triggered blocks
 DASH_AUTO_SEC=60        # heartbeat: reprint at least this often
 SESSION_START=$(date +%s)
@@ -1339,30 +1352,29 @@ render_dashboard() {
     up_sec=$(printf '%02d' $(( up_s % 60 )))
 
     # No clear() here: it cannot touch this screen (see the header above).
-    # The leading blank line is the only separator available between one
-    # appended block and the last thing printed before it.
-    LOG " "
+    # No leading blank line either -- at 14 visible lines a spacer costs
+    # more than it buys, and the title line already reads as a break.
     LOG cyan "== COUNTER-SURVEILLANCE == v$SCRIPT_VERSION"
     LOG "up $up_h:$up_m:$up_sec  |  $(dash_status_line)"
-    LOG "--------------------------------"
+    LOG "----------------------------------------"
 
-    # Two categories per row: counts stay aligned on a narrow screen, and
-    # all eight fit in four lines instead of eight.
+    # Three categories per row: 14 chars a cell, 42 of the 50 columns, so
+    # all eight land in 3 lines instead of the 4 that two-per-row cost.
     row=""; pending=0
     for cat in $DASH_CATS; do
         dash_cat_enabled "$cat" || continue
         lbl=$(dash_cat_label "$cat")
         n=${CAT_COUNT[$cat]:-0}
-        row="$row$(printf '%-8s%-6s' "$lbl" "$n")"
+        row="$row$(printf '%-9s%-5s' "$lbl" "$n")"
         pending=1
-        if [ ${#row} -ge 28 ]; then
+        if [ ${#row} -ge 42 ]; then
             LOG "${row%"${row##*[![:space:]]}"}"
             row=""; pending=0
         fi
     done
     [ "$pending" = "1" ] && LOG "${row%"${row##*[![:space:]]}"}"
 
-    LOG "--------------------------------"
+    LOG "----------------------------------------"
     if [ "$DETECTIONS" = "0" ]; then
         LOG green "No devices detected yet"
     else
@@ -1390,7 +1402,7 @@ render_dashboard() {
         i=$((i + 1))
     done
 
-    LOG "--------------------------------"
+    LOG "----------------------------------------"
     LOG green "LEFT = stats   RIGHT = bookmark"
 }
 
