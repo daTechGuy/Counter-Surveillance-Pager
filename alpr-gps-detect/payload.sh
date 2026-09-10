@@ -157,6 +157,50 @@ stealth_blink() {
 }
 
 # ---------------------------------------------------------------------------
+# GPS health
+# ---------------------------------------------------------------------------
+# This payload's ONLY input is position, so "no fix" and "GPS is broken" have
+# to look different. Silence means the same thing in both cases -- no cameras
+# reported -- and without this you cannot tell a clear drive past nothing from
+# a receiver that was never plugged in.
+#
+# Three things have to line up, and each fails differently:
+#
+#   gpsd running      -- GPS_GET returns "0 0 0 0" when it is not, which is
+#                        indistinguishable from a cold receiver with no lock.
+#   device path valid -- gpsd.core.device is a /dev/serial/by-path entry, and
+#                        that path encodes the USB PORT. Moving the receiver
+#                        to a different port, or adding a hub, changes it and
+#                        gpsd then cannot open it. Seen on this device: the
+#                        config said 1.1_1-1.1:1.0 while the hardware was on
+#                        1.3_1-1.3:1.x.
+#   a fix             -- a cold first fix can take 15-30 minutes with clear
+#                        sky, per Hak5's own GPS documentation, and indoors
+#                        it will never arrive.
+#
+# Setting any of it is deliberately NOT this payload's job: GPS is device
+# configuration, done in Settings > GPS in the Pager UI (path, baud, then
+# "Restart GPSd"). Reporting it accurately IS this payload's job.
+gpsd_running() {
+    # -x so this matches the daemon itself and not, say, a shell whose command
+    # line happens to contain the word.
+    pgrep -x gpsd >/dev/null 2>&1
+}
+
+gps_device_path() { uci get gpsd.core.device 2>/dev/null; }
+gps_device_speed() { uci get gpsd.core.speed 2>/dev/null; }
+
+# "" when everything checks out, otherwise a short reason.
+gps_fault() {
+    local d
+    gpsd_running || { echo "gpsd not running"; return; }
+    d=$(gps_device_path)
+    [ -z "$d" ] && { echo "no device configured"; return; }
+    [ -e "$d" ] || { echo "device path missing"; return; }
+    echo ""
+}
+
+# ---------------------------------------------------------------------------
 # Screens -- styled after hak5's bt-bluepine
 # ---------------------------------------------------------------------------
 DASH_RULE_W=48
@@ -179,6 +223,7 @@ write_state() {
         echo "hits=$DETECTIONS"
         echo "lastfix=$LAST_FIX"
         echo "lastfixtime=$LAST_FIX_TIME"
+        echo "lastfixepoch=$LAST_FIX_EPOCH"
         echo "lasthit=$LAST_HIT"
     } > "$STATE_FILE.tmp" 2>/dev/null
     mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null
@@ -186,6 +231,7 @@ write_state() {
 
 read_state() {
     FIX_COUNT=0; DETECTIONS=0; LAST_FIX=""; LAST_FIX_TIME=""; LAST_HIT=""
+    LAST_FIX_EPOCH=0
     [ -s "$STATE_FILE" ] || return
     local k v
     while IFS='=' read -r k v; do
@@ -194,6 +240,7 @@ read_state() {
             hits)        DETECTIONS="$v" ;;
             lastfix)     LAST_FIX="$v" ;;
             lastfixtime) LAST_FIX_TIME="$v" ;;
+            lastfixepoch) LAST_FIX_EPOCH="$v" ;;
             lasthit)     LAST_HIT="$v" ;;
         esac
     done < "$STATE_FILE"
@@ -208,12 +255,25 @@ screen_status() {
 
     LOG magenta "$(dash_rule 'ALPR GPS Status')"
     LOG cyan "Uptime: $up_h:$up_m | Fixes: $FIX_COUNT | Radius: ${ALPR_RADIUS_MI}mi"
+    # Fix AGE, not just the timestamp. A position from 20 minutes ago looks
+    # identical to a current one on screen, and for a detector that only
+    # matters while you are moving, a stale fix is the same as no fix.
+    local age fault
     if [ -n "$LAST_FIX" ]; then
+        age=$(( $(date +%s) - LAST_FIX_EPOCH ))
         LOG "Position: $LAST_FIX"
-        LOG "Fix at: $LAST_FIX_TIME"
+        if [ "$age" -le 10 ]; then
+            LOG green "Fix: ${age}s ago ($LAST_FIX_TIME)"
+        elif [ "$age" -lt 120 ]; then
+            LOG yellow "Fix: ${age}s ago ($LAST_FIX_TIME) -- stale"
+        else
+            LOG red "Fix: $((age / 60))m ago ($LAST_FIX_TIME) -- LOST"
+        fi
     else
         LOG red "No GPS fix yet"
     fi
+    fault=$(gps_fault)
+    [ -n "$fault" ] && LOG red "GPS: $fault -- see GPS Health"
     if [ "$DETECTIONS" = "0" ]; then
         LOG green "Cameras in range: 0"
     else
@@ -234,6 +294,32 @@ screen_cameras() {
     done < <(tail -n 8 "$LOG_FILE")
     [ "$n" = "0" ] && LOG green "None yet this session"
     LOG magenta "$(dash_rule 'Cameras Found')"
+}
+
+screen_gps() {
+    local fault d
+    LOG magenta "$(dash_rule 'GPS Health')"
+    if gpsd_running; then LOG green "gpsd: running"; else LOG red "gpsd: NOT RUNNING"; fi
+    d=$(gps_device_path)
+    if [ -z "$d" ]; then
+        LOG red "Device: not configured"
+    elif [ -e "$d" ]; then
+        LOG green "Device: OK ($(basename "$d"))"
+    else
+        LOG red "Device: MISSING ($(basename "$d"))"
+    fi
+    LOG cyan "Baud: $(gps_device_speed)"
+    read_state
+    if [ -n "$LAST_FIX" ]; then
+        LOG green "Last fix: $LAST_FIX_TIME"
+    else
+        LOG yellow "No fix yet (cold start can take 15-30m)"
+    fi
+    fault=$(gps_fault)
+    if [ -n "$fault" ]; then
+        LOG red "Fix in Settings > GPS, then Restart GPSd"
+    fi
+    LOG magenta "$(dash_rule 'End')"
 }
 
 screen_database() {
@@ -284,6 +370,24 @@ fi
 LOG green "Database: $(sqlite3 "$ALPR_DB_FILE" 'SELECT COUNT(*) FROM cameras;' 2>/dev/null) cameras"
 LOG green "Radius: ${ALPR_RADIUS_MI}mi | Poll: every ${POLL_SECONDS}s"
 
+# Reported, not fatal. gpsd can be started and the receiver replugged while
+# this runs, and the loop picks a fix up the moment one exists -- so refusing
+# to start would be worse than saying plainly that nothing will be found yet.
+_gps_fault=$(gps_fault)
+if [ -n "$_gps_fault" ]; then
+    LOG red "GPS PROBLEM: $_gps_fault"
+    LOG yellow "Nothing will be detected until this is fixed."
+    LOG yellow "Settings > GPS: set the device path and baud, then Restart GPSd."
+    LOG yellow "The path encodes the USB port -- moving the receiver changes it."
+else
+    LOG green "GPS: gpsd running, device present"
+    if [ "$(timeout 3 GPS_GET 2>/dev/null)" = "0 0 0 0" ]; then
+        LOG yellow "No fix yet -- a cold start can take 15-30m with clear sky."
+    else
+        LOG green "GPS: fix available"
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
@@ -320,6 +424,7 @@ SESSION_START=$(date +%s)
 FIX_COUNT=0
 LAST_FIX=""
 LAST_FIX_TIME=""
+LAST_FIX_EPOCH=0
 LAST_HIT=""
 
 # ---------------------------------------------------------------------------
@@ -337,6 +442,7 @@ detection_loop() {
             FIX_COUNT=$((FIX_COUNT + 1))
             LAST_FIX="$GPS_FIX"
             LAST_FIX_TIME=$(date '+%H:%M:%S')
+            LAST_FIX_EPOCH=$(date +%s)
             [ "$TRACK_GPS" = "1" ] && echo "$LAST_FIX_TIME | $GPS_FIX" >> "$TRACK_FILE"
 
             GPS_TAG=" | gps=$GPS_FIX"
@@ -391,15 +497,17 @@ while true; do
     _sel=$(LIST_PICKER "ALPR-GPS-Detect v$SCRIPT_VERSION" \
         "1: Status" \
         "2: Cameras Found" \
-        "3: Database" \
-        "4: Session Files" \
+        "3: GPS Health" \
+        "4: Database" \
+        "5: Session Files" \
         "0: Stop Scanning" \
         "1: Status")
     case "$_sel" in
         "1: Status")         screen_status ;;
         "2: Cameras Found")  screen_cameras ;;
-        "3: Database")       screen_database ;;
-        "4: Session Files")  screen_session ;;
+        "3: GPS Health")     screen_gps ;;
+        "4: Database")       screen_database ;;
+        "5: Session Files")  screen_session ;;
         "0: Stop Scanning")  break ;;
         *)                   break ;;
     esac

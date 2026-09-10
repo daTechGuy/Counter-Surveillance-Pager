@@ -79,16 +79,49 @@ then `gps_alpr_proximity.awk` runs a precise haversine distance over just that
 small candidate set. The bounding box is deliberately generous — it only has to
 avoid excluding a camera the precise check would have accepted.
 
+## GPS has to be working first
+
+This payload does **not** start or configure the GPS. It calls `GPS_GET` and
+uses whatever fix `gpsd` already has, because GPS is device configuration, not
+a payload's business. But it does *report* the state, since silence would
+otherwise be ambiguous: "no cameras nearby" and "the receiver was never plugged
+in" look identical.
+
+Three things have to line up, and each fails differently:
+
+| Check | Failure looks like |
+| --- | --- |
+| `gpsd` running | `GPS_GET` returns `0 0 0 0`, same as a cold receiver |
+| Device path valid | `gpsd` cannot open it, so it will not start |
+| A fix acquired | cold start takes 15-30 minutes with clear sky |
+
+**The device path encodes the USB port.** `gpsd.core.device` is a
+`/dev/serial/by-path/...` entry, so moving the receiver to a different port, or
+adding a hub, changes it and breaks the config. Seen on this very device after
+a reflash: the config said `1.1_1-1.1:1.0` while the hardware was on
+`1.3_1-1.3:1.x`.
+
+Set it in the Pager UI under `Settings` > `GPS` — device path and baud (4800,
+9600 or 115200), then **Restart GPSd**. `cgps` over SSH shows live satellite
+detail. Hak5's own [GPS documentation](https://documentation.hak5.org/wifi-pineapple-pager/gps)
+covers supported receivers; U-Blox M8030-KT and Quectel are the recommended
+chipsets.
+
+The startup banner reports any of this that is wrong, and the **GPS Health**
+screen shows it live. Neither is fatal: `gpsd` can be started and the receiver
+replugged while this runs, and the loop picks up a fix the moment one exists.
+
 ## Using it
 
 Options at startup: Stealth Mode (3-way), Always Alert, and GPS track logging.
 Then it scans in the background and the menu owns the screen:
 
 ```
-1: Status          uptime, fix count, current position, cameras found
+1: Status          uptime, fix count, position, FIX AGE, cameras found
 2: Cameras Found   the session's hits
-3: Database        camera count, size, or why it is not usable
-4: Session Files   where the loot went
+3: GPS Health      gpsd, device path, baud, and what to fix
+4: Database        camera count, size, or why it is not usable
+5: Session Files   where the loot went
 0: Stop Scanning
 ```
 
