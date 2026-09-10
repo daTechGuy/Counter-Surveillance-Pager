@@ -1189,35 +1189,35 @@ COUNTER=0
 # ---------------------------------------------------------------------------
 # Live on-screen dashboard
 # ---------------------------------------------------------------------------
-# The stats screen is a LIST_PICKER, not text painted into the payload
-# log. That follows the two projects this payload already borrows from:
-# hak5's own bt-bluepine builds every one of its screens out of dialogs and
-# pickers (120 CONFIRMATION_DIALOG calls, 7 dynamically-built LIST_PICKERs,
-# and not one dashboard painted into the log), and jbohack/nyanBOX reaches
-# its stats the same way, through a menu.
+# The stats screen is drawn on demand, by LEFT, and nothing else ever
+# paints. Both halves of that matter, and both were learned the hard way.
 #
-# Painting it into the log was tried first and does not work here. The log
-# is append-only -- LOG is a symlink to /usr/bin/hak5cmd, a compiled binary
-# that hands each line to the UI over /tmp/api.sock, writing zero bytes to
-# its own stdout, so the shell's `clear` goes somewhere the screen never
-# reads and none of hak5cmd's 68 verbs clears the view. What that leaves is
-# appending a block, and a block that fills the window tears: the view
-# repaints on its own 0.75s timer (payload_log.json "refresh_interval")
-# and was caught mid-update, which showed up on the device as the screen
-# flipping between the log and a half-drawn second panel. Emitting the
-# block as a single newline-separated LOG call did not fix it either.
+# It is styled and drawn after hak5's own bt-bluepine, whose Info screen
+# does exactly this: magenta section rules with the title right-aligned
+# against a trailing " ====", coloured "Key: val | Key: val" facts between
+# them, and a short sleep between sections rather than dumping every line
+# at once. jbohack/nyanBOX reaches its stats the same way, from a menu.
 #
-# A picker has none of those problems. It is a real UI component: it owns
-# the screen, renders in one go, holds until dismissed, and scrolls under
-# the user's control rather than on a timer.
+# Why nothing paints on a timer: the log is append-only. LOG is a symlink
+# to /usr/bin/hak5cmd, a compiled binary that hands each line to the UI
+# over /tmp/api.sock and writes zero bytes to its own stdout, so the
+# shell's `clear` goes somewhere the screen never reads, and none of
+# hak5cmd's 68 verbs clears the view. A panel painted on a heartbeat
+# therefore just accumulates, and one that fills the 14-line window tears
+# against the view's own 0.75s repaint timer (payload_log.json
+# "refresh_interval") -- on the device that looked like the screen
+# flipping between the log and a half-drawn second panel. Instrumenting
+# every paint proved the payload was not double-rendering: 91 paints over
+# two hours, one process, never two close together. The tearing was the
+# view's. Painting only when asked, while nothing else prints, is what
+# bt-bluepine does and is what avoids it.
 #
-# So the main loop paints nothing at all. It writes the panel's lines to a
-# state file every cycle, and the button watcher -- a separate process,
-# already sitting in WAIT_FOR_INPUT -- reads that file and raises the
-# picker when LEFT is pressed. The state file is also what makes the
-# watcher's copy of the counters correct: it is forked once at startup, so
-# anything it reads from memory froze there (the same reason it re-fetches
-# its own GPS fix rather than reading $GPS_TAG).
+# The main loop therefore only refreshes the screen's source data into a
+# state file. bookmark_watcher -- a separate process, already sitting in
+# WAIT_FOR_INPUT -- reads that file and paints on LEFT. The file is also
+# what keeps its numbers right: it is forked once at startup, so anything
+# it reads from memory froze there (the same reason it re-fetches its own
+# GPS fix rather than reading $GPS_TAG).
 DASH_RECENT_LINES=3     # recent hits carried in the stats screen
 DASH_MAX_TEXT=36        # picker rows are narrower than log lines -- see
                         # bt-bluepine's header note on setting max_chars to
@@ -1312,53 +1312,78 @@ dash_status_line() {
 
 # Repaints the whole screen. Fixed-height block, so it lands the same way
 # every time instead of drifting down the display as counts change.
-# Rebuilds the stats screen's lines into $DASH_STATE_FILE. Cheap enough to
-# run every main-loop cycle: a handful of string appends and one small
-# write to tmpfs, and crucially NOTHING to the screen.
+# Section rule in bt-bluepine's house style: "=" padding with the section
+# title right-aligned against a trailing " ====", the whole thing a fixed
+# width. Theirs are hard-coded strings (LOG magenta
+# "================================ Device Info ===="); building it means
+# the titles here can change without anyone counting "=" by hand.
+DASH_RULE_W=48
+dash_rule() {
+    local tail=" $1 ====" n eq
+    n=$(( DASH_RULE_W - ${#tail} ))
+    [ "$n" -lt 4 ] && n=4
+    eq=$(printf "%${n}s" "" | tr ' ' '=')
+    echo "$eq$tail"
+}
+
+# Rebuilds the stats screen into $DASH_STATE_FILE as "colour|text" lines.
+# Cheap enough to run every main-loop cycle: some string appends and one
+# small write to tmpfs, and crucially NOTHING to the screen -- the screen
+# is only ever drawn by show_dash_screen(), on LEFT.
 write_dash_state() {
     # No DISPLAY_MODE guard: this only writes a file, never the screen, so
     # LEFT gives the same stats screen in the legacy scrolling-log mode too.
-    local up_s up_h up_m cat tag n row i entry txt
+    local up_s up_h up_m cat tag n row i entry txt gps stealth
     local -a out=()
     up_s=$(( $(date +%s) - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
     up_m=$(printf '%02d' $(( (up_s % 3600) / 60 )))
 
-    _o() { out+=("$1"); }
+    _o() { out+=("$1|$2"); }
 
-    _o "up $up_h:$up_m   $(dash_status_line)"
+    if [ -n "$GPS_FIX" ]; then gps="yes"; else gps="no"; fi
+    case "$STEALTH_MODE" in
+        1) stealth="vibrate only" ;;
+        2) stealth="silent" ;;
+        *) stealth="on" ;;
+    esac
 
-    # 3-letter tags, three to a row -- keeps each row inside the narrower
-    # width a picker option gets.
+    _o magenta "$(dash_rule 'Session Info')"
+    _o cyan    "Uptime: $up_h:$up_m | GPS: $gps | Alerts: $stealth"
+    if [ "$DETECTIONS" = "0" ]; then
+        _o green "Unique Devices: 0 -- nothing detected yet"
+    else
+        _o red   "Unique Devices: $DETECTIONS"
+    fi
+
+    _o magenta "$(dash_rule 'Detections')"
+    # Four tags a row, pipe-separated, same shape as bt-bluepine's
+    # "Key: val | Key: val" info lines.
     row=""
     for cat in $DASH_CATS; do
         dash_cat_enabled "$cat" || continue
         tag=$(dash_cat_tag "$cat")
         n=${CAT_COUNT[$cat]:-0}
-        row="$row$(printf '%-4s%-4s' "$tag" "$n")"
-        if [ ${#row} -ge 24 ]; then
-            _o "${row%"${row##*[![:space:]]}"}"
-            row=""
-        fi
+        if [ -z "$row" ]; then row="$tag $n"; else row="$row | $tag $n"; fi
+        if [ ${#row} -ge 28 ]; then _o "" "$row"; row=""; fi
     done
-    [ -n "$row" ] && _o "${row%"${row##*[![:space:]]}"}"
+    [ -n "$row" ] && _o "" "$row"
 
-    if [ "$DETECTIONS" = "0" ]; then
-        _o "nothing detected yet"
-    else
-        _o "UNIQUE DEVICES: $DETECTIONS"
-    fi
-
-    i=0
+    _o magenta "$(dash_rule 'Recent')"
+    i=0; n=0
     while [ "$i" -lt "$DASH_RECENT_LINES" ]; do
         entry="${RECENT_HITS[$i]:-}"
         if [ -n "$entry" ]; then
             txt="${entry#*|}"
             [ ${#txt} -gt "$DASH_MAX_TEXT" ] && txt="${txt:0:$((DASH_MAX_TEXT - 1))}>"
-            _o "$txt"
+            _o "" "$txt"
+            n=$((n + 1))
         fi
         i=$((i + 1))
     done
+    [ "$n" = "0" ] && _o "" "(none yet)"
+
+    _o green "= LEFT refresh | RIGHT bookmark ==== Stats ===="
 
     # Written whole then moved into place, so the watcher can never read a
     # half-written file -- it runs in its own process and is not
@@ -1369,24 +1394,37 @@ write_dash_state() {
     unset -f _o
 }
 
-# Raises the stats screen. Called ONLY from bookmark_watcher's process:
-# LIST_PICKER blocks until the user dismisses it, and blocking the main
-# loop would stall every detector for as long as the screen is up.
-show_dash_picker() {
-    local line
-    local -a args=()
+# Paints the stats screen, bt-bluepine style: magenta section rules,
+# coloured facts between them, a footer rule saying which button does what.
+#
+# Painted into the log rather than raised as a LIST_PICKER, which is what
+# this used before. BluePine's own Info screen is painted the same way
+# (payload.sh's "Device Info"/"Scan Info"/"Scan Settings" block), and it
+# holds still for the same reason it will here: nothing else is printing.
+# The main loop paints nothing at all now, so once this lands it is the
+# last thing on the screen until you press something.
+#
+# Called ONLY from bookmark_watcher's process. It reads $DASH_STATE_FILE
+# rather than the counters directly because that process is forked once at
+# startup, so anything it reads from memory froze there -- the same reason
+# it re-fetches its own GPS fix instead of reading $GPS_TAG.
+show_dash_screen() {
+    local line col txt shown=0
     if [ ! -s "$DASH_STATE_FILE" ]; then
-        ERROR_DIALOG "No stats yet -- still starting up" >/dev/null 2>&1
+        LOG red "Stats: still starting up, nothing to show yet"
         return
     fi
     while IFS= read -r line; do
-        [ -n "$line" ] && args+=("$line")
+        [ -z "$line" ] && continue
+        col="${line%%|*}"
+        txt="${line#*|}"
+        if [ -n "$col" ]; then LOG "$col" "$txt"; else LOG "$txt"; fi
+        shown=$((shown + 1))
+        # bt-bluepine paces its Info screen with a sleep between sections
+        # rather than dumping every line at once; a rule is where a section
+        # starts, so that is where the pause goes.
+        case "$txt" in ====*) sleep 0.2 ;; esac
     done < "$DASH_STATE_FILE"
-    args+=("Close")
-    # Trailing "Close" twice is the platform's calling convention, not a
-    # mistake: LIST_PICKER's last argument is the pre-selected default
-    # (see its own usage string, and bt-bluepine's dynamic picker builder).
-    LIST_PICKER "Counter-Surveillance v$SCRIPT_VERSION" "${args[@]}" "Close" >/dev/null 2>&1
 }
 
 # Records one detection and repaints. $1 category, $2 device key, $3 the
@@ -2150,7 +2188,7 @@ get_gps_fix() {
 # putting it in the loop would stall every detector for as long as the
 # screen is up. This function is forked once at startup, so its copy of
 # DETECTIONS/CAT_COUNT/RECENT_HITS froze there -- which is exactly why
-# show_dash_picker reads the state file the main loop keeps current,
+# show_dash_screen reads the state file the main loop keeps current,
 # rather than reading those variables (the same reason the GPS fix below
 # is re-fetched instead of read from $GPS_TAG).
 bookmark_watcher() {
@@ -2159,7 +2197,7 @@ bookmark_watcher() {
     while true; do
         pressed=$(WAIT_FOR_INPUT 2>/dev/null)
         if [ "$pressed" = "LEFT" ]; then
-            show_dash_picker
+            show_dash_screen
             continue
         fi
         if [ "$pressed" = "RIGHT" ]; then
