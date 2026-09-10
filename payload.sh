@@ -1312,18 +1312,6 @@ dash_cat_enabled() {
     esac
 }
 
-# Colour each recent-hit line by the same language the scrolling log used:
-# red for the categories that mean someone is acting on you right now,
-# yellow for the unverified-signature tiers, cyan for confirmed Flock,
-# uncoloured for the watchlist you configured yourself.
-dash_cat_color() {
-    case "$1" in
-        tracker|deauth|drone|alpr) echo "red" ;;
-        glasses|skimmer)           echo "yellow" ;;
-        flock)                     echo "cyan" ;;
-        *)                         echo "" ;;
-    esac
-}
 
 # The one-line "how is this rig configured right now" strip under the
 # title: GPS fix if there is one, and stealth state, since both change
@@ -1346,7 +1334,7 @@ render_dashboard() {
     [ "$DISPLAY_MODE" = "0" ] || return 0
     DASH_LAST_PAINT=$(date +%s)
 
-    local up_s up_h up_m cat tag n row i entry c txt col e
+    local up_s up_h up_m cat tag n row i entry c txt blob e
     local -a out=()
     up_s=$(( DASH_LAST_PAINT - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
@@ -1408,8 +1396,7 @@ render_dashboard() {
             # Truncate rather than wrap: a wrapped line costs a row and
             # pushes the footer past the bottom of the window.
             [ ${#txt} -gt "$DASH_MAX_TEXT" ] && txt="${txt:0:$((DASH_MAX_TEXT - 1))}>"
-            col=$(dash_cat_color "$c")
-            _o "$col" "$txt"
+            _o "" "$txt"
         fi
         i=$((i + 1))
     done
@@ -1417,17 +1404,35 @@ render_dashboard() {
     _o "" ""
     _o green "LEFT stats   RIGHT bookmark"
 
-    # Pad to a full window so no older text survives underneath, then emit.
+    # Pad to a full window so no older text survives underneath.
     while [ ${#out[@]} -lt "$DASH_VISIBLE_LINES" ]; do out+=("|"); done
+
+    # ONE LOG call for the whole block, newline-separated -- NOT one call
+    # per line. Each LOG is a separate message to the UI socket
+    # (/tmp/api.sock) and the view samples on its own 0.75s timer, so a
+    # 14-message burst gets caught half-delivered: some old log lines, then
+    # the first few lines of the block. That half-drawn frame is what read
+    # from the device as "it keeps switching from the log to the dashboard"
+    # and as a second, briefer dashboard with fewer rows.
+    #
+    # Multi-line in a single LOG is this platform's own idiom, not a trick:
+    # see LOG "\n$LOG_BUFFER" in the official library's FullPullPRUpload
+    # payload, among others.
+    #
+    # The cost is colour. A LOG call carries one colour for everything it
+    # prints, so the block is uncoloured and the 3-letter category tag now
+    # carries what red/yellow/cyan used to say. Worth it: a colour that
+    # only renders correctly half the time isn't telling you anything.
+    blob=""
     i=0
     while [ "$i" -lt "$DASH_VISIBLE_LINES" ]; do
         e="${out[$i]}"
-        c="${e%%|*}"
         txt="${e#*|}"
         [ -z "$txt" ] && txt=" "
-        if [ -n "$c" ]; then LOG "$c" "$txt"; else LOG "$txt"; fi
+        if [ "$i" = "0" ]; then blob="$txt"; else blob="$blob\n$txt"; fi
         i=$((i + 1))
     done
+    LOG "$blob"
     unset -f _o
 }
 
