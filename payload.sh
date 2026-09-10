@@ -152,7 +152,7 @@
 #   Bookmarks: press RIGHT any time to flag the current moment (timestamp +
 #     GPS if available) to bookmarks_<timestamp>.txt, for anything you
 #     notice that the detectors should have caught (or just want to mark
-#     for review) -- see bookmark_watcher()'s comment for why this runs as
+#     for review) -- see do_bookmark()'s comment for why this is a menu
 #     its own background loop rather than inside the main one.
 # ============================================================================
 #
@@ -427,12 +427,12 @@ echo "Retail BLE beacon log started at $(date)" > "$BEACON_LOG_FILE"
 # hits.
 FLOCK_DIAG_LOG_FILE="${LOOT_DIR}/flock_wifi_diag_${TIMESTAMP}.txt"
 echo "Flock WiFi diagnostic log (unmatched-OUI wildcard probes, never alerts) started at $(date)" > "$FLOCK_DIAG_LOG_FILE"
-# Manual "flag this moment for later analysis" -- see bookmark_watcher()
+# Manual "flag this moment for later analysis" -- see do_bookmark()
 # below. Confirmed live which DuckyScript button-name string this device's
 # RIGHT button reports (WAIT_FOR_INPUT returns "RIGHT", same command the
 # stock BUTTON_COMBO example payload uses in its own background loop).
 # Stats-screen source data, rebuilt each main-loop cycle and read by
-# bookmark_watcher when LEFT is pressed. Work dir, not loot: it is a
+# the menu when a stats screen is drawn. Work dir, not loot: it is a
 # snapshot of live state, not session evidence, and it lives on tmpfs.
 DASH_STATE_FILE="${WORK_DIR}/dash_state"
 
@@ -496,7 +496,7 @@ GLASSES_BLE_MON_PID=""
 DEAUTH_TCPDUMP_PID=""
 DEAUTH_MON_PID=""
 WIFI_HOP_PID=""
-BOOKMARK_WATCHER_PID=""
+DETECTION_PID=""
 WIFI_IFACE_CREATED=0
 
 cleanup() {
@@ -508,7 +508,7 @@ cleanup() {
              "$FLOCK_BLE_HCIDUMP_PID" "$FLOCK_BLE_MON_PID" \
              "$GLASSES_BLE_HCIDUMP_PID" "$GLASSES_BLE_MON_PID" \
              "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID" \
-             "$BOOKMARK_WATCHER_PID"; do
+             "$DETECTION_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
     rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
@@ -646,12 +646,6 @@ WANT_RETAIL_BEACONS=0
 # route repeatedly and wanting every pass to alert, not just the first.
 ALWAYS_ALERT=0
 
-# DISPLAY_MODE: 0 dashboard (default), 1 scrolling hit log (the legacy
-# screen). Declared here rather than beside the rest of the dashboard code
-# further down because the startup menu toggles it, and the menu runs
-# first -- see write_dash_state() for what the two modes actually look
-# like and why the legacy one is still reachable.
-DISPLAY_MODE=0
 
 # STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
 # suppressed, vibrator still pulses so a detection can still be felt without
@@ -747,14 +741,6 @@ stealth_menu_item() {
     esac
 }
 
-display_mode_menu_item() {
-    if [ "$DISPLAY_MODE" = "0" ]; then
-        echo "[X] Dashboard blocks (stats on LEFT, hits to loot only)"
-    else
-        echo "[ ] Dashboard blocks (off: scrolling hit log)"
-    fi
-}
-
 always_alert_menu_item() {
     if [ "$ALWAYS_ALERT" = "1" ]; then
         echo "[X] Always Alert (re-alert on every pass, no dedup)"
@@ -777,7 +763,6 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
-            "$(display_mode_menu_item)" \
             "Start scanning" \
             "Start scanning")
         case "$_resp" in
@@ -792,7 +777,6 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
-            *"Dashboard blocks"*) DISPLAY_MODE=$((1 - DISPLAY_MODE)) ;;
             "Start scanning") break ;;
             *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE/ALWAYS_ALERT values rather than looping forever
         esac
@@ -1184,7 +1168,6 @@ LOG "----------------------------------"
 
 DETECTIONS=0
 SEEN_STRONG=""
-COUNTER=0
 
 # ---------------------------------------------------------------------------
 # Live on-screen dashboard
@@ -1213,11 +1196,10 @@ COUNTER=0
 # bt-bluepine does and is what avoids it.
 #
 # The main loop therefore only refreshes the screen's source data into a
-# state file. bookmark_watcher -- a separate process, already sitting in
-# WAIT_FOR_INPUT -- reads that file and paints on LEFT. The file is also
-# what keeps its numbers right: it is forked once at startup, so anything
-# it reads from memory froze there (the same reason it re-fetches its own
-# GPS fix rather than reading $GPS_TAG).
+# state file, and the foreground menu reads that file to draw. They are
+# separate processes -- the detection loop is backgrounded so the menu can
+# own the screen -- so the file is the only way the menu can see live
+# numbers at all.
 DASH_RECENT_LINES=3     # recent hits carried in the stats screen
 DASH_MAX_TEXT=36        # picker rows are narrower than log lines -- see
                         # bt-bluepine's header note on setting max_chars to
@@ -1331,8 +1313,6 @@ dash_rule() {
 # small write to tmpfs, and crucially NOTHING to the screen -- the screen
 # is only ever drawn by show_dash_screen(), on LEFT.
 write_dash_state() {
-    # No DISPLAY_MODE guard: this only writes a file, never the screen, so
-    # LEFT gives the same stats screen in the legacy scrolling-log mode too.
     local up_s up_h up_m cat tag n row i entry txt gps stealth
     local -a out=()
     up_s=$(( $(date +%s) - SESSION_START ))
@@ -1383,7 +1363,7 @@ write_dash_state() {
     done
     [ "$n" = "0" ] && _o "" "(none yet)"
 
-    _o green "= LEFT refresh | RIGHT bookmark ==== Stats ===="
+    _o green "$(dash_rule 'End')"
 
     # Written whole then moved into place, so the watcher can never read a
     # half-written file -- it runs in its own process and is not
@@ -1404,10 +1384,8 @@ write_dash_state() {
 # The main loop paints nothing at all now, so once this lands it is the
 # last thing on the screen until you press something.
 #
-# Called ONLY from bookmark_watcher's process. It reads $DASH_STATE_FILE
-# rather than the counters directly because that process is forked once at
-# startup, so anything it reads from memory froze there -- the same reason
-# it re-fetches its own GPS fix instead of reading $GPS_TAG.
+# Reads $DASH_STATE_FILE rather than the counters directly: those live in
+# detection_loop's process, which is not this one.
 show_dash_screen() {
     local line col txt shown=0
     if [ ! -s "$DASH_STATE_FILE" ]; then
@@ -1431,27 +1409,17 @@ show_dash_screen() {
 # short "what/who" text the dashboard's Recent panel shows for it.
 #
 # MUST be called before the caller's own LOG line, because it sets
-# $DETECT_TAG (" [#N]") for scrolling-log mode to append. That tag is
-# deliberately screen-only and never reaches $LOG_FILE: export_gps_kml.awk
-# anchors its " | gps=LAT,LON" match to end-of-line, so a suffix on the
-# persisted line would silently drop every GPS-tagged hit from the KML
-# export, and summarize_session.sh reads the same file positionally.
+# Loot lines are written by the callers exactly as before, byte for byte:
+# export_gps_kml.awk anchors its " | gps=LAT,LON" match to end-of-line, so
+# anything appended to a persisted line would silently drop every
+# GPS-tagged hit from the KML export, and summarize_session.sh reads the
+# same file positionally.
 #
 # Called by every real detection across every category (Flock, drone
 # Remote ID, Mesh-Detect, rogue trackers, deauth/evil-twin, known ALPR
 # cameras, skimmers, glasses) -- NOT by handle_beacon_line(), which
 # deliberately isn't a security detection, see that function's own header
 # for why.
-# Per-hit screen line. In dashboard mode the screen IS the dashboard, so
-# these are suppressed entirely -- the hit is already in its loot file and
-# already counted in the panel, and letting it scroll would push the
-# dashboard off the display it just repainted. In scrolling-log mode this
-# is the old behaviour unchanged, " [#N]" tag and all. "-" means "no
-# colour", since LOG takes the colour as a separate leading argument.
-hit_log() {
-    [ "$DISPLAY_MODE" = "0" ] && return 0
-    if [ -n "$1" ] && [ "$1" != "-" ]; then LOG "$1" "$2"; else LOG "$2"; fi
-}
 
 bump_counter() {
     local cat="$1" key hit now
@@ -1465,7 +1433,6 @@ bump_counter() {
         CAT_SEEN["$cat|$key"]=1
         CAT_COUNT["$cat"]=$(( ${CAT_COUNT[$cat]:-0} + 1 ))
     fi
-    DETECT_TAG=" [#$DETECTIONS]"
 
     hit="$(date '+%H:%M') $(dash_cat_tag "$cat") ${3:-$2}"
     RECENT_HITS+=("$cat|$hit")
@@ -1591,9 +1558,7 @@ check_alpr_gps_proximity() {
         CURRENT_TIME=$(date '+%H:%M:%S')
         ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
         bump_counter alpr "osm:$id" "osm:$id ${dist}mi"
-        hit_log red "$ENTRY$DETECT_TAG"
         echo "$ENTRY" >> "$LOG_FILE"
-        COUNTER=$((COUNTER + 1))
         stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
         ALPR_GPS_SEEN[$id]=1
     done < <(sqlite3 -csv "$ALPR_DB_FILE" \
@@ -1723,13 +1688,10 @@ handle_flock_wifi_line() {
     bump_counter flock "$mac" "$mac W/$conf"
     if [ "$conf" = "high" ]; then
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)$GPS_TAG"
-        hit_log cyan "$ENTRY$DETECT_TAG"
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
-        hit_log yellow "$ENTRY$DETECT_TAG"
     fi
     echo "$ENTRY" >> "$LOG_FILE"
-    COUNTER=$((COUNTER + 1))
     # conf=medium now gets a physical alert too, not just conf=high --
     # field-confirmed live 2026-08-20 (parked next to a real camera on OUI
     # 9c:2f:9d, RSSI trending -49/-39/-38dBm as proximity increased) that
@@ -1771,9 +1733,7 @@ handle_flock_ble_line() {
     CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
     bump_counter flock "$mac" "$mac B?"
-    hit_log yellow "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
-    COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
 }
 
@@ -1800,9 +1760,7 @@ handle_glasses_ble_line() {
     CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Glasses?? ($brand, unverified signature, $cid)$rssi_sfx$GPS_TAG"
     bump_counter glasses "$mac" "$mac $brand"
-    hit_log yellow "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
-    COUNTER=$((COUNTER + 1))
     SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
 }
 
@@ -1877,9 +1835,7 @@ handle_mesh_wifi_line() {
         ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
     fi
     bump_counter mesh "$mac" "$mac W"
-    hit_log - "$ENTRY$DETECT_TAG"
     echo "$ENTRY" >> "$LOG_FILE"
-    COUNTER=$((COUNTER + 1))
     stealth_blink
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
 }
@@ -1941,7 +1897,6 @@ handle_tracker_line() {
 
     local minutes=$(( age / 60 ))
     bump_counter tracker "$mac" "$mac $label"
-    hit_log red "ROGUE TRACKER [$label] $mac - seen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min$DETECT_TAG"
     stealth_alert "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
 }
 
@@ -1988,12 +1943,9 @@ handle_beacon_line() {
     local label
     label=$(beacon_protocol_label "$protocol")
     echo "$(date '+%H:%M:%S') | $mac | $label | $detail$GPS_TAG" >> "$BEACON_LOG_FILE"
-    # hit_log, not LOG: in dashboard mode this would otherwise be the one
-    # thing still scrolling, and it would clobber the panel on every
-    # passing shop beacon -- the noisiest source here by a wide margin,
-    # and the one category deliberately not counted in the panel either.
+    # No screen line: beacons are the noisiest source here by a wide
+    # margin, and the one category deliberately not counted either.
     # BEACON_LOG_FILE still gets every one of them, unchanged.
-    hit_log - "BEACON: $mac | $label$GPS_TAG"
 }
 
 # Parse one line from deauth_eviltwin_monitor.awk -- either
@@ -2054,7 +2006,6 @@ handle_deauth_line() {
             [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
             DEAUTH_LAST_ALERT[$mac]=$now
             bump_counter deauth "$mac" "$mac flood"
-            hit_log red "DEAUTH FLOOD [$mac] -> $dst - ${delta_count} ${subtype} frames in ${delta_time}s$DETECT_TAG"
             stealth_alert "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
         fi
         return
@@ -2068,7 +2019,6 @@ handle_deauth_line() {
         [ $((now - last_alert)) -lt "$DEAUTH_ALERT_COOLDOWN" ] && return
         DEAUTH_LAST_ALERT[$mac]=$now
         bump_counter deauth "$mac" "$mac twin"
-        hit_log red "EVIL TWIN AP [$ssid] $mac is NOT a known BSSID for this SSID$DETECT_TAG"
         stealth_alert "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
     fi
 }
@@ -2133,7 +2083,6 @@ handle_rid_line() {
         local label="$mac"
         [ -n "$known_id" ] && label="$mac ($known_id)"
         bump_counter drone "$mac" "$mac"
-        hit_log red "DRONE [$src] $label - $summary$DETECT_TAG"
         stealth_alert "DRONE REMOTE ID" "$label\n$summary\nvia $src"
     fi
 }
@@ -2163,70 +2112,47 @@ get_gps_fix() {
     echo "$lat,$lon"
 }
 
-# Manual "flag this moment for later analysis" -- press RIGHT on the Pager
-# any time you notice something the detectors should have caught (or just
-# want to mark for review), and it gets logged with a timestamp and GPS fix
-# (if available) to BOOKMARK_LOG_FILE. Confirmed live: WAIT_FOR_INPUT
-# returns "RIGHT" for this device's RIGHT button (same command the stock
-# BUTTON_COMBO example payload already runs in its own background loop --
-# this isn't a new pattern for this platform, just the same one applied
-# here).
+# Manual "flag this moment for later analysis" -- a menu action rather
+# than a button watcher. A background process parked in WAIT_FOR_INPUT
+# would compete with the foreground menu for the D-pad (only one reader
+# can win a button press), which is why bt-bluepine has no such watcher
+# either: everything it does goes through its menu.
 #
-# Runs as its OWN background loop, separate from the main detection loop
-# below, so a WAIT_FOR_INPUT call (which blocks until a button is pressed)
-# never stalls detection. Calls get_gps_fix() itself rather than reading
-# the main loop's $GPS_TAG -- this function is forked once at startup, so
-# it would otherwise only ever see whatever $GPS_TAG held at that exact
-# moment (bash background jobs don't see the parent's later variable
-# updates), not a fresh fix at the time of the actual button press.
+# Calls get_gps_fix() itself rather than reading the detection loop's
+# $GPS_TAG -- that loop is a separate process now, so its variables are
+# not visible here at all.
 #
 # Double vibrate pulse (not the single pulse a real detection uses)
-# specifically so a bookmark press feels different from a detection alert
-# -- confirms the press registered without having to look at the screen.
-# LEFT raises the stats screen, and it is raised from HERE rather than
-# from the main loop on purpose: LIST_PICKER blocks until dismissed, so
-# putting it in the loop would stall every detector for as long as the
-# screen is up. This function is forked once at startup, so its copy of
-# DETECTIONS/CAT_COUNT/RECENT_HITS froze there -- which is exactly why
-# show_dash_screen reads the state file the main loop keeps current,
-# rather than reading those variables (the same reason the GPS fix below
-# is re-fetched instead of read from $GPS_TAG).
-bookmark_watcher() {
-    local pressed n gps_fix gps_sfx
-    n=0
-    while true; do
-        pressed=$(WAIT_FOR_INPUT 2>/dev/null)
-        if [ "$pressed" = "LEFT" ]; then
-            show_dash_screen
-            continue
-        fi
-        if [ "$pressed" = "RIGHT" ]; then
-            n=$((n + 1))
-            gps_fix=$(get_gps_fix)
-            gps_sfx=""
-            [ -n "$gps_fix" ] && gps_sfx=" | gps=$gps_fix"
-            echo "$(date '+%H:%M:%S') | bookmark #$n$gps_sfx" >> "$BOOKMARK_LOG_FILE"
-            if [ -f /sys/class/gpio/vibrator/value ]; then
-                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-                sleep 0.12
-                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-                sleep 0.1
-                echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
-                sleep 0.12
-                echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
-            fi
-        fi
-    done
+# specifically so a bookmark feels different from a detection alert.
+BOOKMARK_N=0
+do_bookmark() {
+    local gps_fix gps_sfx
+    BOOKMARK_N=$((BOOKMARK_N + 1))
+    gps_fix=$(get_gps_fix)
+    gps_sfx=""
+    [ -n "$gps_fix" ] && gps_sfx=" | gps=$gps_fix"
+    echo "$(date '+%H:%M:%S') | bookmark #$BOOKMARK_N$gps_sfx" >> "$BOOKMARK_LOG_FILE"
+    if [ -f /sys/class/gpio/vibrator/value ]; then
+        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+        sleep 0.12
+        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+        sleep 0.1
+        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+        sleep 0.12
+        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
+    fi
+    LOG magenta "$(dash_rule 'Bookmark')"
+    LOG green "Bookmark #$BOOKMARK_N saved$gps_sfx"
+    LOG "Logged to $(basename "$BOOKMARK_LOG_FILE")"
 }
-if command -v WAIT_FOR_INPUT >/dev/null 2>&1; then
-    bookmark_watcher &
-    BOOKMARK_WATCHER_PID=$!
-    LOG green "Bookmark: enabled (press RIGHT to flag a moment for later analysis)"
-    LOG green "Stats: press LEFT for the detection summary any time"
-else
-    LOG red "Bookmark: disabled (WAIT_FOR_INPUT not found)"
-fi
 
+# The detection engine, moved off the foreground so the menu can own the
+# screen. Everything in here is silent: hits go to their loot files, real
+# alerts go to the vibrator/LED/ringtone, and the numbers the menu screens
+# read go to $DASH_STATE_FILE. Nothing it does prints, which is what makes
+# a menu screen stay put once drawn -- the whole reason bt-bluepine's
+# interface feels settled and the old always-on log did not.
+detection_loop() {
 while true; do
     # Refreshed once per tick; GPS_TAG is what every hit logged this tick
     # appends to its line (" | gps=LAT,LON", or nothing without a fix) --
@@ -2267,37 +2193,11 @@ while true; do
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | $NAME$GPS_TAG"
+            # $MATCH (name tier vs bare OUI) used to choose a LOG colour
+            # here; with nothing printing, the tier survives only in the
+            # loot line's own name text, which carries it anyway.
             bump_counter flock "$MAC" "$MAC"
-            if echo "$NAME" | grep -qi "fs ext battery"; then
-                hit_log yellow "$ENTRY$DETECT_TAG"
-            elif echo "$NAME" | grep -qi "penguin"; then
-                hit_log green "$ENTRY$DETECT_TAG"
-            elif echo "$NAME" | grep -qi "pigvision"; then
-                hit_log magenta "$ENTRY$DETECT_TAG"
-            elif echo "$NAME" | grep -qi "flock\|xuntong"; then
-                hit_log cyan "$ENTRY$DETECT_TAG"
-            elif [ "$MATCH" = "oui" ]; then
-                # No recognized name, but the OUI itself matched
-                # FLOCKCAM_OUIS -- same "Other Flock" tier as a bare "flock"
-                # name match above, just reached via the MAC instead.
-                hit_log cyan "$ENTRY$DETECT_TAG"
-            else
-                hit_log - "$ENTRY$DETECT_TAG"
-            fi
             echo "$ENTRY" >> "$LOG_FILE"
-            COUNTER=$((COUNTER + 1))
-            # Colour legend, reprinted every 10th hit so it stays reachable
-            # as hits scroll it off. Scrolling-log mode only: in dashboard
-            # mode nothing scrolls, the hit lines it decodes aren't on the
-            # screen at all, and printing it would just clobber the panel.
-            if [ "$DISPLAY_MODE" = "1" ] && [ $((COUNTER % 10)) -eq 0 ]; then
-                LOG " "
-                LOG yellow   "FS Ext Battery"
-                LOG green    "Penguin"
-                LOG magenta  "Pigvision"
-                LOG cyan     "Other Flock"
-                LOG " "
-            fi
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC $NAME"
         done < <(sort -u /tmp/hci_scan.txt)
@@ -2323,9 +2223,7 @@ while true; do
                 ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)$GPS_TAG"
             fi
             bump_counter mesh "$MAC" "$MAC B"
-            hit_log - "$ENTRY$DETECT_TAG"
             echo "$ENTRY" >> "$LOG_FILE"
-            COUNTER=$((COUNTER + 1))
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
         done < <(sort -u /tmp/hci_scan.txt)
@@ -2344,9 +2242,7 @@ while true; do
             CURRENT_TIME=$(date '+%H:%M:%S')
             ENTRY="DECT: $CURRENT_TIME | $MAC | CC Skimmer? (BLE \"$NAME\", $MATCH)$GPS_TAG"
             bump_counter skimmer "$MAC" "$MAC"
-            hit_log yellow "$ENTRY$DETECT_TAG"
             echo "$ENTRY" >> "$LOG_FILE"
-            COUNTER=$((COUNTER + 1))
             stealth_blink
             SEEN_STRONG="$SEEN_STRONG $MAC BLE_SKIMMER"
         done < <(sort -u /tmp/hci_scan.txt)
@@ -2484,4 +2380,109 @@ while true; do
 
     sleep 3
 done
+}
+
+detection_loop &
+DETECTION_PID=$!
+
+# ---------------------------------------------------------------------------
+# Menu -- the foreground, and the only thing that draws
+# ---------------------------------------------------------------------------
+# Modelled on bt-bluepine: print a screen, block on a picker, act, print,
+# block again. The screen never changes while it is being read, because
+# the only process that draws is the one waiting for you.
+
+screen_live_stats()   { show_dash_screen; }
+
+# Last hits across every loot file this session, newest first. Read from
+# the files rather than from memory: the counters live in detection_loop's
+# process and are not visible here.
+screen_recent() {
+    local n=0 f line
+    LOG magenta "$(dash_rule 'Recent Detections')"
+    for f in "$LOG_FILE" "$TRACKER_LOG_FILE" "$DRONE_LOG_FILE" "$DEAUTH_LOG_FILE"; do
+        [ -s "$f" ] || continue
+        while IFS= read -r line; do
+            case "$line" in ""|*"log started"*|*"started at"*) continue ;; esac
+            LOG "${line:0:48}"
+            n=$((n + 1))
+            [ "$n" -ge 8 ] && break
+        done < <(tail -n 8 "$f")
+        [ "$n" -ge 8 ] && break
+    done
+    [ "$n" = "0" ] && LOG green "Nothing logged yet this session"
+    LOG magenta "$(dash_rule 'Recent Detections')"
+}
+
+# Which detectors were asked for, and which actually came up. The two
+# differ whenever hardware or a tool is missing, and that gap is worth
+# being able to check in the field rather than inferring from silence.
+screen_detectors() {
+    local want ok
+    LOG magenta "$(dash_rule 'Detector Status')"
+    for row in \
+        "Flock BLE:$WANT_FLOCK:$FLOCK_BLE_UUID_OK" \
+        "Flock WiFi:$WANT_FLOCK:$FLOCK_WIFI_OK" \
+        "Drone BLE:$WANT_DRONE:$BLE_RID_OK" \
+        "Drone WiFi:$WANT_DRONE:$WIFI_RID_OK" \
+        "Tracker BLE:$WANT_TRACKER:$TRACKER_BLE_OK" \
+        "Mesh WiFi:$WANT_MESH:$MESH_WIFI_OK" \
+        "Glasses BLE:$WANT_GLASSES:$GLASSES_BLE_OK" \
+        "Deauth WiFi:$WANT_DEAUTH:$DEAUTH_OK"; do
+        want="${row#*:}"; ok="${want#*:}"; want="${want%%:*}"
+        if [ "$want" != "1" ]; then
+            LOG "${row%%:*}: off"
+        elif [ "$ok" = "1" ]; then
+            LOG green "${row%%:*}: running"
+        else
+            LOG red "${row%%:*}: UNAVAILABLE"
+        fi
+    done
+    LOG magenta "$(dash_rule 'Detector Status')"
+}
+
+screen_session() {
+    LOG magenta "$(dash_rule 'Session Files')"
+    LOG cyan "Loot: $LOOT_DIR"
+    LOG "Session: $TIMESTAMP"
+    LOG "Version: v$SCRIPT_VERSION"
+    LOG magenta "$(dash_rule 'Session Files')"
+}
+
+# Falls back to running headless if LIST_PICKER is missing, rather than
+# spinning on a picker that never returns -- same defensive stance the
+# startup toggle menu already takes.
+if ! command -v LIST_PICKER >/dev/null 2>&1; then
+    LOG red "LIST_PICKER unavailable -- detectors running, no menu."
+    wait "$DETECTION_PID"
+    exit 0
+fi
+
+LOG " "
+LOG green "Detectors running in the background. Use the menu."
+
+while true; do
+    _sel=$(LIST_PICKER "Counter-Surveillance v$SCRIPT_VERSION" \
+        "1: Live Stats" \
+        "2: Recent Detections" \
+        "3: Detector Status" \
+        "4: Bookmark This Moment" \
+        "5: Session Files" \
+        "0: Stop Scanning" \
+        "1: Live Stats")
+    case "$_sel" in
+        "1: Live Stats")           screen_live_stats ;;
+        "2: Recent Detections")    screen_recent ;;
+        "3: Detector Status")      screen_detectors ;;
+        "4: Bookmark This Moment") do_bookmark ;;
+        "5: Session Files")        screen_session ;;
+        "0: Stop Scanning")        break ;;
+        *)                         break ;;
+    esac
+done
+
+LOG magenta "$(dash_rule 'Stopping')"
+kill "$DETECTION_PID" 2>/dev/null
+wait "$DETECTION_PID" 2>/dev/null
+LOG green "Detectors stopped. Loot in $LOOT_DIR"
 exit 0
