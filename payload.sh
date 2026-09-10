@@ -361,47 +361,6 @@ DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
 rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
-# Local copy of the OpenStreetMap ALPR camera dataset (the same data
-# DeFlock's own map at deflock.org renders), fetched by fetch_alpr_db.sh --
-# see that file's header and gps_alpr_proximity.awk's header. Purely
-# geographic: no RF involved, so a known camera in this database alerts
-# regardless of whether it emits anything any other detector here could
-# see. Optional -- silently no-ops with no GPS hardware (same as every
-# other GPS-tagged feature already in this file) and just as silently
-# no-ops if this file isn't present, same reasoning as every other
-# config-file-driven detector degrading independently.
-#
-# SQLite, not the raw CSV directly -- confirmed live against a real 100k-
-# row synthetic dataset on this device (mipsel_24kc, sqlite3 3.46.1
-# confirmed present): a full awk linear scan of the CSV took 3m42s wall
-# time; an indexed sqlite3 range query against the same data took 0.38-
-# 2.51s depending on box size, roughly 90-470x faster. A per-GPS-cycle
-# scan of a nationwide, tens-of-thousands-of-row database has to be fast
-# enough not to stall the whole detection loop every cycle -- only the
-# index made that true regardless of database size. gps_alpr_proximity.awk
-# still does the final precise haversine distance check (SQLite's own
-# build here isn't confirmed to have sin/cos compiled in, and awk's
-# already field-verified for this) -- sqlite3 only handles the coarse
-# indexed bounding-box pre-filter now, same job the CSV version's own
-# awk-side bbox filter used to do, just via an index instead of a scan.
-ALPR_DB_FILE="$SCRIPT_DIR/alpr_camera_db.sqlite"
-# 500ft (~0.0947mi), not the ~50ft originally asked for -- 50ft is at or
-# below typical consumer GPS accuracy (+-10-15ft under open sky, worse in
-# poor conditions) and gives under 1.2s of warning at 30mph, under 0.5s at
-# highway speed -- closer to "confirms you're passing it right now" than
-# an actual early warning. 500ft clears the GPS-noise floor and gives a
-# few real seconds of notice at normal driving speed. User's own call
-# after being shown the tradeoff.
-ALPR_RADIUS_MI=0.0947
-# Fixed, deliberately generous margin for the SQL bounding-box PRE-filter
-# only (not the final answer -- gps_alpr_proximity.awk's precise haversine
-# check downstream is what actually enforces ALPR_RADIUS_MI). Correctness
-# only requires this to be a superset of the real radius, so a fixed wide
-# margin is fine even though it doesn't account for longitude compression
-# at higher latitudes the way the precise check does -- confirmed live a
-# box this size (actually tested wider, 0.4x0.5 degrees, ~27x31 miles)
-# still only takes ~2.5s indexed, nowhere near slow enough to matter.
-ALPR_BBOX_MARGIN_DEG=0.15
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
 # Time-bounded, not permanent like tracker_allowlist.conf -- see
 # snooze_tracker.sh and load_tracker_snooze() below. Lives in WORK_DIR
@@ -615,13 +574,6 @@ WANT_DEAUTH=1
 WANT_DRONE=1
 WANT_SKIMMER=1
 WANT_GLASSES=1
-# Menu label "Known ALPR Cameras (GPS Database)" -- deliberately not
-# grouped under the "Flock Safety cameras" toggle even though there's
-# overlap in what each can catch: this one is GPS+database, completely
-# independent of every RF detector above, and each ~2.7-2.8s measured
-# real-world cycle cost (see check_alpr_gps_proximity()) is worth being
-# able to turn off on its own, not bundled with an unrelated RF toggle.
-WANT_ALPR_GPS=1
 # Off by default, unlike every WANT_* above -- this piggybacks entirely on
 # the Rogue BLE trackers' scan process (rogue_tracker_monitor.awk's iBeacon/
 # Eddystone-UID/Eddystone-URL branches, see that file's header), so it's
@@ -727,7 +679,6 @@ detection_menu_item() {
         drone) val="$WANT_DRONE" ;;
         skimmer) val="$WANT_SKIMMER" ;;
         glasses) val="$WANT_GLASSES" ;;
-        alpr_gps) val="$WANT_ALPR_GPS" ;;
         retail_beacons) val="$WANT_RETAIL_BEACONS" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
@@ -759,7 +710,6 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item drone 'Drone Remote ID')" \
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
-            "$(detection_menu_item alpr_gps 'Known ALPR Cameras (GPS Database)')" \
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
@@ -773,7 +723,6 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
-            *"Known ALPR Cameras"*) WANT_ALPR_GPS=$((1 - WANT_ALPR_GPS)) ;;
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
@@ -962,22 +911,6 @@ elif [ ! -f "$SCRIPT_DIR/glasses_ble_monitor.awk" ]; then
     LOG red "Smart-glasses BLE (company ID) detection: disabled (glasses_ble_monitor.awk not found -- looked in $SCRIPT_DIR)"
 else
     LOG red "Smart-glasses BLE (company ID) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
-fi
-
-# No hardware/awk-file dependency to check here the way every RF detector
-# above has -- this one's dependencies (sqlite3, the .sqlite database, a
-# GPS fix) are checked live every cycle inside check_alpr_gps_proximity()
-# itself instead, since a GPS fix specifically can come and go during a
-# single run (tunnel, parking garage, etc.) in a way none of the other
-# gates here do.
-if [ "$WANT_ALPR_GPS" = "0" ]; then
-    LOG yellow "Known ALPR Cameras (GPS Database): disabled (not selected in detection menu)"
-elif ! command -v sqlite3 >/dev/null 2>&1; then
-    LOG red "Known ALPR Cameras (GPS Database): disabled (sqlite3 not found)"
-elif [ ! -f "$ALPR_DB_FILE" ]; then
-    LOG yellow "Known ALPR Cameras (GPS Database): no-op ($ALPR_DB_FILE not found -- see fetch_alpr_db.sh)"
-else
-    LOG green "Known ALPR Cameras (GPS Database): enabled ($ALPR_RADIUS_MI mi radius, sqlite3 found, database present -- still needs a live GPS fix each cycle to actually check)"
 fi
 
 # The shared wlan1mon radio setup itself is gated on ANY WiFi-side category
@@ -1221,9 +1154,8 @@ SESSION_START=$(date +%s)
 
 # Unique-device bookkeeping behind the counts.
 #
-# DETECTED_DEVICES is keyed on the device key alone (a MAC, or "osm:<id>"
-# for a GPS-database ALPR camera, which has no MAC), so it counts DISTINCT
-# DEVICES rather than alerts: a tracker that re-alerts every cooldown, or
+# DETECTED_DEVICES is keyed on the device key alone -- a MAC, for every
+# detector here -- so it counts DISTINCT DEVICES rather than alerts: a tracker that re-alerts every cooldown, or
 # a camera caught on both the WiFi and BLE paths, moves the total once and
 # then stops. CAT_SEEN is keyed on "category|key" instead, so that same
 # camera still shows up under both the categories that found it. The
@@ -1238,7 +1170,7 @@ RECENT_HITS=()
 # Order the dashboard lists categories in. Kept as a space-separated
 # string rather than an associative array so the display order is fixed
 # and readable; the panel only prints the ones actually enabled.
-DASH_CATS="flock drone tracker mesh deauth alpr skimmer glasses"
+DASH_CATS="flock drone tracker mesh deauth skimmer glasses"
 
 dash_cat_label() {
     case "$1" in
@@ -1247,7 +1179,6 @@ dash_cat_label() {
         tracker) echo "Tracker" ;;
         mesh)    echo "Mesh" ;;
         deauth)  echo "Deauth" ;;
-        alpr)    echo "ALPR" ;;
         skimmer) echo "Skimmer" ;;
         glasses) echo "Glasses" ;;
     esac
@@ -1266,7 +1197,6 @@ dash_cat_tag() {
         tracker) echo "TRK" ;;
         mesh)    echo "MSH" ;;
         deauth)  echo "ATK" ;;
-        alpr)    echo "ALP" ;;
         skimmer) echo "SKM" ;;
         glasses) echo "GLS" ;;
     esac
@@ -1282,7 +1212,6 @@ dash_cat_enabled() {
         tracker) [ "$WANT_TRACKER" = "1" ] ;;
         mesh)    [ "$WANT_MESH" = "1" ] ;;
         deauth)  [ "$WANT_DEAUTH" = "1" ] ;;
-        alpr)    [ "$WANT_ALPR_GPS" = "1" ] ;;
         skimmer) [ "$WANT_SKIMMER" = "1" ] ;;
         glasses) [ "$WANT_GLASSES" = "1" ] ;;
         *)       false ;;
@@ -1429,8 +1358,8 @@ show_dash_screen() {
 # same file positionally.
 #
 # Called by every real detection across every category (Flock, drone
-# Remote ID, Mesh-Detect, rogue trackers, deauth/evil-twin, known ALPR
-# cameras, skimmers, glasses) -- NOT by handle_beacon_line(), which
+# Remote ID, Mesh-Detect, rogue trackers, deauth/evil-twin, skimmers,
+# glasses) -- NOT by handle_beacon_line(), which
 # deliberately isn't a security detection, see that function's own header
 # for why.
 
@@ -1536,48 +1465,6 @@ mesh_ble_match() {
     done
 }
 
-declare -A ALPR_GPS_SEEN
-# Checks the current GPS position against ALPR_DB_FILE via
-# gps_alpr_proximity.awk and LOG/loot/alerts every match within
-# ALPR_RADIUS_MI, once per camera id per session (own dedup array, not
-# SEEN_STRONG -- there's no MAC here, an OSM node id is the natural key).
-# Silently no-ops without a GPS fix or without the CSV present -- see
-# ALPR_DB_FILE's own comment for why both are optional. Hard alert
-# (stealth_alert, not stealth_blink) since this is database-confirmed
-# ground truth, not an RF heuristic -- the strongest-confidence category
-# this project has, deliberately treated at least as seriously as the
-# tightest RF match tier.
-check_alpr_gps_proximity() {
-    [ "$WANT_ALPR_GPS" = "1" ] || return
-    [ -z "$GPS_FIX" ] && return
-    [ -f "$ALPR_DB_FILE" ] || return
-    command -v sqlite3 >/dev/null 2>&1 || return
-    local lat="${GPS_FIX%%,*}" lon="${GPS_FIX##*,}"
-    if [ -z "$lat" ] || [ -z "$lon" ]; then return; fi
-    local id clat2 clon2 dist box_lat1 box_lat2 box_lon1 box_lon2
-    read -r box_lat1 box_lat2 box_lon1 box_lon2 < <(awk \
-        -v clat="$lat" -v clon="$lon" -v m="$ALPR_BBOX_MARGIN_DEG" \
-        'BEGIN { print clat-m, clat+m, clon-m, clon+m }')
-    # Stage 1 (sqlite3): indexed bounding-box pre-filter -- the whole point
-    # of this being a .sqlite database instead of the old CSV, see
-    # ALPR_DB_FILE's own comment for the measured speedup. Stage 2 (awk,
-    # piped in via stdin, no filename argument): precise haversine distance
-    # on just that small candidate set, same proven logic the CSV version
-    # used, just fed a pre-filtered stream instead of the whole file.
-    while IFS=',' read -r id clat2 clon2 dist; do
-        [ -z "$id" ] && continue
-        if [ "$ALWAYS_ALERT" != "1" ] && [ -n "${ALPR_GPS_SEEN[$id]:-}" ]; then continue; fi
-        local CURRENT_TIME ENTRY
-        CURRENT_TIME=$(date '+%H:%M:%S')
-        ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
-        bump_counter alpr "osm:$id" "osm:$id ${dist}mi"
-        echo "$ENTRY" >> "$LOG_FILE"
-        stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
-        ALPR_GPS_SEEN[$id]=1
-    done < <(sqlite3 -csv "$ALPR_DB_FILE" \
-        "SELECT id,lat,lon FROM cameras WHERE lat BETWEEN $box_lat1 AND $box_lat2 AND lon BETWEEN $box_lon1 AND $box_lon2;" 2>/dev/null \
-        | awk -v clat="$lat" -v clon="$lon" -v radius_mi="$ALPR_RADIUS_MI" -f "$SCRIPT_DIR/gps_alpr_proximity.awk")
-}
 
 # Checks one "MAC NAME" BLE scan result for the legacy Flock-You BLE-name
 # loop below: a name match (now also including "xuntong", the manufacturer
@@ -2174,7 +2061,6 @@ while true; do
     GPS_TAG=""
     [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
 
-    check_alpr_gps_proximity
 
     load_tracker_snooze
 
