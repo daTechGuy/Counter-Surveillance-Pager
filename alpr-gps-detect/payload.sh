@@ -246,6 +246,24 @@ read_state() {
     done < "$STATE_FILE"
 }
 
+# Hold a screen until a button is pressed.
+#
+# Without this the menu loop raises the next LIST_PICKER the instant a screen
+# finishes printing, and the picker draws straight over it -- reported from
+# the device as "it goes to a dashboard then quickly gives the choice again".
+# bt-bluepine does not have that problem because it never returns straight to
+# its picker: it prints, says "Press OK...", and blocks on
+# WAIT_FOR_BUTTON_PRESS first. This is that wait.
+#
+# WAIT_FOR_INPUT (any button) rather than WAIT_FOR_BUTTON_PRESS A (BluePine's
+# choice): any press dismissing the screen is kinder than hunting for one
+# specific key, and WAIT_FOR_INPUT is the call already confirmed working on
+# this device.
+pause_screen() {
+    LOG green "Press any button to return to the menu"
+    WAIT_FOR_INPUT >/dev/null 2>&1
+}
+
 screen_status() {
     read_state
     local up_s up_h up_m
@@ -503,11 +521,11 @@ while true; do
         "0: Stop Scanning" \
         "1: Status")
     case "$_sel" in
-        "1: Status")         screen_status ;;
-        "2: Cameras Found")  screen_cameras ;;
-        "3: GPS Health")     screen_gps ;;
-        "4: Database")       screen_database ;;
-        "5: Session Files")  screen_session ;;
+        "1: Status")         screen_status;   pause_screen ;;
+        "2: Cameras Found")  screen_cameras;  pause_screen ;;
+        "3: GPS Health")     screen_gps;      pause_screen ;;
+        "4: Database")       screen_database; pause_screen ;;
+        "5: Session Files")  screen_session;  pause_screen ;;
         "0: Stop Scanning")  break ;;
         *)                   break ;;
     esac
