@@ -1146,10 +1146,6 @@ SEEN_STRONG=""
 # separate processes -- the detection loop is backgrounded so the menu can
 # own the screen -- so the file is the only way the menu can see live
 # numbers at all.
-DASH_RECENT_LINES=3     # recent hits carried in the stats screen
-DASH_MAX_TEXT=36        # picker rows are narrower than log lines -- see
-                        # bt-bluepine's header note on setting max_chars to
-                        # 38/40 in the option_dialog_string templates
 SESSION_START=$(date +%s)
 
 # Unique-device bookkeeping behind the counts.
@@ -1165,7 +1161,6 @@ SESSION_START=$(date +%s)
 declare -A DETECTED_DEVICES
 declare -A CAT_SEEN
 declare -A CAT_COUNT
-RECENT_HITS=()
 
 # Order the dashboard lists categories in. Kept as a space-separated
 # string rather than an associative array so the display order is fixed
@@ -1184,21 +1179,23 @@ dash_cat_label() {
     esac
 }
 
-# Three-letter tag the Recent panel prefixes each hit with. The full
-# labels are too wide there: a line is "HH:MM TAG <mac>" = 5+1+3+1+17 =
-# 27 of the ~31 usable columns, which leaves a few spare for a qualifier
-# and still shows every octet of the MAC. Truncating a MAC mid-octet, the
-# way the full labels forced, makes it useless for telling two devices
-# apart, which is the one job this panel has.
-dash_cat_tag() {
+
+# Whether a category actually came up, as opposed to merely being wanted.
+# The two differ whenever a radio or tool is missing, and that gap is the
+# thing worth seeing in the field. A category with more than one path
+# (Flock is BLE and WiFi, drone Remote ID likewise) counts as live if
+# either path did.
+dash_cat_live() {
     case "$1" in
-        flock)   echo "FLK" ;;
-        drone)   echo "UAS" ;;
-        tracker) echo "TRK" ;;
-        mesh)    echo "MSH" ;;
-        deauth)  echo "ATK" ;;
-        skimmer) echo "SKM" ;;
-        glasses) echo "GLS" ;;
+        flock)   [ "$FLOCK_BLE_UUID_OK" = "1" ] || [ "$FLOCK_WIFI_OK" = "1" ] && echo 1 ;;
+        drone)   [ "$BLE_RID_OK" = "1" ] || [ "$WIFI_RID_OK" = "1" ] && echo 1 ;;
+        tracker) [ "$TRACKER_BLE_OK" = "1" ] && echo 1 ;;
+        mesh)    [ "$MESH_WIFI_OK" = "1" ] || [ "$MESH_BLE_OK" = "1" ] && echo 1 ;;
+        deauth)  [ "$DEAUTH_OK" = "1" ] && echo 1 ;;
+        glasses) [ "$GLASSES_BLE_OK" = "1" ] && echo 1 ;;
+        # Skimmer matching runs over the shared hcitool lescan dump rather
+        # than a reader of its own, so it is up whenever that cycle is.
+        skimmer) [ "$BTCLASSIC_OK" = "1" ] && echo 1 ;;
     esac
 }
 
@@ -1279,33 +1276,27 @@ write_dash_state() {
     fi
 
     _o magenta "$(dash_rule 'Detections')"
-    # Four tags a row, pipe-separated, same shape as bt-bluepine's
-    # "Key: val | Key: val" info lines.
-    row=""
+    # One row per detector: readable name, whether it is actually running,
+    # and its count. "off" means you did not select it; "N/A" means you did
+    # but it could not start (missing radio or tool), which is the case
+    # worth seeing in the field and was previously only on a second screen.
     for cat in $DASH_CATS; do
-        dash_cat_enabled "$cat" || continue
-        tag=$(dash_cat_tag "$cat")
         n=${CAT_COUNT[$cat]:-0}
-        if [ -z "$row" ]; then row="$tag $n"; else row="$row | $tag $n"; fi
-        if [ ${#row} -ge 28 ]; then _o "" "$row"; row=""; fi
-    done
-    [ -n "$row" ] && _o "" "$row"
-
-    _o magenta "$(dash_rule 'Recent')"
-    i=0; n=0
-    while [ "$i" -lt "$DASH_RECENT_LINES" ]; do
-        entry="${RECENT_HITS[$i]:-}"
-        if [ -n "$entry" ]; then
-            txt="${entry#*|}"
-            [ ${#txt} -gt "$DASH_MAX_TEXT" ] && txt="${txt:0:$((DASH_MAX_TEXT - 1))}>"
-            _o "" "$txt"
-            n=$((n + 1))
+        if ! dash_cat_enabled "$cat"; then
+            _o "" "$(printf '%-11s%-6s%s' "$(dash_cat_label "$cat")" "off" "-")"
+        elif [ "$(dash_cat_live "$cat")" = "1" ]; then
+            _o "" "$(printf '%-11s%-6s%s' "$(dash_cat_label "$cat")" "run" "$n")"
+        else
+            _o "" "$(printf '%-11s%-6s%s' "$(dash_cat_label "$cat")" "N/A" "-")"
         fi
-        i=$((i + 1))
     done
-    [ "$n" = "0" ] && _o "" "(none yet)"
-
-    _o green "$(dash_rule 'End')"
+    # No WANT_ toggle of its own -- it rides the BLE cycle whenever hcitool
+    # is present, so it reports availability only.
+    if [ "$BTCLASSIC_OK" = "1" ]; then
+        _o "" "$(printf '%-11s%-6s%s' "BT Classic" "run" "")"
+    else
+        _o "" "$(printf '%-11s%-6s%s' "BT Classic" "N/A" "-")"
+    fi
 
     # Written whole then moved into place, so the watcher can never read a
     # half-written file -- it runs in its own process and is not
@@ -1374,13 +1365,6 @@ bump_counter() {
     if [ -n "$key" ] && [ -z "${CAT_SEEN[$cat|$key]}" ]; then
         CAT_SEEN["$cat|$key"]=1
         CAT_COUNT["$cat"]=$(( ${CAT_COUNT[$cat]:-0} + 1 ))
-    fi
-
-    hit="$(date '+%H:%M') $(dash_cat_tag "$cat") ${3:-$2}"
-    RECENT_HITS+=("$cat|$hit")
-    # Ring buffer, same trim live_probe uses on its own display list.
-    if [ ${#RECENT_HITS[@]} -gt "$DASH_RECENT_LINES" ]; then
-        RECENT_HITS=("${RECENT_HITS[@]:1}")
     fi
 
     # Deliberately draws nothing. The stats screen is raised by LEFT, and
@@ -2397,33 +2381,6 @@ screen_recent() {
     LOG magenta "$(dash_rule 'Recent Detections')"
 }
 
-# Which detectors were asked for, and which actually came up. The two
-# differ whenever hardware or a tool is missing, and that gap is worth
-# being able to check in the field rather than inferring from silence.
-screen_detectors() {
-    local want ok
-    LOG magenta "$(dash_rule 'Detector Status')"
-    for row in \
-        "Flock BLE:$WANT_FLOCK:$FLOCK_BLE_UUID_OK" \
-        "Flock WiFi:$WANT_FLOCK:$FLOCK_WIFI_OK" \
-        "Drone BLE:$WANT_DRONE:$BLE_RID_OK" \
-        "Drone WiFi:$WANT_DRONE:$WIFI_RID_OK" \
-        "Tracker BLE:$WANT_TRACKER:$TRACKER_BLE_OK" \
-        "Mesh WiFi:$WANT_MESH:$MESH_WIFI_OK" \
-        "Glasses BLE:$WANT_GLASSES:$GLASSES_BLE_OK" \
-        "Deauth WiFi:$WANT_DEAUTH:$DEAUTH_OK" \
-        "BT Classic:1:$BTCLASSIC_OK"; do
-        want="${row#*:}"; ok="${want#*:}"; want="${want%%:*}"
-        if [ "$want" != "1" ]; then
-            LOG "${row%%:*}: off"
-        elif [ "$ok" = "1" ]; then
-            LOG green "${row%%:*}: running"
-        else
-            LOG red "${row%%:*}: UNAVAILABLE"
-        fi
-    done
-    LOG magenta "$(dash_rule 'Detector Status')"
-}
 
 screen_session() {
     LOG magenta "$(dash_rule 'Session Files')"
@@ -2449,17 +2406,15 @@ while true; do
     _sel=$(LIST_PICKER "Counter-Surveillance v$SCRIPT_VERSION" \
         "1: Live Stats" \
         "2: Recent Detections" \
-        "3: Detector Status" \
-        "4: Bookmark This Moment" \
-        "5: Session Files" \
+        "3: Bookmark This Moment" \
+        "4: Session Files" \
         "0: Stop Scanning" \
         "1: Live Stats")
     case "$_sel" in
         "1: Live Stats")           screen_live_stats; pause_screen ;;
-        "2: Recent Detections")    screen_recent;     pause_screen ;;
-        "3: Detector Status")      screen_detectors;  pause_screen ;;
-        "4: Bookmark This Moment") do_bookmark;       pause_screen ;;
-        "5: Session Files")        screen_session;    pause_screen ;;
+        "2: Recent Detections")    screen_recent;  pause_screen ;;
+        "3: Bookmark This Moment") do_bookmark;    pause_screen ;;
+        "4: Session Files")        screen_session; pause_screen ;;
         "0: Stop Scanning")        break ;;
         *)                         break ;;
     esac
