@@ -599,10 +599,10 @@ WANT_RETAIL_BEACONS=0
 ALWAYS_ALERT=0
 
 
-# STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED/RINGTONE/ALERT_RINGTONE
+# STEALTH_MODE: 0 off (default), 1 stealth+vibrate (LED and RINGTONE
 # suppressed, vibrator still pulses so a detection can still be felt without
 # looking at the screen), 2 stealth+silent (all physical feedback suppressed,
-# only the on-screen LOG and loot files still show a detection happened).
+# only the stats screen and loot files still show a detection happened).
 # Idea from cncartistsec/BluePine-WiFi-Pineapple-Pager's Stealth Mode ("Sound
 # Effects, LEDS, Payload LED Actions Disabled") -- vibrate is deliberately its
 # own tier here rather than folded into "everything off": BluePine's own
@@ -652,20 +652,39 @@ stealth_blink() {
     fi
 }
 
-# Wraps the LED RED / RINGTONE warning / ALERT_RINGTONE / LED OFF sequence
-# used by the hard-alert detectors (rogue tracker, deauth flood, evil-twin,
-# drone). Both STEALTH_MODE 1 and 2 suppress this whole sequence -- LED and
-# RINGTONE/ALERT_RINGTONE are both visible/audible tells with no vibrate-only
-# path through the platform builtins, so there's no meaningful difference
-# between the two stealth tiers here (unlike stealth_blink's raw sysfs
-# vibrate, which stealth can address independently of the LED/sound).
+# Physical feedback ONLY -- deliberately no modal.
+#
+# This used to call ALERT_RINGTONE, whose own usage string reads "Raise a
+# modal alert": it takes over the screen. That was harmless while this
+# payload was a single loop printing to the log, and became a real fault the
+# moment the detection loop was backgrounded so the menu could own the
+# screen. Two processes then raise modal UI at each other -- the loop an
+# alert, the foreground a LIST_PICKER -- and the display flips between them
+# for as long as anything keeps detecting. On the device that read as the
+# menu "flashing over a second screen", and one AirTag sitting nearby,
+# re-alerting on its cooldown, was enough to do it continuously.
+#
+# LED, RINGTONE and VIBRATE draw nothing -- checked against each command's
+# own usage text -- so they are what a background process may use. The
+# detail the modal carried is not lost: it is in the loot file and on the
+# stats screen, which is the better place for it anyway, since a modal
+# dismissed while driving tells you nothing afterwards.
+# Callers still pass a title and body. They are accepted and not displayed:
+# the caller already writes the same text to its loot file, and the stats
+# screen reads from there. Keeping them at the call sites keeps those
+# reading as "alert, about this" rather than a bare buzz.
 stealth_alert() {
-    local title="$1" body="$2"
     if [ "$STEALTH_MODE" = "0" ]; then
         LED RED
         RINGTONE warning
-        ALERT_RINGTONE "$title" "$body"
         LED OFF
+    fi
+    # Felt, not seen, and kept in STEALTH_MODE 1: a pulse is not visible or
+    # audible to anyone else, unlike the LED and the ringtone.
+    if [ "$STEALTH_MODE" != "2" ] && [ -f /sys/class/gpio/vibrator/value ]; then
+        echo 1 > /sys/class/gpio/vibrator/value 2>/dev/null
+        sleep 0.25
+        echo 0 > /sys/class/gpio/vibrator/value 2>/dev/null
     fi
 }
 
@@ -1973,7 +1992,7 @@ handle_rid_line() {
 
 # Best-effort GPS fix via the Pager's own GPS_GET command (/usr/bin/GPS_GET,
 # a thin wrapper over pineapd's HTTP API -- same platform-builtin convention
-# already used for LOG/LED/RINGTONE/ALERT_RINGTONE elsewhere in this file,
+# already used for LOG/LED/RINGTONE elsewhere in this file,
 # rather than reinventing GPS handling by talking to gpsd/gpspipe directly).
 # Confirmed live: prints "LAT LON ALT SPEED", space-separated, and "0 0 0 0"
 # when there's no hardware or no fix yet -- the same no-fix sentinel another
