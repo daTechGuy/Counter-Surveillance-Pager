@@ -208,9 +208,17 @@ stealth_blink() {
 # configuration, done in Settings > GPS in the Pager UI (path, baud, then
 # "Restart GPSd"). Reporting it accurately IS this payload's job.
 gpsd_running() {
-    # -x so this matches the daemon itself and not, say, a shell whose command
-    # line happens to contain the word.
-    pgrep -x gpsd >/dev/null 2>&1
+    # NOT `pgrep -x gpsd`. That was the first attempt and it is wrong on this
+    # device: pgrep here is BusyBox, whose -x matches the whole command line
+    # rather than the process name, so it returned no match while gpsd was
+    # demonstrably running and serving. Verified live -- ps showed
+    # "/usr/sbin/gpsd -N -n -S 2947 ...", `pgrep -x gpsd` said NO MATCH,
+    # `pgrep -f /usr/sbin/gpsd` said MATCH, and port 2947 was listening.
+    #
+    # Matching the full path keeps the precision -x was reached for (a shell
+    # whose arguments merely contain "gpsd" will not match) without relying
+    # on GNU pgrep semantics this platform does not have.
+    pgrep -f "/usr/sbin/gpsd" >/dev/null 2>&1
 }
 
 gps_device_path() { uci get gpsd.core.device 2>/dev/null; }
