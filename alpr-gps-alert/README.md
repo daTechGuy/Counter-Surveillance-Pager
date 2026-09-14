@@ -1,7 +1,13 @@
-# ALPR-GPS-Detect
+# ALPR-GPS-Alert
 
-Alerts when the Pager comes within range of a **known ALPR camera** (automatic
+Alerts when the Pager comes within range of a **mapped ALPR camera** (automatic
 licence plate reader), by position alone. No radio is used at any point.
+
+**Scope:** this covers every mapped plate reader, not only Flock Safety. The
+dataset is tagged `surveillance:type=ALPR`, which includes Motorola/Vigilant,
+Genetec and the rest. A hit means *a mapped plate reader is near you*, not
+*that camera is a Flock*. The detector that genuinely identifies Flock Safety
+hardware over RF lives in the [parent payload](../README.md).
 
 Split out of [Counter-Surveillance-Pager](../README.md), where it ran as one
 detector among eight.
@@ -141,7 +147,7 @@ the same one does not buzz every lap. Always Alert turns that off.
 
 ## Loot
 
-Written to `/root/loot/alpr_gps_detect/`:
+Written to `/root/loot/alpr_gps_alert/`:
 
 - `alpr_gps_<timestamp>.txt` — one line per camera found, with the position you
   were at when it triggered

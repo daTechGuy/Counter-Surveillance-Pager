@@ -1,5 +1,5 @@
 #!/bin/bash
-# Title: ALPR-GPS-Detect - known ALPR cameras by position, no radio
+# Title: ALPR-GPS-Alert - alerts on mapped ALPR cameras by position, no radio
 # Description: Cross-references the Pager's live GPS position against a local
 #              database of known ALPR (automatic licence plate reader) camera
 #              locations, and alerts when you come within range of one.
@@ -33,6 +33,12 @@
 # monitor mode, and battery cost is a GPS fix and one indexed query every few
 # seconds.
 #
+# SCOPE: this covers EVERY mapped plate reader, not only Flock Safety --
+# the dataset is tagged surveillance:type=ALPR, which includes Motorola/
+# Vigilant, Genetec and the rest. A hit means "a mapped plate reader is near
+# you", not "that camera is a Flock". The detector that genuinely identifies
+# Flock Safety hardware over RF lives in the parent payload.
+#
 # DATA: alpr_camera_db.csv is DeFlock's own aggregated OpenStreetMap dataset
 # (deflock.org), fetched by fetch_alpr_db.sh. The .sqlite this actually reads
 # is built from that CSV and is a gitignored build artefact -- see
@@ -47,7 +53,7 @@
 # working directory IS that directory when launched from the payload menu,
 # which is why "." is tried first and is what actually resolves in practice.
 SCRIPT_DIR=""
-for _candidate in "." "/root/payloads/user/reconnaissance/ALPR-GPS-Detect" "$(dirname "$0" 2>/dev/null)"; do
+for _candidate in "." "/root/payloads/user/reconnaissance/ALPR-GPS-Alert" "$(dirname "$0" 2>/dev/null)"; do
     if [ -n "$_candidate" ] && [ -f "$_candidate/gps_alpr_proximity.awk" ]; then
         SCRIPT_DIR="$_candidate"
         break
@@ -62,12 +68,12 @@ SCRIPT_VERSION="unknown"
 [ -f "$SCRIPT_DIR/VERSION" ] && SCRIPT_VERSION=$(cat "$SCRIPT_DIR/VERSION" 2>/dev/null)
 [ -z "$SCRIPT_VERSION" ] && SCRIPT_VERSION="unknown"
 
-LOOT_DIR="/root/loot/alpr_gps_detect"
+LOOT_DIR="/root/loot/alpr_gps_alert"
 mkdir -p "$LOOT_DIR"
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 LOG_FILE="${LOOT_DIR}/alpr_gps_${TIMESTAMP}.txt"
 TRACK_FILE="${LOOT_DIR}/track_${TIMESTAMP}.txt"
-echo "ALPR-GPS-Detect v$SCRIPT_VERSION started at $(date)" > "$LOG_FILE"
+echo "ALPR-GPS-Alert v$SCRIPT_VERSION started at $(date)" > "$LOG_FILE"
 echo "GPS track log started at $(date)" > "$TRACK_FILE"
 
 # The indexed database this reads. A plain CSV scan is not fast enough to run
@@ -357,7 +363,7 @@ dash_rule() {
     echo "$eq$tail"
 }
 
-STATE_FILE="/tmp/alpr_gps_state"
+STATE_FILE="/tmp/alpr_gps_alert_state"
 
 # Written by the detection loop, read by the menu. They are separate
 # processes -- the loop is backgrounded so the menu can own the screen --
@@ -656,7 +662,7 @@ LOG " "
 LOG green "Scanning in the background. Use the menu."
 
 while true; do
-    _sel=$(LIST_PICKER "ALPR-GPS-Detect v$SCRIPT_VERSION" \
+    _sel=$(LIST_PICKER "ALPR-GPS-Alert v$SCRIPT_VERSION" \
         "1: Status" \
         "2: Cameras Found" \
         "3: GPS Health" \
