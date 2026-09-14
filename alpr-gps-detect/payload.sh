@@ -224,6 +224,117 @@ gpsd_running() {
 gps_device_path() { uci get gpsd.core.device 2>/dev/null; }
 gps_device_speed() { uci get gpsd.core.speed 2>/dev/null; }
 
+# Find the receiver by listening for it, rather than trusting configuration.
+#
+# Only safe to call when gpsd is NOT running: gpsd holds the port open, and
+# reading it underneath the daemon would fight it for bytes.
+#
+# A GPS receiver streams NMEA continuously whether or not it has a lock, so
+# "does this port emit sentences starting with $GP/$GN/$GL/$GA" is a
+# definitive test -- unlike matching USB vendor IDs, which would need a list
+# of every adapter anyone might use. The OEM module attached here is a
+# Quectel LC86LIC behind a CH340 (1a86:7523) appearing as /dev/ttyUSB0, but
+# nothing below depends on that.
+#
+# 9600 first because it is both this module's rate and the platform default;
+# the others are the rates Hak5's own GPS documentation lists.
+gps_detect_port() {
+    local d baud
+    for d in /dev/ttyUSB0 /dev/ttyUSB1 /dev/ttyACM0 /dev/ttyACM1; do
+        [ -e "$d" ] || continue
+        for baud in 9600 4800 38400 115200; do
+            stty -F "$d" "$baud" raw -echo 2>/dev/null || continue
+            if timeout 3 head -c 300 "$d" 2>/dev/null | grep -qE '\$G[PNLA][A-Z]{3},'; then
+                echo "$d"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# Start gpsd if it is not already up, and say plainly what happened.
+#
+# This payload used to refuse to touch any of it, on the grounds that GPS is
+# device configuration. That was the wrong line to draw: starting a daemon
+# that is meant to be running is not reconfiguring anything, and leaving it
+# stopped meant the payload reported a fault the user then had to go and fix
+# by hand for no reason.
+#
+# Where it still will not act alone is the device PATH. gpsd.core.device is a
+# /dev/serial/by-path entry encoding the USB port, so it goes stale whenever
+# the receiver moves ports or a hub is added -- which is exactly what was
+# wrong on this device for days. Rewriting it silently would be changing
+# system configuration behind the user's back, so it asks first, on screen.
+# This runs during startup, before the detection loop is backgrounded, so a
+# modal here is safe (see stealth_alert for why it would not be later).
+ensure_gpsd() {
+    local dev detected
+    if gpsd_running; then
+        LOG green "GPS: gpsd already running"
+        return 0
+    fi
+
+    dev=$(gps_device_path)
+    if [ -n "$dev" ] && [ -e "$dev" ]; then
+        LOG yellow "GPS: gpsd not running -- starting it"
+        /etc/init.d/gpsd start >/dev/null 2>&1
+        sleep 4
+        if gpsd_running; then
+            LOG green "GPS: gpsd started on $(basename "$dev")"
+            return 0
+        fi
+        LOG red "GPS: gpsd would not start on the configured port"
+    else
+        LOG yellow "GPS: configured port is missing ($(basename "${dev:-none}"))"
+    fi
+
+    LOG yellow "GPS: listening for the receiver on each serial port..."
+    detected=$(gps_detect_port)
+    if [ -z "$detected" ]; then
+        LOG red "GPS: no NMEA on any serial port."
+        LOG yellow "Receiver not plugged in, or not powered."
+        return 1
+    fi
+
+    LOG green "GPS: receiver found on $(basename "$detected")"
+
+    # Prefer the by-path name over the raw /dev/ttyUSB0: the raw name is
+    # assigned in enumeration order and can move between boots, while the
+    # by-path name is stable for as long as the receiver stays in that port.
+    local bypath="" link
+    for link in /dev/serial/by-path/*; do
+        [ -e "$link" ] || continue
+        if [ "$(readlink -f "$link")" = "$(readlink -f "$detected")" ]; then
+            bypath="$link"
+            break
+        fi
+    done
+    [ -z "$bypath" ] && bypath="$detected"
+
+    if command -v CONFIRMATION_DIALOG >/dev/null 2>&1; then
+        local ans
+        ans=$(CONFIRMATION_DIALOG "GPS found on $(basename "$bypath") but config points elsewhere. Update it?" 2>/dev/null)
+        case "$ans" in
+            [Yy]*|"true"|"1"|"OK"|"Yes")
+                uci set gpsd.core.device="$bypath" 2>/dev/null
+                uci commit gpsd 2>/dev/null
+                LOG green "GPS: config updated to $(basename "$bypath")"
+                /etc/init.d/gpsd restart >/dev/null 2>&1
+                sleep 4
+                gpsd_running && { LOG green "GPS: gpsd running"; return 0; }
+                LOG red "GPS: gpsd still would not start"
+                return 1
+                ;;
+        esac
+    fi
+
+    LOG yellow "Left unchanged. To fix it yourself:"
+    LOG yellow "  Settings > GPS > device: $(basename "$bypath")"
+    LOG yellow "  then Restart GPSd"
+    return 1
+}
+
 # "" when everything checks out, otherwise a short reason.
 gps_fault() {
     local d
@@ -422,15 +533,14 @@ fi
 LOG green "Database: $(sqlite3 "$ALPR_DB_FILE" 'SELECT COUNT(*) FROM cameras;' 2>/dev/null) cameras"
 LOG green "Radius: ${ALPR_RADIUS_MI}mi | Poll: every ${POLL_SECONDS}s"
 
-# Reported, not fatal. gpsd can be started and the receiver replugged while
-# this runs, and the loop picks a fix up the moment one exists -- so refusing
-# to start would be worse than saying plainly that nothing will be found yet.
+# Try to bring GPS up rather than merely complaining about it. Still not
+# fatal either way: the receiver can be plugged in mid-session and the loop
+# picks up a fix the moment one exists.
+ensure_gpsd
 _gps_fault=$(gps_fault)
 if [ -n "$_gps_fault" ]; then
     LOG red "GPS PROBLEM: $_gps_fault"
     LOG yellow "Nothing will be detected until this is fixed."
-    LOG yellow "Settings > GPS: set the device path and baud, then Restart GPSd."
-    LOG yellow "The path encodes the USB port -- moving the receiver changes it."
 else
     LOG green "GPS: gpsd running, device present"
     if [ "$(timeout 3 GPS_GET 2>/dev/null)" = "0 0 0 0" ]; then
