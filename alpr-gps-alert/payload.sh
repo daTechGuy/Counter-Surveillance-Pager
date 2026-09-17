@@ -19,7 +19,7 @@
 #
 #   - It needs NO radio at all. No BLE adapter, no monitor-mode WiFi, no
 #     channel hopping, none of the pineapd contention the WiFi detectors have
-#     to be configured around. Only GPS_GET and sqlite3.
+#     to be configured around. Only gpsd (via gpspipe) and sqlite3.
 #   - It therefore CANNOT be starved by the shared-radio duty cycle that
 #     every other detector competes inside, and equally it never takes radio
 #     time from them.
@@ -46,6 +46,38 @@
 # ============================================================================
 
 # ---------------------------------------------------------------------------
+# Screen-safe LOG
+# ---------------------------------------------------------------------------
+# Shadows the platform's LOG (a PATH-found command, symlink to hak5cmd) with a
+# bash function of the same name that truncates to the payload-log screen's
+# own width first. Ported from the parent payload, which established live that
+# overflowing that limit does not merely wrap: it leaves the view's render
+# buffer in a state that resurfaces later as flashing/garbled fragments of an
+# older screen, long after the offending line scrolled away. The theme's
+# payload_log.json gives max_chars: 50; 8 of this file's ~80 LOG lines were
+# over that, the longest 69 characters.
+#
+# A function beats the PATH command in bash's lookup order, so every existing
+# `LOG "text"` / `LOG colour "text"` call is covered with no edits, and so is
+# any added later. `command LOG` reaches the real one without recursing.
+LOG_MAX_WIDTH=49
+LOG() {
+    if [ "$#" -eq 0 ]; then
+        command LOG
+        return
+    fi
+    local last="${@: -1}"
+    if [ "${#last}" -gt "$LOG_MAX_WIDTH" ]; then
+        last="${last:0:$((LOG_MAX_WIDTH - 1))}…"
+    fi
+    if [ "$#" -eq 1 ]; then
+        command LOG "$last"
+    else
+        command LOG "$1" "$last"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Where we are running from
 # ---------------------------------------------------------------------------
 # The Pager copies a payload to /tmp/payload-<n>.sh before running it, so
@@ -60,7 +92,7 @@ for _candidate in "." "/root/payloads/user/reconnaissance/ALPR-GPS-Alert" "$(dir
     fi
 done
 if [ -z "$SCRIPT_DIR" ]; then
-    LOG red "Cannot find gps_alpr_proximity.awk next to this payload -- aborting."
+    LOG red "Cannot find gps_alpr_proximity.awk -- aborting"
     exit 1
 fi
 
@@ -125,17 +157,28 @@ trap 'cleanup; exit 143' TERM
 # ---------------------------------------------------------------------------
 # Device helpers -- same implementations as the parent payload
 # ---------------------------------------------------------------------------
-# GPS_GET returns "lat lon alt speed", or "0 0 0 0" when there is no fix.
-# The timeout matters: without a fix it can sit there.
+# Best-effort fix, read straight from gpsd (gpspipe, localhost:2947).
+#
+# This called GPS_GET until the parent payload traced its own menu flashing
+# to exactly that. /usr/bin/GPS_GET is not a hak5cmd verb but a shell script
+# around `HAK5_API_GET "pineap/gps/get"` -- curl over /tmp/api.sock, the same
+# socket LOG, LIST_PICKER and WAIT_FOR_INPUT drive the screen through. Called
+# from a backgrounded detection loop it contends with the foreground menu.
+# This payload hit it hardest of all: POLL_SECONDS is 3, so it was calling
+# the screen's own socket every 3 seconds for the life of the session, where
+# the parent called it twice per ~22s cycle and that was enough to flash
+# continuously.
+#
+# gpspipe talks to gpsd's socket and never goes near the UI. -w streams JSON;
+# a TPV report with mode >= 2 carries lat/lon, mode 1 does not. Last good TPV
+# in the sample wins, `timeout` bounds a silent receiver, and no gpsd / no fix
+# prints nothing, exactly as the GPS_GET version did with its "0 0 0 0".
+# Output is unchanged ("LAT,LON").
 get_gps_fix() {
-    local out lat lon
-    out=$(timeout 3 GPS_GET 2>/dev/null)
-    [ -z "$out" ] && return
-    [ "$out" = "0 0 0 0" ] && return
-    read -r lat lon _ <<< "$out"
-    [ -z "$lat" ] && return
-    [ -z "$lon" ] && return
-    echo "$lat,$lon"
+    timeout 3 gpspipe -w -n 10 2>/dev/null \
+        | grep '"class":"TPV"' \
+        | jq -r 'select(.mode >= 2 and .lat != null and .lon != null) | "\(.lat),\(.lon)"' 2>/dev/null \
+        | tail -n 1
 }
 
 # A database match is ground truth, not a guess, so this is the hard alert:
@@ -162,11 +205,31 @@ get_gps_fix() {
 # the caller already writes the same text to its loot file, and the stats
 # screen reads from there. Keeping them at the call sites keeps those
 # reading as "alert, about this" rather than a bare buzz.
+#
+# LED and RINGTONE are gone from here, and for the same reason GPS_GET is
+# gone from get_gps_fix() above: /usr/bin/LED and /usr/bin/RINGTONE are
+# HAK5_API_POST wrappers onto /tmp/api.sock, the screen's socket, and this
+# runs in the backgrounded loop. The parent payload confirmed live that both
+# flash the foreground menu from there despite their usage text claiming they
+# draw nothing, and replaced them with direct sysfs writes -- the buzzer is a
+# real PWM device in the LED class (/sys/class/leds/buzzer/, with frequency
+# and volume alongside brightness; 2000Hz at volume 128 is an audible beep).
+# `ls -d /sys/class/leds/*/` with the trailing slash, not a bare glob:
+# BusyBox prints a header per match otherwise and breaks `head -1`.
 stealth_alert() {
     if [ "$STEALTH_MODE" = "0" ]; then
-        LED RED
-        RINGTONE warning
-        LED OFF
+        local _led_path
+        _led_path=$(ls -d /sys/class/leds/*/ 2>/dev/null | head -1)
+        [ -n "$_led_path" ] && echo 1 > "${_led_path}brightness" 2>/dev/null
+        if [ -f /sys/class/leds/buzzer/brightness ]; then
+            echo 2000 > /sys/class/leds/buzzer/frequency 2>/dev/null
+            echo 128 > /sys/class/leds/buzzer/volume 2>/dev/null
+            echo 1 > /sys/class/leds/buzzer/brightness 2>/dev/null
+            sleep 0.3
+            echo 0 > /sys/class/leds/buzzer/brightness 2>/dev/null
+            echo 0 > /sys/class/leds/buzzer/volume 2>/dev/null
+        fi
+        [ -n "$_led_path" ] && echo 0 > "${_led_path}brightness" 2>/dev/null
     fi
     # Felt, not seen, and kept in STEALTH_MODE 1: a pulse is not visible or
     # audible to anyone else, unlike the LED and the ringtone.
@@ -198,7 +261,7 @@ stealth_blink() {
 #
 # Three things have to line up, and each fails differently:
 #
-#   gpsd running      -- GPS_GET returns "0 0 0 0" when it is not, which is
+#   gpsd running      -- get_gps_fix() returns nothing when it is not, which is
 #                        indistinguishable from a cold receiver with no lock.
 #   device path valid -- gpsd.core.device is a /dev/serial/by-path entry, and
 #                        that path encodes the USB PORT. Moving the receiver
@@ -295,7 +358,7 @@ ensure_gpsd() {
         LOG yellow "GPS: configured port is missing ($(basename "${dev:-none}"))"
     fi
 
-    LOG yellow "GPS: listening for the receiver on each serial port..."
+    LOG yellow "GPS: listening on each serial port..."
     detected=$(gps_detect_port)
     if [ -z "$detected" ]; then
         LOG red "GPS: no NMEA on any serial port."
@@ -523,12 +586,18 @@ LOG cyan "== ALPR-GPS-DETECT == v$SCRIPT_VERSION"
 LOG "Known ALPR cameras by position. No radio used."
 LOG " "
 
-if ! command -v GPS_GET >/dev/null 2>&1; then
-    LOG red "GPS_GET not found -- this payload cannot work without it."
-    exit 1
-fi
+# gpspipe and jq, not GPS_GET: position now comes from gpsd directly (see
+# get_gps_fix()). Checking for the command this actually calls is the point --
+# the old check passed on a device where GPS_GET existed, which said nothing
+# about whether a fix was reachable.
+for _need in gpspipe jq; do
+    if ! command -v "$_need" >/dev/null 2>&1; then
+        LOG red "$_need not found -- cannot read GPS. Aborting."
+        exit 1
+    fi
+done
 if ! command -v sqlite3 >/dev/null 2>&1; then
-    LOG red "sqlite3 not found -- cannot query the camera database."
+    LOG red "sqlite3 not found -- cannot query database"
     exit 1
 fi
 if [ ! -f "$ALPR_DB_FILE" ]; then
@@ -549,8 +618,8 @@ if [ -n "$_gps_fault" ]; then
     LOG yellow "Nothing will be detected until this is fixed."
 else
     LOG green "GPS: gpsd running, device present"
-    if [ "$(timeout 3 GPS_GET 2>/dev/null)" = "0 0 0 0" ]; then
-        LOG yellow "No fix yet -- a cold start can take 15-30m with clear sky."
+    if [ -z "$(get_gps_fix)" ]; then
+        LOG yellow "No fix yet -- cold start takes 15-30m"
     else
         LOG green "GPS: fix available"
     fi

@@ -21,7 +21,8 @@ That difference runs deeper than it sounds:
 
 - **It needs no radio at all.** No BLE adapter, no monitor-mode WiFi, no
   channel hopping, and none of the `pineapd` interface contention the WiFi
-  detectors have to be configured around. Only `GPS_GET` and `sqlite3`.
+  detectors have to be configured around. Only `gpsd` (read via `gpspipe`)
+  and `sqlite3`.
 - **It cannot be starved by the shared-radio duty cycle** every other detector
   competes inside, and it never takes radio time from them.
 - **It alerts on ground truth, not an RF heuristic.** A database match is a
@@ -37,7 +38,7 @@ is a GPS fix and one indexed query every few seconds.
 
 | Needs | Why |
 | --- | --- |
-| `GPS_GET` | the Pager's own GPS command, and a live fix |
+| `gpspipe` + `jq` | read the fix straight from `gpsd`, never through the Pager's `GPS_GET` — see below |
 | `sqlite3` | confirmed present on this device |
 | `alpr_camera_db.sqlite` | built from the shipped CSV, see below |
 
@@ -87,17 +88,29 @@ avoid excluding a camera the precise check would have accepted.
 
 ## GPS has to be working first
 
-This payload does **not** start or configure the GPS. It calls `GPS_GET` and
-uses whatever fix `gpsd` already has, because GPS is device configuration, not
-a payload's business. But it does *report* the state, since silence would
-otherwise be ambiguous: "no cameras nearby" and "the receiver was never plugged
-in" look identical.
+Position comes from `gpsd` directly (`gpspipe -w`, TPV reports with `mode >= 2`),
+**not** from the Pager's `GPS_GET` command. That is deliberate and not a style
+choice: `/usr/bin/GPS_GET` is a shell script wrapping `HAK5_API_GET
+"pineap/gps/get"` — curl over `/tmp/api.sock`, the same socket `LOG`,
+`LIST_PICKER` and `WAIT_FOR_INPUT` use to drive the screen. Calling it from the
+backgrounded detection loop makes the foreground menu flash between two
+screens, which is exactly what it did in the parent payload. At `POLL_SECONDS=3`
+this payload would hit that socket every three seconds for the whole session.
+**Nothing in the detection loop may call a Pager command that goes through
+`/tmp/api.sock`** — check `/usr/bin/<VERB>` for `HAK5_API_*` or a `hak5cmd`
+symlink before using one there.
+
+It will *start* `gpsd` if it is not running, and hunt for the receiver if the
+configured port is stale, but it will not rewrite `gpsd.core.device` without
+asking first — that is device configuration. It also *reports* the state, since
+silence would otherwise be ambiguous: "no cameras nearby" and "the receiver was
+never plugged in" look identical.
 
 Three things have to line up, and each fails differently:
 
 | Check | Failure looks like |
 | --- | --- |
-| `gpsd` running | `GPS_GET` returns `0 0 0 0`, same as a cold receiver |
+| `gpsd` running | no fix is reported at all, same as a cold receiver |
 | Device path valid | `gpsd` cannot open it, so it will not start |
 | A fix acquired | cold start takes 15-30 minutes with clear sky |
 
@@ -138,8 +151,14 @@ while a screen is being read, which is what keeps it still.
 
 ## Alerting
 
-A database match is ground truth, so it gets the hard alert: LED, ringtone and
-a dialog, plus a vibrate pulse. Stealth Mode 1 drops to vibrate only; Stealth
+A database match is ground truth, so it gets the hard alert: LED, buzzer and a
+vibrate pulse. All three are driven by writing `/sys/class/leds/*` and
+`/sys/class/gpio/vibrator` directly rather than through the platform's `LED`
+and `RINGTONE` commands, which are `HAK5_API_POST` wrappers onto the screen's
+own socket and flash the menu when called from the background loop. There is no
+modal dialog: a modal raised from the detection loop fights the foreground menu
+for the screen, and one dismissed while driving tells you nothing afterwards —
+the loot file and the Status screen are the durable record. Stealth Mode 1 drops to vibrate only; Stealth
 Mode 2 is fully silent and the loot file is the only record.
 
 Each camera alerts **once per session** by OSM node id, so driving a loop past
