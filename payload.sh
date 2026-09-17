@@ -347,10 +347,11 @@ MESH_WIFI_HITS="$WORK_DIR/mesh_wifi_hits.log"
 TRACKER_HITS="$WORK_DIR/tracker_hits.log"
 FLOCK_BLE_HITS="$WORK_DIR/flock_ble_hits.log"
 GLASSES_BLE_HITS="$WORK_DIR/glasses_ble_hits.log"
+RAVEN_BLE_HITS="$WORK_DIR/raven_ble_hits.log"
 DEAUTH_HITS="$WORK_DIR/deauth_eviltwin_hits.log"
-touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$FLOCK_ADDR1_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$GLASSES_BLE_HITS" "$DEAUTH_HITS"
-# BLE_FIFO is now shared by all 4 BLE hcidump detectors (Drone RID/Rogue
-# Trackers/Flock BLE UUID/Smart Glasses), same as MGT_RAW_FIFO below is
+touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$FLOCK_ADDR1_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$GLASSES_BLE_HITS" "$RAVEN_BLE_HITS" "$DEAUTH_HITS"
+# BLE_FIFO is now shared by all 5 BLE hcidump detectors (Drone RID/Rogue
+# Trackers/Flock BLE/Smart Glasses/Flock Raven), same as MGT_RAW_FIFO below is
 # shared by the WiFi ones -- TRACKER_FIFO/FLOCK_BLE_FIFO/GLASSES_BLE_FIFO
 # are gone, each of those detectors' own FIFO before that merge. See the
 # BLE pipeline's own comment, near where it starts, for the full story.
@@ -580,6 +581,14 @@ WANT_GLASSES=1
 # device nearby is squarely this payload's own threat model (someone
 # running the same class of hardware against you), not ambient noise.
 WANT_PINEAPPLE=1
+# Flock Safety's Raven acoustic gunshot detectors (raven_ble_monitor.awk) --
+# a different product line from the cameras WANT_FLOCK covers, so its own
+# toggle, though Live Stats counts its hits under the Flock slot.
+WANT_RAVEN=1
+# Unitree robots (Go2/G1/H1/B2/X1 quadrupeds and humanoids) by BLE name --
+# the same kind of autonomous platform as a drone, and counted in Live
+# Stats' Drone/Robot slot alongside drone Remote ID.
+WANT_UNITREE=1
 # Off by default, unlike every WANT_* above -- this piggybacks entirely on
 # the Rogue BLE trackers' scan process (rogue_tracker_monitor.awk's iBeacon/
 # Eddystone-UID/Eddystone-URL branches, see that file's header), so it's
@@ -744,6 +753,8 @@ detection_menu_item() {
         skimmer) val="$WANT_SKIMMER" ;;
         glasses) val="$WANT_GLASSES" ;;
         pineapple) val="$WANT_PINEAPPLE" ;;
+        raven) val="$WANT_RAVEN" ;;
+        unitree) val="$WANT_UNITREE" ;;
         retail_beacons) val="$WANT_RETAIL_BEACONS" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
@@ -776,6 +787,8 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
             "$(detection_menu_item pineapple 'Rogue Pineapple / pentest device')" \
+            "$(detection_menu_item raven 'Flock Raven gunshot detectors')" \
+            "$(detection_menu_item unitree 'Unitree robots (Go2/G1/H1/B2/X1)')" \
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
@@ -790,6 +803,8 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
             *"Rogue Pineapple"*) WANT_PINEAPPLE=$((1 - WANT_PINEAPPLE)) ;;
+            *"Flock Raven"*) WANT_RAVEN=$((1 - WANT_RAVEN)) ;;
+            *"Unitree robots"*) WANT_UNITREE=$((1 - WANT_UNITREE)) ;;
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
@@ -854,6 +869,7 @@ MESH_WIFI_OK=0
 TRACKER_BLE_OK=0
 FLOCK_BLE_UUID_OK=0
 GLASSES_BLE_OK=0
+RAVEN_BLE_OK=0
 BTCLASSIC_OK=0
 DEAUTH_OK=0
 
@@ -1020,6 +1036,27 @@ else
     LOG red "Smart-glasses BLE (company ID) detection: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
 fi
 
+# Same file-existence gate again -- see raven_ble_monitor.awk's header for
+# the two firmware signatures and why neither is field-confirmed yet.
+if [ "$WANT_RAVEN" = "0" ]; then
+    LOG yellow "Flock Raven BLE: disabled (not selected)"
+elif [ -n "$AWK" ] && [ -n "$HCIDUMP" ] && [ -f "$SCRIPT_DIR/raven_ble_monitor.awk" ]; then
+    RAVEN_BLE_OK=1
+    LOG yellow "Flock Raven BLE: enabled, not field-confirmed"
+elif [ ! -f "$SCRIPT_DIR/raven_ble_monitor.awk" ]; then
+    LOG red "Flock Raven BLE: disabled (awk file missing)"
+else
+    LOG red "Flock Raven BLE: disabled (missing$( [ -z "$AWK" ] && echo " awk")$( [ -z "$HCIDUMP" ] && echo " hcidump"))"
+fi
+
+# Name match over the shared hcitool lescan dump (unitree_ble_match()), so
+# no reader or file of its own -- available whenever that scan cycle is.
+if [ "$WANT_UNITREE" = "0" ]; then
+    LOG yellow "Unitree robot BLE: disabled (not selected)"
+else
+    LOG green "Unitree robot BLE: enabled"
+fi
+
 # The shared wlan1mon radio setup itself is gated on ANY WiFi-side category
 # being wanted -- Flock/Mesh/Deauth WiFi and Drone WiFi each still get their
 # own individual WANT_* check further down, this just skips bringing up the
@@ -1110,18 +1147,20 @@ fi
 # new names -- those already meant "the hcidump capture" and "its awk
 # reader" for rid_ble_monitor.awk alone; they mean the same thing for the
 # shared pipeline now, just with more readers behind that one awk process.
-if [ "$BLE_RID_OK" = "1" ] || [ "$TRACKER_BLE_OK" = "1" ] || [ "$FLOCK_BLE_UUID_OK" = "1" ] || [ "$GLASSES_BLE_OK" = "1" ]; then
+if [ "$BLE_RID_OK" = "1" ] || [ "$TRACKER_BLE_OK" = "1" ] || [ "$FLOCK_BLE_UUID_OK" = "1" ] || [ "$GLASSES_BLE_OK" = "1" ] || [ "$RAVEN_BLE_OK" = "1" ]; then
     mkfifo "$BLE_FIFO"
     "$HCIDUMP" -i hci0 --raw > "$BLE_FIFO" 2>"$WORK_DIR/hcidump.log" &
     HCIDUMP_PID=$!
     "$AWK" -v WANT_RID_BLE="$BLE_RID_OK" -v WANT_TRACKER="$TRACKER_BLE_OK" \
         -v WANT_FLOCK_BLE="$FLOCK_BLE_UUID_OK" -v WANT_GLASSES="$GLASSES_BLE_OK" \
+        -v WANT_RAVEN="$RAVEN_BLE_OK" \
         -v RID_HITS_FILE="$BLE_HITS" -v TRACKER_HITS_FILE="$TRACKER_HITS" \
         -v FLOCK_BLE_HITS_FILE="$FLOCK_BLE_HITS" -v GLASSES_HITS_FILE="$GLASSES_BLE_HITS" \
+        -v RAVEN_HITS_FILE="$RAVEN_BLE_HITS" \
         -f "$SCRIPT_DIR/rid_common.awk" \
         -f "$SCRIPT_DIR/rid_ble_monitor.awk" -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" \
         -f "$SCRIPT_DIR/flock_ble_monitor.awk" -f "$SCRIPT_DIR/glasses_ble_monitor.awk" \
-        -f "$SCRIPT_DIR/ble_dispatch.awk" \
+        -f "$SCRIPT_DIR/raven_ble_monitor.awk" -f "$SCRIPT_DIR/ble_dispatch.awk" \
         < "$BLE_FIFO" 2>"$WORK_DIR/ble_dispatch.log" &
     BLE_MON_PID=$!
 fi
@@ -1259,15 +1298,45 @@ declare -A DETECTED_DEVICES
 declare -A CAT_SEEN
 declare -A CAT_COUNT
 
-# Order the dashboard lists categories in. Kept as a space-separated
-# string rather than an associative array so the display order is fixed
-# and readable; the panel only prints the ones actually enabled.
-DASH_CATS="flock drone tracker mesh deauth skimmer glasses pineapple"
+# Every counted category, one per detector toggle -- what bump_counter()
+# keys CAT_COUNT on, and what the "Off:" line names. Kept as a space-
+# separated string rather than an associative array so the order is fixed
+# and readable.
+DASH_CATS="flock raven drone unitree tracker mesh deauth pineapple skimmer glasses"
+
+# The grid shows fewer slots than there are categories: related detectors
+# share one, so adding Raven and Unitree did not add a row. DASH_SLOTS is
+# the display order; dash_slot_cats() says which categories each slot sums.
+#   Flock       -- flock + raven (both Flock Safety products)
+#   Drone/Robot -- drone Remote ID + Unitree robots (autonomous platforms)
+#   WiFi Attack -- deauth/evil-twin + rogue Pineapple (hostile WiFi gear)
+# Grouping is display-only. Each detector keeps its own toggle, category,
+# count and loot-line label, so a session can still be picked apart after.
+DASH_SLOTS="flock drone tracker mesh attack skimmer glasses"
+
+dash_slot_label() {
+    case "$1" in
+        drone)  echo "Drone/Robot" ;;
+        attack) echo "WiFi Attack" ;;
+        *)      dash_cat_label "$1" ;;
+    esac
+}
+
+dash_slot_cats() {
+    case "$1" in
+        flock)  echo "flock raven" ;;
+        drone)  echo "drone unitree" ;;
+        attack) echo "deauth pineapple" ;;
+        *)      echo "$1" ;;
+    esac
+}
 
 dash_cat_label() {
     case "$1" in
         flock)   echo "Flock" ;;
+        raven)   echo "Raven" ;;
         drone)   echo "Drone" ;;
+        unitree) echo "Unitree" ;;
         tracker) echo "Tracker" ;;
         mesh)    echo "Mesh" ;;
         deauth)  echo "Deauth" ;;
@@ -1297,6 +1366,9 @@ dash_cat_live() {
         # Same reasoning as skimmer: pineapple_match() runs over the shared
         # BT Classic scan and hcitool lescan dump, no reader of its own.
         pineapple) [ "$BTCLASSIC_OK" = "1" ] && echo 1 ;;
+        raven)   [ "$RAVEN_BLE_OK" = "1" ] && echo 1 ;;
+        # Same again: unitree_ble_match() runs over the shared lescan dump.
+        unitree) [ "$BTCLASSIC_OK" = "1" ] && echo 1 ;;
     esac
 }
 
@@ -1313,6 +1385,8 @@ dash_cat_enabled() {
         skimmer) [ "$WANT_SKIMMER" = "1" ] ;;
         glasses) [ "$WANT_GLASSES" = "1" ] ;;
         pineapple) [ "$WANT_PINEAPPLE" = "1" ] ;;
+        raven)   [ "$WANT_RAVEN" = "1" ] ;;
+        unitree) [ "$WANT_UNITREE" = "1" ] ;;
         *)       false ;;
     esac
 }
@@ -1378,7 +1452,7 @@ dash_rule() {
 # small write to tmpfs, and crucially NOTHING to the screen -- the screen
 # is only ever drawn by show_dash_screen(), on LEFT.
 write_dash_state() {
-    local up_s up_h up_m cat tag n row i entry txt gps stealth label val
+    local up_s up_h up_m cat tag n row i entry txt gps stealth label val slot sum on live btc
     local -a out=() slots=() off=()
     up_s=$(( $(date +%s) - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
@@ -1395,48 +1469,52 @@ write_dash_state() {
 
     _o magenta "$(dash_rule 'Session Info')"
     _o cyan    "Uptime: $up_h:$up_m | GPS: $gps | Alerts: $stealth"
+    # BT Classic rides this line rather than holding a grid slot: it has no
+    # WANT_ toggle and no count of its own (it rides the BLE cycle whenever
+    # hcitool is present and feeds the categories below), so all it ever
+    # reports is up or not. The zero case lost its "-- nothing detected yet"
+    # to make room: the longest form, "Unique Devices: NNNN | BT Classic:
+    # N/A", is 38 chars, inside LOG_MAX_WIDTH.
+    if [ "$BTCLASSIC_OK" = "1" ]; then btc="on"; else btc="N/A"; fi
     if [ "$DETECTIONS" = "0" ]; then
-        _o green "Unique Devices: 0 -- nothing detected yet"
+        _o green "Unique Devices: 0 | BT Classic: $btc"
     else
-        _o red   "Unique Devices: $DETECTIONS"
+        _o red   "Unique Devices: $DETECTIONS | BT Classic: $btc"
     fi
 
     _o magenta "$(dash_rule 'Detections')"
-    # Two dot-leader slots per line (see dash_slot()). Only detectors you
-    # selected get a slot: a count if it came up, "N/A" if it was selected
-    # but could not start (missing radio or tool) -- the case worth seeing
-    # in the field. Ones you switched off are named once on a trailing
-    # "Off:" line instead of each holding a slot that can never change.
+    # Two dot-leader slots per line (see dash_slot()), one per DASH_SLOTS
+    # entry, each summing the categories dash_slot_cats() gives it. A slot
+    # shows when any of its detectors was selected: the summed count of the
+    # ones that came up, or "N/A" if none of the selected ones could start
+    # (missing radio or tool) -- the case worth seeing in the field. Every
+    # detector you switched off is named individually on a trailing "Off:"
+    # line, so a half-off group still says which half.
+    #
+    # ROOM FOR ONE MORE STAT. With everything selected this is 7 slots over
+    # 4 rows, so the right-hand half of the last row (beside Glasses) is
+    # free: one more DASH_SLOTS entry fills it without adding a line. The
+    # screen is then 8 lines, well inside the 14-line window. Keep label +
+    # value within dash_slot()'s 22 chars.
     slots=()
     off=()
-    for cat in $DASH_CATS; do
-        label=$(dash_cat_label "$cat")
-        if ! dash_cat_enabled "$cat"; then
-            off+=("$label")
-            continue
-        fi
-        if [ "$(dash_cat_live "$cat")" = "1" ]; then
-            val=${CAT_COUNT[$cat]:-0}
-        else
-            val="N/A"
-        fi
-        slots+=("$(dash_slot "$label" "$val")")
+    for slot in $DASH_SLOTS; do
+        sum=0; on=0; live=0
+        for cat in $(dash_slot_cats "$slot"); do
+            dash_cat_enabled "$cat" || continue
+            on=1
+            if [ "$(dash_cat_live "$cat")" = "1" ]; then
+                live=1
+                sum=$(( sum + ${CAT_COUNT[$cat]:-0} ))
+            fi
+        done
+        [ "$on" = "1" ] || continue
+        if [ "$live" = "1" ]; then val=$sum; else val="N/A"; fi
+        slots+=("$(dash_slot "$(dash_slot_label "$slot")" "$val")")
     done
-    # No WANT_ toggle and no count of its own -- it rides the BLE cycle
-    # whenever hcitool is present and feeds the categories above -- so it
-    # is not in DASH_CATS; it just reports whether it is up, as the last slot.
-    #
-    # ROOM FOR ONE MORE STAT, right here. With all 8 detectors selected this
-    # makes 9 slots, so BT Classic sits alone on the last grid row and the
-    # right-hand half of that row is empty. One more `slots+=("$(dash_slot
-    # "Label" "value")")` after this block fills it with no extra line, and
-    # the screen stays at 9 lines (well inside the 14-line window). Keep the
-    # label + value within dash_slot()'s 22 chars.
-    if [ "$BTCLASSIC_OK" = "1" ]; then
-        slots+=("$(dash_slot "BT Classic" "on")")
-    else
-        slots+=("$(dash_slot "BT Classic" "N/A")")
-    fi
+    for cat in $DASH_CATS; do
+        dash_cat_enabled "$cat" || off+=("$(dash_cat_label "$cat")")
+    done
     for ((i = 0; i < ${#slots[@]}; i += 2)); do
         if [ -n "${slots[i+1]}" ]; then
             _o "" "${slots[i]}$DASH_SLOT_GAP${slots[i+1]}"
@@ -1450,7 +1528,8 @@ write_dash_state() {
     for label in "${off[@]}"; do
         if [ -z "$row" ]; then
             row="Off: $label"
-        elif [ $(( ${#row} + 2 + ${#label} )) -gt "$DASH_RULE_W" ]; then
+        # +3: the ", " before this label and the "," a wrap would leave.
+        elif [ $(( ${#row} + 3 + ${#label} )) -gt "$DASH_RULE_W" ]; then
             _o "" "$row,"
             row="     $label"
         else
@@ -1544,6 +1623,7 @@ MESH_WIFI_HITS_OFFSET=0
 TRACKER_HITS_OFFSET=0
 FLOCK_BLE_HITS_OFFSET=0
 GLASSES_BLE_HITS_OFFSET=0
+RAVEN_BLE_HITS_OFFSET=0
 
 # Per (mac|protocol) tracker state -- see handle_tracker_line(). Keyed on
 # the exact string rogue_tracker_monitor.awk emits as its 3rd field
@@ -1698,6 +1778,21 @@ pineapple_match() {
     esac
 }
 
+# Unitree robots advertise a BLE Local Name of model + "_" + serial fragment
+# (Go2_XXXX, G1_XXXX, ...) -- the prefix is what the Unitree app pairs on,
+# so it is stable across firmware. Case-sensitive on purpose: the capital
+# letters are part of the model name, and a lowercase "go2_" is not one.
+# Echoes the model, or nothing.
+unitree_ble_match() {
+    case "$1" in
+        Go2_*) echo "Go2" ;;
+        G1_*)  echo "G1" ;;
+        H1_*)  echo "H1" ;;
+        B2_*)  echo "B2" ;;
+        X1_*)  echo "X1" ;;
+    esac
+}
+
 ble_skimmer_match() {
     local mac="$1" name="$2"
     local mac_lc="${mac,,}"
@@ -1791,33 +1886,51 @@ handle_flock_wifi_line() {
     SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"
 }
 
-# Parse one "ble_flock|MAC|uuid_09c8" line from flock_ble_monitor.awk and
-# LOG/loot it -- see that file's header for why this signature is UNVERIFIED
-# (never demonstrated against a real camera by anyone this was sourced
-# from). Log-only: no vibrate/LED at all, even softer than a Flock WiFi
-# conf=low hit, since unlike that one this entire detector is an unproven
-# lead rather than a real signature with an unmatched fingerprint.
+# Parse one line from flock_ble_monitor.awk and loot it. Two shapes, one per
+# path in that file's header:
+#   ble_flock|MAC|uuid_09c8|rssi=N
+#     PATH 1, UNVERIFIED (never demonstrated against a real camera by anyone
+#     this was sourced from). Log-only: no vibrate/LED at all, even softer
+#     than a Flock WiFi conf=low hit, since this entire signature is an
+#     unproven lead rather than a real one with an unmatched fingerprint.
+#   ble_flock|MAC|mfg_serial_tn_validated|serial=NNNNNNNNNN|tn=TN...|rssi=N
+#     PATH 2: company ID + bare 10-digit serial name + embedded TN serial,
+#     all three on one advertisement. Not field-confirmed either, but three
+#     independent signals agreeing is real corroboration, so it gets the
+#     physical alert -- same tier as a Flock WiFi conf=medium hit.
+# Separate dedup keys, so a device first seen on the weak path still
+# alerts if it later shows the validated one.
 handle_flock_ble_line() {
     local line="$1"
     local src mac msgtype kv
     IFS='|' read -r src mac msgtype kv <<< "$line"
     [ -z "$mac" ] && return
-    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac BLE_FLOCK_UUID"; then return; fi
 
-    # $kv is just "|rssi=N" or "" -- flock_ble_monitor.awk has no other
-    # trailing fields on this line, unlike the other handlers that need to
-    # split rssi out of a value they'd otherwise use for something else.
+    local dedup_key="BLE_FLOCK_UUID"
+    [ "$msgtype" = "mfg_serial_tn_validated" ] && dedup_key="BLE_FLOCK_VALIDATED"
+    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac $dedup_key"; then return; fi
+
+    local CURRENT_TIME ENTRY
+    CURRENT_TIME=$(date '+%H:%M:%S')
+
+    if [ "$msgtype" = "mfg_serial_tn_validated" ]; then
+        ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (BLE $msgtype, $kv)$GPS_TAG"
+        bump_counter flock "$mac" "$mac B/validated"
+        echo "$ENTRY" >> "$LOG_FILE"
+        stealth_blink
+        SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
+        return
+    fi
+
+    # $kv is just "rssi=N" or "" on this path.
     local rssi_sfx=""
     case "$kv" in
         *rssi=*) rssi_sfx=" | rssi=${kv#*rssi=}" ;;
     esac
-
-    local CURRENT_TIME ENTRY
-    CURRENT_TIME=$(date '+%H:%M:%S')
     ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
     bump_counter flock "$mac" "$mac B?"
     echo "$ENTRY" >> "$LOG_FILE"
-    SEEN_STRONG="$SEEN_STRONG $mac BLE_FLOCK_UUID"
+    SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
 }
 
 # Parse one "ble_glasses|MAC|BRAND|cid=0xNNNN|rssi=N" line from
@@ -1845,6 +1958,49 @@ handle_glasses_ble_line() {
     bump_counter glasses "$mac" "$mac $brand"
     echo "$ENTRY" >> "$LOG_FILE"
     SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
+}
+
+# Parse one line from raven_ble_monitor.awk and loot it:
+#   ble_raven|MAC|fw12|svc=gps|rssi=N   -- one of Raven's 5 proprietary
+#     128-bit service UUIDs. Specific enough to stand alone, so it gets the
+#     physical alert, labeled "Raven?" (not field-confirmed).
+#   ble_raven|MAC|fw11x|rssi=N          -- Device Information + Heart Rate +
+#     Location and Navigation together. Each is an ordinary SIG service, so
+#     "Raven??" and log-only, same soft tier as the Flock BLE UUID path.
+# Counted under the raven category, which Live Stats folds into its Flock
+# slot (see DASH_SLOTS); the loot line keeps it distinct.
+handle_raven_ble_line() {
+    local line="$1"
+    local src mac msgtype kv
+    IFS='|' read -r src mac msgtype kv <<< "$line"
+    [ -z "$mac" ] && return
+
+    local dedup_key="RAVEN_FW11X"
+    [ "$msgtype" = "fw12" ] && dedup_key="RAVEN_FW12"
+    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac $dedup_key"; then return; fi
+
+    local rssi_sfx=""
+    case "$kv" in
+        *rssi=*) rssi_sfx=" | rssi=${kv#*rssi=}" ;;
+    esac
+
+    local CURRENT_TIME ENTRY
+    CURRENT_TIME=$(date '+%H:%M:%S')
+
+    if [ "$msgtype" = "fw12" ]; then
+        local svc="${kv%%|rssi=*}"
+        ENTRY="DECT: $CURRENT_TIME | $mac | Raven? (BLE fw12, $svc)$rssi_sfx$GPS_TAG"
+        bump_counter raven "$mac" "$mac fw12"
+        echo "$ENTRY" >> "$LOG_FILE"
+        stealth_blink
+        SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
+        return
+    fi
+
+    ENTRY="DECT: $CURRENT_TIME | $mac | Raven?? (BLE fw11x, unverified signature)$rssi_sfx$GPS_TAG"
+    bump_counter raven "$mac" "$mac fw11x"
+    echo "$ENTRY" >> "$LOG_FILE"
+    SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
 }
 
 # Vendor-specific alert labels for select Mesh-Detect OUI/MAC hits (used by
@@ -2328,7 +2484,12 @@ while true; do
     # is wanted -- the loop's own `sleep 3` at the bottom still paces it, so
     # this doesn't turn into a busy-loop, it just iterates faster and spends
     # that time draining WiFi-side hits instead.
-    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ] || [ "$WANT_SKIMMER" = "1" ] || [ "$WANT_PINEAPPLE" = "1" ]; then
+    # WANT_GLASSES and WANT_RAVEN are here for the scan-enable alone: both are
+    # hcidump readers with no lescan-dump matching of their own, and without
+    # this, running either with every other BLE category off started no scan
+    # at all (Glasses was missing from this list before Raven was added).
+    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ] || [ "$WANT_SKIMMER" = "1" ] || [ "$WANT_PINEAPPLE" = "1" ] \
+       || [ "$WANT_GLASSES" = "1" ] || [ "$WANT_RAVEN" = "1" ] || [ "$WANT_UNITREE" = "1" ]; then
     # --- Bluetooth Classic inquiry -------------------------------------
     # Everything else on the Bluetooth side here is BLE: hcitool lescan and
     # the hcidump readers that piggyback on it only ever see advertising
@@ -2506,7 +2667,27 @@ while true; do
             SEEN_STRONG="$SEEN_STRONG $MAC BLE_PINEAPPLE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
-    fi   # closes the WANT_FLOCK/WANT_MESH/WANT_TRACKER/WANT_DRONE/WANT_SKIMMER/WANT_PINEAPPLE BLE-scan gate above
+
+    # --- Unitree robot BLE scan: same lescan dump, by Local Name prefix ---
+    # --- (unitree_ble_match()). Counted under the unitree category, which ---
+    # --- Live Stats folds into its Drone/Robot slot -------------------------
+    if [ "$WANT_UNITREE" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
+        while read -r full_line; do
+            MAC=$(echo "$full_line" | awk '{print $1}')
+            NAME=$(echo "$full_line" | cut -d' ' -f2-)
+            [ -z "$MAC" ] && continue
+            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BLE_UNITREE"; then continue; fi
+            MATCH=$(unitree_ble_match "$NAME")
+            [ -z "$MATCH" ] && continue
+            CURRENT_TIME=$(date '+%H:%M:%S')
+            ENTRY="DECT: $CURRENT_TIME | $MAC | Unitree $MATCH (BLE \"$NAME\")$GPS_TAG"
+            bump_counter unitree "$MAC" "$MAC"
+            echo "$ENTRY" >> "$LOG_FILE"
+            stealth_blink
+            SEEN_STRONG="$SEEN_STRONG $MAC BLE_UNITREE"
+        done < <(sort -u /tmp/hci_scan.txt)
+    fi
+    fi   # closes the BLE-scan gate above
 
     # --- Flock Safety WiFi scan: drain whatever flock_wifi_monitor.awk found ---
     # Uses process substitution (not a `cmd | while` pipe) so the SEEN_STRONG
@@ -2593,6 +2774,17 @@ while true; do
                 [ -n "$line" ] && handle_glasses_ble_line "$line"
             done < <(tail -c "+$((GLASSES_BLE_HITS_OFFSET + 1))" "$GLASSES_BLE_HITS")
             GLASSES_BLE_HITS_OFFSET=$NEW_SIZE
+        fi
+    fi
+
+    # --- Flock Raven BLE: drain whatever raven_ble_monitor.awk found ---
+    if [ "$RAVEN_BLE_OK" = "1" ]; then
+        NEW_SIZE=$(wc -c < "$RAVEN_BLE_HITS" 2>/dev/null); [ -z "$NEW_SIZE" ] && NEW_SIZE=0
+        if [ "$NEW_SIZE" -gt "$RAVEN_BLE_HITS_OFFSET" ]; then
+            while IFS= read -r line; do
+                [ -n "$line" ] && handle_raven_ble_line "$line"
+            done < <(tail -c "+$((RAVEN_BLE_HITS_OFFSET + 1))" "$RAVEN_BLE_HITS")
+            RAVEN_BLE_HITS_OFFSET=$NEW_SIZE
         fi
     fi
 

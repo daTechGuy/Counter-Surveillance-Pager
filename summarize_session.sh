@@ -86,7 +86,12 @@ if [ -f "$SURV" ]; then
     total=$(count_of '^DECT:' "$SURV")
     flock_high=$(count_of 'conf=high' "$SURV")
     flock_low=$(count_of 'conf=low' "$SURV")
-    flock_ble_uuid=$(count_of 'unverified signature' "$SURV")
+    # Anchored to "Flock??" -- Glasses?? and Raven?? lines say "unverified
+    # signature" too.
+    flock_ble_uuid=$(count_of 'Flock\?\? \(BLE' "$SURV")
+    flock_ble_valid=$(count_of 'mfg_serial_tn_validated' "$SURV")
+    raven=$(count_of '\| Raven\?' "$SURV")
+    unitree=$(count_of '\| Unitree ' "$SURV")
     flock_name=$(count_of '\| (fs ext battery|[Pp]enguin|[Pp]igvision)' "$SURV")
     mesh=$(count_of 'Mesh-Detect|detected \(' "$SURV")
     gps_hits=$(count_of ' \| gps=' "$SURV")
@@ -98,6 +103,9 @@ if [ -f "$SURV" ]; then
     echo "  Flock, conf=high           : $flock_high"
     echo "  Flock, conf=low            : $flock_low"
     echo "  Flock BLE UUID (unverified): $flock_ble_uuid"
+    echo "  Flock BLE validated serial : $flock_ble_valid"
+    echo "  Flock Raven (BLE)          : $raven"
+    echo "  Unitree robots (BLE)       : $unitree"
     echo "  Flock BLE name-match       : $flock_name"
     echo "  Mesh-Detect watchlist      : $mesh"
     echo "  GPS-tagged                 : $gps_hits"

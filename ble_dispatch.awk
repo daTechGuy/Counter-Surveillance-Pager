@@ -1,14 +1,15 @@
 # ble_dispatch.awk -- shared packet-reassembly driver for every BLE
 # detector that reads hcidump's raw hex format (Drone Remote ID, Rogue
-# Trackers, Flock BLE UUID, Smart Glasses). Run as:
+# Trackers, Flock BLE, Smart Glasses, Flock Raven). Run as:
 #   hcidump -i hci0 --raw | awk \
 #     -f rid_common.awk \
 #     -f rid_ble_monitor.awk -f rogue_tracker_monitor.awk \
 #     -f flock_ble_monitor.awk -f glasses_ble_monitor.awk \
-#     -f ble_dispatch.awk \
+#     -f raven_ble_monitor.awk -f ble_dispatch.awk \
 #     -v WANT_RID_BLE=1 -v WANT_TRACKER=1 -v WANT_FLOCK_BLE=1 -v WANT_GLASSES=1 \
+#     -v WANT_RAVEN=1 \
 #     -v RID_HITS_FILE=... -v TRACKER_HITS_FILE=... \
-#     -v FLOCK_BLE_HITS_FILE=... -v GLASSES_HITS_FILE=...
+#     -v FLOCK_BLE_HITS_FILE=... -v GLASSES_HITS_FILE=... -v RAVEN_HITS_FILE=...
 #
 # Same change, same reasoning, as wifi_mgt_dispatch.awk on the WiFi side --
 # see that file's own header for the full story (confirmed live this
@@ -37,7 +38,7 @@
 # continuation line.
 #
 # Gating: each detector's WANT_* flag (set from payload.sh's own
-# BLE_RID_OK/TRACKER_BLE_OK/FLOCK_BLE_UUID_OK/GLASSES_BLE_OK) controls both
+# BLE_RID_OK/TRACKER_BLE_OK/FLOCK_BLE_UUID_OK/GLASSES_BLE_OK/RAVEN_BLE_OK) controls both
 # whether its array gets populated at all and whether its process function
 # gets called -- same reasoning as wifi_mgt_dispatch.awk's own gating.
 
@@ -59,6 +60,7 @@ BEGIN {
             if (WANT_TRACKER)    { tnpkt = dispatch_npkt; tpkt[dispatch_npkt] = tok }
             if (WANT_FLOCK_BLE)  { fbnpkt = dispatch_npkt; fbpkt[dispatch_npkt] = tok }
             if (WANT_GLASSES)    { gbnpkt = dispatch_npkt; gbpkt[dispatch_npkt] = tok }
+            if (WANT_RAVEN)      { rvnpkt = dispatch_npkt; rvpkt[dispatch_npkt] = tok }
         }
     }
     next
@@ -75,6 +77,7 @@ BEGIN {
             if (WANT_TRACKER)    { tnpkt = dispatch_npkt; tpkt[dispatch_npkt] = tok }
             if (WANT_FLOCK_BLE)  { fbnpkt = dispatch_npkt; fbpkt[dispatch_npkt] = tok }
             if (WANT_GLASSES)    { gbnpkt = dispatch_npkt; gbpkt[dispatch_npkt] = tok }
+            if (WANT_RAVEN)      { rvnpkt = dispatch_npkt; rvpkt[dispatch_npkt] = tok }
         }
     }
 }
@@ -88,4 +91,5 @@ function dispatch_process() {
     if (WANT_TRACKER)   process_tracker_packet()
     if (WANT_FLOCK_BLE) process_flock_ble_packet()
     if (WANT_GLASSES)   process_glasses_packet()
+    if (WANT_RAVEN)     process_raven_ble_packet()
 }

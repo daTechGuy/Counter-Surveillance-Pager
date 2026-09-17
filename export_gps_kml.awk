@@ -32,6 +32,8 @@ BEGIN {
     print style_def("deauth",   "ff0000ff")   # red
     print style_def("eviltwin", "ff0080ff")   # deep orange-red
     print style_def("drone",    "ff00ffff")   # yellow
+    print style_def("raven",    "ff800080")   # purple -- Flock Raven gunshot detector
+    print style_def("robot",    "ffffff00")   # cyan -- Unitree robot
     print style_def("bookmark", "ff00ff00")   # green -- deliberately not used
                                                # by any detector category, so a
                                                # manually-flagged moment always
@@ -64,6 +66,11 @@ function category_for(fname, text,    lt) {
         return "deauth"
     }
     if (fname ~ /drone_rid/) return "drone"
+    # "Raven? (BLE fw12, ..." / "Raven?? (BLE fw11x, ..." and "Unitree Go2
+    # (BLE ..." -- own pins rather than folded into flock/drone the way Live
+    # Stats groups them, so a map review can still tell them apart.
+    if (lt ~ / \| raven\?/) return "raven"
+    if (lt ~ / \| unitree /) return "robot"
     # Flock BLE name-scan hits ("fs ext battery"/"penguin"/"pigvision"/
     # "flock") and Flock WiFi/BLE-UUID hits ("Flock (..." / "Flock? (..." /
     # "Flock?? (...") all land here.
