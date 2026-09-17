@@ -113,33 +113,14 @@
 # rid_common.awk's shared ble_total_adv_len()/ble_rssi_for() helpers --
 # same trailing-per-report-RSSI layout rid_ble_monitor.awk's header cites.
 
-BEGIN {
-    tnpkt = 0
-    tstarted = 0
-}
-
-/^[><] / {
-    if (tstarted && tnpkt > 0) process_tracker_packet()
-    tstarted = 1
-    tnpkt = 0
-    n = split($0, toks, " ")
-    for (k = 2; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { tnpkt++; tpkt[tnpkt] = toks[k] }
-    }
-    next
-}
-
-{
-    if (!tstarted) next   # ignore hcidump's own startup banner lines
-    n = split($0, toks, " ")
-    for (k = 1; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { tnpkt++; tpkt[tnpkt] = toks[k] }
-    }
-}
-
-END {
-    if (tstarted && tnpkt > 0) process_tracker_packet()
-}
+# Packet reassembly (BEGIN tnpkt/tstarted init, the hcidump-format driver
+# rules, the END flush) used to live here -- see rid_ble_monitor.awk's
+# analogous note on the WiFi side (rid_wifi_monitor.awk's own header) for
+# why: merged into a shared dispatch process alongside rid_ble_monitor.awk/
+# flock_ble_monitor.awk/glasses_ble_monitor.awk, now owned by
+# ble_dispatch.awk, which calls process_tracker_packet() (unchanged below)
+# once per packet. tnpkt/tpkt[] are still this function's own state, just
+# written by that shared driver now.
 
 # Emit at most once for the 1st sighting of a (mac,protocol) pair, then
 # again every EMIT_EVERY sightings after that -- a packet-count-based
@@ -159,8 +140,15 @@ function tracker_throttle_ok(key,    c) {
 # trailing-field convention as rid_common.awk's emit_hit(), so it's
 # suppressed rather than printed when not meaningful.
 function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, \
-                                u1, u2, b, j, key, rssi_sfx, m, uuid_raw, uuid) {
+                                u1, u2, b, j, key, rssi_sfx, m, uuid_raw, uuid, out) {
     rssi_sfx = (rssi != "" && rssi != 127) ? "|rssi=" rssi : ""
+    # Redirects every print below to $TRACKER_HITS_FILE instead of this
+    # process's shared stdout -- both "ble_tracker|" and "ble_beacon|"
+    # lines below go to the same file; payload.sh's own drain loop already
+    # dispatches on that prefix (see this file's header for why they share
+    # one process/file). Falls back to /dev/stdout if unset, same reasoning
+    # as emit_hit()'s own RID_HITS_FILE in rid_common.awk.
+    out = (TRACKER_HITS_FILE != "") ? TRACKER_HITS_FILE : "/dev/stdout"
     i = start
     while (i < start + len) {
         adlen = hex2dec(arr[i])
@@ -176,7 +164,7 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                 if (b == 18) {                        # 0x12 offline finding
                     key = mac "|applefindmy"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|applefindmy|status=" arr[i + 6] rssi_sfx
+                        print "ble_tracker|" mac "|applefindmy|status=" arr[i + 6] rssi_sfx >> out
                         fflush()
                     }
                 } else if (b == 2 && adlen >= 25) {    # 0x02 iBeacon (retail beacon, not a tracker)
@@ -186,7 +174,7 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                            substr(uuid_raw, 13, 4) "-" substr(uuid_raw, 17, 4) "-" substr(uuid_raw, 21, 12)
                     key = mac "|ibeacon"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_beacon|" mac "|ibeacon|uuid=" uuid rssi_sfx
+                        print "ble_beacon|" mac "|ibeacon|uuid=" uuid rssi_sfx >> out
                         fflush()
                     }
                 }
@@ -197,7 +185,7 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                 if (u1 == "ED" && u2 == "FE") {       # Tile (0xFEED)
                     key = mac "|tile"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|tile|" rssi_sfx
+                        print "ble_tracker|" mac "|tile|" rssi_sfx >> out
                         fflush()
                     }
                 }
@@ -207,7 +195,7 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
             if (u1 == "5A" && u2 == "FD") {           # Samsung SmartTag (0xFD5A)
                 key = mac "|smarttag"
                 if (tracker_throttle_ok(key)) {
-                    print "ble_tracker|" mac "|smarttag|" rssi_sfx
+                    print "ble_tracker|" mac "|smarttag|" rssi_sfx >> out
                     fflush()
                 }
             } else if (u1 == "AA" && u2 == "FE" && adlen >= 4) {   # Eddystone/FMDN (0xFEAA)
@@ -215,25 +203,25 @@ function scan_tracker_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                 if (b == 65) {                        # 0x41 unwanted tracking
                     key = mac "|fmdn_unwanted"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|fmdn_unwanted|" rssi_sfx
+                        print "ble_tracker|" mac "|fmdn_unwanted|" rssi_sfx >> out
                         fflush()
                     }
                 } else if (b == 64) {                 # 0x40 normal
                     key = mac "|fmdn_normal"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_tracker|" mac "|fmdn_normal|" rssi_sfx
+                        print "ble_tracker|" mac "|fmdn_normal|" rssi_sfx >> out
                         fflush()
                     }
                 } else if (b == 0) {                  # 0x00 Eddystone-UID (retail beacon, not a tracker)
                     key = mac "|eddystone_uid"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_beacon|" mac "|eddystone_uid|" rssi_sfx
+                        print "ble_beacon|" mac "|eddystone_uid|" rssi_sfx >> out
                         fflush()
                     }
                 } else if (b == 16) {                 # 0x10 Eddystone-URL (retail beacon, not a tracker)
                     key = mac "|eddystone_url"
                     if (tracker_throttle_ok(key)) {
-                        print "ble_beacon|" mac "|eddystone_url|" rssi_sfx
+                        print "ble_beacon|" mac "|eddystone_url|" rssi_sfx >> out
                         fflush()
                     }
                 }

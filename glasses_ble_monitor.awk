@@ -39,9 +39,10 @@
 # rid_common.awk's ble_total_adv_len()/ble_rssi_for()).
 
 BEGIN {
-    gbnpkt = 0
-    gbstarted = 0
-
+    # gbnpkt/gbpkt[] are set per-packet by ble_dispatch.awk's shared
+    # reassembly driver now (see that file, and rogue_tracker_monitor.awk's
+    # analogous note) -- this BEGIN block only sets up this detector's own
+    # static data below.
     # Keyed on the wire-order (little-endian) byte pair, lowercase.
     glasses_company["530d"] = "Meta Ray-Ban"
     glasses_company["ab01"] = "Meta Ray-Ban"
@@ -53,29 +54,6 @@ BEGIN {
     glasses_company["8709"] = "XREAL"
 }
 
-/^[><] / {
-    if (gbstarted && gbnpkt > 0) process_glasses_packet()
-    gbstarted = 1
-    gbnpkt = 0
-    n = split($0, toks, " ")
-    for (k = 2; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { gbnpkt++; gbpkt[gbnpkt] = toks[k] }
-    }
-    next
-}
-
-{
-    if (!gbstarted) next   # ignore hcidump's own startup banner lines
-    n = split($0, toks, " ")
-    for (k = 1; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { gbnpkt++; gbpkt[gbnpkt] = toks[k] }
-    }
-}
-
-END {
-    if (gbstarted && gbnpkt > 0) process_glasses_packet()
-}
-
 # Same 1st + every-10th packet-count throttle as the other BLE detectors,
 # keyed per (mac, company-id) pair.
 function glasses_throttle_ok(key,    c) {
@@ -84,8 +62,9 @@ function glasses_throttle_ok(key,    c) {
     return (c == 1 || c % 10 == 0)
 }
 
-function scan_glasses_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, cid, brand, key, rssi_sfx) {
+function scan_glasses_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, cid, brand, key, rssi_sfx, out) {
     rssi_sfx = (rssi != "" && rssi != 127) ? "|rssi=" rssi : ""
+    out = (GLASSES_HITS_FILE != "") ? GLASSES_HITS_FILE : "/dev/stdout"
     i = start
     while (i < start + len) {
         adlen = hex2dec(arr[i])
@@ -99,7 +78,7 @@ function scan_glasses_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, 
                 brand = glasses_company[cid]
                 key = mac "|" cid
                 if (glasses_throttle_ok(key)) {
-                    print "ble_glasses|" mac "|" brand "|cid=0x" arr[i + 3] arr[i + 2] rssi_sfx
+                    print "ble_glasses|" mac "|" brand "|cid=0x" arr[i + 3] arr[i + 2] rssi_sfx >> out
                     fflush()
                 }
             }

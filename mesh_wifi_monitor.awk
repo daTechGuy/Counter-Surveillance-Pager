@@ -10,26 +10,23 @@
 # part is handled BLE-side, directly in payload.sh (reusing the Flock BLE
 # scan's own hcitool lescan output, same as name matching there).
 #
-# Run as:
-#   tcpdump -i wlan1mon -n -l -xx type mgt \
-#     | awk -v CONFIG_FILE=mesh_detect_targets.conf \
-#           -f rid_common.awk -f mesh_wifi_monitor.awk
+# Run as part of the shared "type mgt" dispatch process now -- see
+# wifi_mgt_dispatch.awk, which owns packet reassembly (once, for every
+# detector sharing that stream) and calls process_mesh_packet() below once
+# per packet, gated on mesh_have_targets the same way the driver rules that
+# used to live in this file already gated it. Config variable renamed
+# MESH_CONFIG_FILE (was CONFIG_FILE) since deauth_eviltwin_monitor.awk's own
+# config file used the same generic name -- harmless as long as each ran in
+# its own separate awk process, a real collision once both share one.
 #
-# Its own tcpdump process, same interface, same reasoning as
-# flock_wifi_monitor.awk's header comment: rid_wifi_monitor.awk's rules all
-# end in `next`, which would block any rule appended after it via a later
-# -f in the same merged awk program, so each WiFi consumer gets its own
-# reader rather than being folded into one shared awk invocation. Radiotap-
-# stripping / mgmt-header byte offsets are the same ones hardware-verified
-# for rid_wifi_monitor.awk (see that file's header).
+# mnpkt/mpkt[] below are still this function's own state, just written by
+# the shared driver instead of a driver living in this file.
 
 BEGIN {
-    mnpkt = 0
-    mstarted = 0
     mesh_have_targets = 0
 
-    if (CONFIG_FILE != "") {
-        while ((getline cfgline < CONFIG_FILE) > 0) {
+    if (MESH_CONFIG_FILE != "") {
+        while ((getline cfgline < MESH_CONFIG_FILE) > 0) {
             sub(/#.*/, "", cfgline)
             gsub(/^[ \t]+|[ \t]+$/, "", cfgline)
             if (cfgline == "") continue
@@ -44,40 +41,11 @@ BEGIN {
             }
             # name: entries are BLE-only (see file header) -- ignored here.
         }
-        close(CONFIG_FILE)
+        close(MESH_CONFIG_FILE)
     }
 }
 
-/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
-    if (mesh_have_targets && mstarted && mnpkt > 0) process_mesh_packet()
-    mstarted = 1
-    mnpkt = 0
-    next
-}
-
-/^[ \t]*0x[0-9A-Fa-f]+:/ {
-    if (!mesh_have_targets || !mstarted) next
-    line = $0
-    sub(/^[ \t]*0x[0-9A-Fa-f]+:[ \t]*/, "", line)
-    n = split(line, toks, " ")
-    for (k = 1; k <= n; k++) {
-        tok = toks[k]
-        if (tok ~ /^[0-9A-Fa-f]+$/) {
-            tl = length(tok)
-            for (p = 1; p <= tl; p += 2) {
-                b = substr(tok, p, 2)
-                if (length(b) == 2) { mnpkt++; mpkt[mnpkt] = tolower(b) }
-            }
-        }
-    }
-    next
-}
-
-END {
-    if (mesh_have_targets && mstarted && mnpkt > 0) process_mesh_packet()
-}
-
-function process_mesh_packet(    itlen, dot11_start, b0, ftype, oui, full_mac, mac, matchkind, rssi) {
+function process_mesh_packet(    itlen, dot11_start, b0, ftype, oui, full_mac, mac, matchkind, rssi, out) {
     if (mnpkt < 4) return
     itlen = hex2dec(mpkt[3]) + hex2dec(mpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -97,6 +65,7 @@ function process_mesh_packet(    itlen, dot11_start, b0, ftype, oui, full_mac, m
 
     mac = mac_str_dot11(mpkt, dot11_start + 10)
     rssi = wifi_rssi(mpkt, itlen, mnpkt)
-    print "wifi_mesh|" mac "|" matchkind ((rssi != 127) ? "|rssi=" rssi : "")
+    out = (MESH_HITS_FILE != "") ? MESH_HITS_FILE : "/dev/stdout"
+    print "wifi_mesh|" mac "|" matchkind ((rssi != 127) ? "|rssi=" rssi : "") >> out
     fflush()
 }

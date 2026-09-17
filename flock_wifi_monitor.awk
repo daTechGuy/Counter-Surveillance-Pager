@@ -124,9 +124,9 @@
 # tcpdump, same -xx text format, same device.
 
 BEGIN {
-    fnpkt = 0
-    fstarted = 0
-
+    # fnpkt/fpkt[] are set per-packet by wifi_mgt_dispatch.awk's shared
+    # reassembly driver now (see that file), not initialized here -- this
+    # BEGIN block only sets up this detector's own static data below.
     split("70:c9:4e 3c:91:80 d8:f3:bc 80:30:49 b8:35:32 " \
           "14:5a:fc 74:4c:a1 08:3a:88 9c:2f:9d c0:35:32 " \
           "94:08:53 e4:aa:ea f4:6a:dd 24:b2:b9 " \
@@ -207,35 +207,13 @@ function flock_diag_throttle_ok(oui) {
     return (fdiag_count[oui] == 1 || fdiag_count[oui] % 10 == 0)
 }
 
-/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
-    if (fstarted && fnpkt > 0) process_flock_packet()
-    fstarted = 1
-    fnpkt = 0
-    next
-}
-
-/^[ \t]*0x[0-9A-Fa-f]+:/ {
-    if (!fstarted) next
-    line = $0
-    sub(/^[ \t]*0x[0-9A-Fa-f]+:[ \t]*/, "", line)
-    n = split(line, toks, " ")
-    for (k = 1; k <= n; k++) {
-        tok = toks[k]
-        if (tok ~ /^[0-9A-Fa-f]+$/) {
-            tl = length(tok)
-            for (p = 1; p <= tl; p += 2) {
-                b = substr(tok, p, 2)
-                if (length(b) == 2) { fnpkt++; fpkt[fnpkt] = tolower(b) }
-            }
-        }
-    }
-    next
-}
-
-END {
-    if (fstarted && fnpkt > 0) process_flock_packet()
-}
-
+# Packet reassembly (the summary-line/hex-line driver rules and the END
+# flush) used to live here -- see rid_wifi_monitor.awk's header comment
+# (same file group, same change) for why it's now in wifi_mgt_dispatch.awk
+# instead, calling process_flock_packet() (unchanged below). fnpkt/fstarted/
+# fpkt[] are still this function's own state, just written by that shared
+# driver now.
+#
 # Returns 1 if the first SSID IE (tag 0) found in [start,end] has length 0
 # (wildcard probe), 0 if found with nonzero length (directed probe, not
 # ours), -1 if not found before `end` (caller retries with an FCS-trimmed
@@ -300,8 +278,14 @@ function flock_sig_matches(arr, start, end,   sigA, sigB) {
 }
 
 function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
-                                   oui, mac, ies_start, r, matched, sig, rssi, rssi_sfx, msgtype) {
+                                   oui, mac, ies_start, r, matched, sig, rssi, rssi_sfx, msgtype, out) {
     if (fnpkt < 4) return
+    # Redirects every print below to $FLOCK_HITS_FILE instead of this
+    # process's shared stdout -- needed once this reader shares a process
+    # with the other "type mgt" detectors (see wifi_mgt_dispatch.awk).
+    # Falls back to /dev/stdout if unset, same reasoning as emit_hit()'s
+    # own RID_HITS_FILE in rid_common.awk.
+    out = (FLOCK_HITS_FILE != "") ? FLOCK_HITS_FILE : "/dev/stdout"
     itlen = hex2dec(fpkt[3]) + hex2dec(fpkt[4]) * 256
     dot11_start = 1 + itlen
     if (dot11_start < 1 || dot11_start + 24 - 1 > fnpkt) return   # not enough for a full mgmt header
@@ -344,7 +328,7 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
         msgtype = "mgmt_oui_match"
         if (stype == 8) msgtype = "beacon_oui_match"
         else if (stype == 5) msgtype = "probe_resp_oui_match"
-        print "wifi_flock|" mac "|" msgtype "|oui=" oui "|conf=medium|stype=" stype rssi_sfx
+        print "wifi_flock|" mac "|" msgtype "|oui=" oui "|conf=medium|stype=" stype rssi_sfx >> out
         fflush()
         return
     }
@@ -377,7 +361,7 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
         if (is_locally_admin_mac(fpkt[dot11_start + 10])) return
         if (flock_diag_throttle_ok(oui)) {
             mac = mac_str_dot11(fpkt, dot11_start + 10)
-            print "wifi_flock_diag|" mac "|oui=" oui
+            print "wifi_flock_diag|" mac "|oui=" oui >> out
             fflush()
         }
         return
@@ -395,13 +379,13 @@ function process_flock_packet(    itlen, dot11_start, b0, ftype, stype, \
     rssi_sfx = (rssi != 127) ? "|rssi=" rssi : ""
 
     if (matched) {
-        print "wifi_flock|" mac "|wildcard_probe_ie_sig|oui=" oui "|conf=high" rssi_sfx
+        print "wifi_flock|" mac "|wildcard_probe_ie_sig|oui=" oui "|conf=high" rssi_sfx >> out
     } else {
         sig = flock_build_ie_sig(fpkt, ies_start, fnpkt)
         if (sig == "" && fnpkt - 4 >= ies_start) sig = flock_build_ie_sig(fpkt, ies_start, fnpkt - 4)
         if (sig == "") sig = "unparseable"
         gsub(/\|/, ";", sig)   # keep "|" as our own field delimiter in the loot line
-        print "wifi_flock|" mac "|wildcard_probe_oui_only|oui=" oui "|conf=low|sig=" sig rssi_sfx
+        print "wifi_flock|" mac "|wildcard_probe_oui_only|oui=" oui "|conf=low|sig=" sig rssi_sfx >> out
     }
     fflush()
 }

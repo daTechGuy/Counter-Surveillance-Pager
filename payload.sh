@@ -349,16 +349,22 @@ FLOCK_BLE_HITS="$WORK_DIR/flock_ble_hits.log"
 GLASSES_BLE_HITS="$WORK_DIR/glasses_ble_hits.log"
 DEAUTH_HITS="$WORK_DIR/deauth_eviltwin_hits.log"
 touch "$BLE_HITS" "$WIFI_HITS" "$FLOCK_WIFI_HITS" "$FLOCK_ADDR1_HITS" "$MESH_WIFI_HITS" "$TRACKER_HITS" "$FLOCK_BLE_HITS" "$GLASSES_BLE_HITS" "$DEAUTH_HITS"
+# BLE_FIFO is now shared by all 4 BLE hcidump detectors (Drone RID/Rogue
+# Trackers/Flock BLE UUID/Smart Glasses), same as MGT_RAW_FIFO below is
+# shared by the WiFi ones -- TRACKER_FIFO/FLOCK_BLE_FIFO/GLASSES_BLE_FIFO
+# are gone, each of those detectors' own FIFO before that merge. See the
+# BLE pipeline's own comment, near where it starts, for the full story.
 BLE_FIFO="$WORK_DIR/ble_raw.fifo"
-WIFI_FIFO="$WORK_DIR/wifi_raw.fifo"
-FLOCK_WIFI_FIFO="$WORK_DIR/flock_wifi_raw.fifo"
 FLOCK_ADDR1_FIFO="$WORK_DIR/flock_addr1_raw.fifo"
-MESH_WIFI_FIFO="$WORK_DIR/mesh_wifi_raw.fifo"
-TRACKER_FIFO="$WORK_DIR/tracker_raw.fifo"
-FLOCK_BLE_FIFO="$WORK_DIR/flock_ble_raw.fifo"
-GLASSES_BLE_FIFO="$WORK_DIR/glasses_ble_raw.fifo"
-DEAUTH_FIFO="$WORK_DIR/deauth_raw.fifo"
-rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
+# Drone WiFi RID/Flock WiFi/Mesh-Detect WiFi/Deauth used to each get their
+# own FIFO here (WIFI_FIFO/FLOCK_WIFI_FIFO/MESH_WIFI_FIFO/DEAUTH_FIFO) --
+# removed once those four were merged into one shared "type mgt" capture
+# AND decode process reading directly from MGT_RAW_FIFO below (see that
+# pipeline's own comment, near where it starts, for the full story). No
+# `tee`/fan-out involved any more: one awk process now calls all four
+# detectors' own process_*_packet() functions directly per packet.
+MGT_RAW_FIFO="$WORK_DIR/mgt_raw.fifo"
+rm -f "$BLE_FIFO" "$FLOCK_ADDR1_FIFO"
 
 MESH_CONFIG_FILE="$SCRIPT_DIR/mesh_detect_targets.conf"
 TRACKER_ALLOWLIST_FILE="$SCRIPT_DIR/tracker_allowlist.conf"
@@ -438,39 +444,35 @@ ALERT_COOLDOWN=10   # seconds between repeat drone UI alerts for the same MAC (l
 
 HCIDUMP_PID=""
 BLE_MON_PID=""
-TCPDUMP_PID=""
-WIFI_MON_PID=""
-FLOCK_TCPDUMP_PID=""
-FLOCK_WIFI_MON_PID=""
+# MGT_TCPDUMP_PID/MGT_AWK_PID together are the one shared "type mgt"
+# capture+decode pair (Drone WiFi RID/Flock WiFi/Mesh-Detect WiFi/Deauth
+# all read from it now, in one merged awk process) -- see that pipeline's
+# own comment, near where it starts, for the full story. No separate
+# WIFI_MON_PID/FLOCK_WIFI_MON_PID/MESH_WIFI_MON_PID/DEAUTH_MON_PID anymore:
+# those were each detector's own awk reader PID before that merge: dead
+# weight now that there's nothing separate left to track.
+MGT_TCPDUMP_PID=""
+MGT_AWK_PID=""
 FLOCK_ADDR1_TCPDUMP_PID=""
 FLOCK_ADDR1_MON_PID=""
-MESH_TCPDUMP_PID=""
-MESH_WIFI_MON_PID=""
-TRACKER_HCIDUMP_PID=""
-TRACKER_MON_PID=""
-FLOCK_BLE_HCIDUMP_PID=""
-FLOCK_BLE_MON_PID=""
-GLASSES_BLE_HCIDUMP_PID=""
-GLASSES_BLE_MON_PID=""
-DEAUTH_TCPDUMP_PID=""
-DEAUTH_MON_PID=""
+# TRACKER_HCIDUMP_PID/TRACKER_MON_PID/FLOCK_BLE_HCIDUMP_PID/
+# FLOCK_BLE_MON_PID/GLASSES_BLE_HCIDUMP_PID/GLASSES_BLE_MON_PID are gone the
+# same way the WiFi side's per-detector PIDs are (see above): Drone RID
+# BLE/Rogue Trackers/Flock BLE UUID/Smart Glasses now share ONE hcidump +
+# ONE merged awk process, tracked by the existing HCIDUMP_PID/BLE_MON_PID
+# below -- see that pipeline's own comment, near where it starts.
 WIFI_HOP_PID=""
 DETECTION_PID=""
 WIFI_IFACE_CREATED=0
 
 cleanup() {
-    for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$TCPDUMP_PID" "$WIFI_MON_PID" \
-             "$FLOCK_TCPDUMP_PID" "$FLOCK_WIFI_MON_PID" \
+    for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$MGT_TCPDUMP_PID" "$MGT_AWK_PID" \
              "$FLOCK_ADDR1_TCPDUMP_PID" "$FLOCK_ADDR1_MON_PID" \
-             "$MESH_TCPDUMP_PID" "$MESH_WIFI_MON_PID" \
-             "$TRACKER_HCIDUMP_PID" "$TRACKER_MON_PID" \
-             "$FLOCK_BLE_HCIDUMP_PID" "$FLOCK_BLE_MON_PID" \
-             "$GLASSES_BLE_HCIDUMP_PID" "$GLASSES_BLE_MON_PID" \
-             "$DEAUTH_TCPDUMP_PID" "$DEAUTH_MON_PID" "$WIFI_HOP_PID" \
+             "$WIFI_HOP_PID" \
              "$DETECTION_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$WIFI_FIFO" "$FLOCK_WIFI_FIFO" "$FLOCK_ADDR1_FIFO" "$MESH_WIFI_FIFO" "$TRACKER_FIFO" "$FLOCK_BLE_FIFO" "$GLASSES_BLE_FIFO" "$DEAUTH_FIFO"
+    rm -f "$BLE_FIFO" "$FLOCK_ADDR1_FIFO" "$MGT_RAW_FIFO"
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -574,6 +576,10 @@ WANT_DEAUTH=1
 WANT_DRONE=1
 WANT_SKIMMER=1
 WANT_GLASSES=1
+# On by default, unlike Retail Beacons below -- a rogue Pineapple/pentest
+# device nearby is squarely this payload's own threat model (someone
+# running the same class of hardware against you), not ambient noise.
+WANT_PINEAPPLE=1
 # Off by default, unlike every WANT_* above -- this piggybacks entirely on
 # the Rogue BLE trackers' scan process (rogue_tracker_monitor.awk's iBeacon/
 # Eddystone-UID/Eddystone-URL branches, see that file's header), so it's
@@ -673,11 +679,50 @@ stealth_blink() {
 # the caller already writes the same text to its loot file, and the stats
 # screen reads from there. Keeping them at the call sites keeps those
 # reading as "alert, about this" rather than a bare buzz.
+#
+# UPDATE, confirmed live: "draws nothing" wasn't the whole story for LED
+# specifically. Live-tested with a standalone line/width test payload and a
+# controlled toggle-everything-off/on comparison: with every detector
+# disabled (background process calling neither this function nor
+# stealth_blink() at all), the foreground menu's WAIT_FOR_INPUT/LIST_PICKER
+# held rock solid, no flashing. Re-enabled, real detections firing this
+# function every few seconds reproduced the exact symptom this comment
+# already describes above -- meaning the platform's own hak5cmd `LED`
+# command, called from the backgrounded process, still contends with the
+# foreground's picker/input state despite its usage text, on this specific
+# hardware. Fixed the same way stealth_blink() already was: bypass hak5cmd's
+# LED entirely and write the sysfs brightness file directly. Reuses that
+# function's own already-confirmed-live path-discovery fix (a bare `ls
+# /sys/class/leds/*` prints a BusyBox header per match and breaks `head -1`
+# -- see stealth_blink()'s header for the full story); duplicated rather
+# than factored out since this is the only other call site and a shared
+# helper wasn't worth it for two lines.
+#
+# UPDATE 2, also confirmed live: fixing LED alone reduced the flashing but
+# did not eliminate it -- `RINGTONE`, the remaining hak5cmd call in this
+# function, is also implicated, not just an audio-subsystem command as
+# first assumed. Fixed the same way: bypass hak5cmd and drive the buzzer
+# directly. It's a real PWM device exposed through the LED sysfs class
+# alongside the visible LEDs above (`/sys/class/leds/buzzer/`, confirmed via
+# `device -> ../../../buzzer_pwm`), with its own `frequency` and `volume`
+# files in addition to `brightness` -- confirmed live to produce an audible
+# beep with frequency=2000 (Hz), volume=128, brightness 0->1->0. Vibrate
+# was never suspect (see stealth_blink() below, which already writes it
+# directly to sysfs, no hak5cmd involved) and stays as-is.
 stealth_alert() {
     if [ "$STEALTH_MODE" = "0" ]; then
-        LED RED
-        RINGTONE warning
-        LED OFF
+        local _led_path
+        _led_path=$(ls -d /sys/class/leds/*/ 2>/dev/null | head -1)
+        [ -n "$_led_path" ] && echo 1 > "${_led_path}brightness" 2>/dev/null
+        if [ -f /sys/class/leds/buzzer/brightness ]; then
+            echo 2000 > /sys/class/leds/buzzer/frequency 2>/dev/null
+            echo 128 > /sys/class/leds/buzzer/volume 2>/dev/null
+            echo 1 > /sys/class/leds/buzzer/brightness 2>/dev/null
+            sleep 0.3
+            echo 0 > /sys/class/leds/buzzer/brightness 2>/dev/null
+            echo 0 > /sys/class/leds/buzzer/volume 2>/dev/null
+        fi
+        [ -n "$_led_path" ] && echo 0 > "${_led_path}brightness" 2>/dev/null
     fi
     # Felt, not seen, and kept in STEALTH_MODE 1: a pulse is not visible or
     # audible to anyone else, unlike the LED and the ringtone.
@@ -698,6 +743,7 @@ detection_menu_item() {
         drone) val="$WANT_DRONE" ;;
         skimmer) val="$WANT_SKIMMER" ;;
         glasses) val="$WANT_GLASSES" ;;
+        pineapple) val="$WANT_PINEAPPLE" ;;
         retail_beacons) val="$WANT_RETAIL_BEACONS" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
@@ -729,6 +775,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item drone 'Drone Remote ID')" \
             "$(detection_menu_item skimmer 'BLE credit-card skimmers')" \
             "$(detection_menu_item glasses 'Smart glasses (Meta/Snap/Bose/etc.)')" \
+            "$(detection_menu_item pineapple 'Rogue Pineapple / pentest device')" \
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
@@ -742,6 +789,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Drone Remote ID") WANT_DRONE=$((1 - WANT_DRONE)) ;;
             *"BLE credit-card skimmers") WANT_SKIMMER=$((1 - WANT_SKIMMER)) ;;
             *"Smart glasses"*) WANT_GLASSES=$((1 - WANT_GLASSES)) ;;
+            *"Rogue Pineapple"*) WANT_PINEAPPLE=$((1 - WANT_PINEAPPLE)) ;;
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
@@ -758,6 +806,46 @@ AWK=$(command -v awk)
 HCIDUMP=$(command -v hcidump)
 TCPDUMP=$(command -v tcpdump)
 IW=$(command -v iw)
+
+# Shadows the platform's own LOG (a PATH-found external command, symlink to
+# hak5cmd -- see show_dash_screen()'s header) with a same-named bash
+# function truncating the message to a safe width before ever reaching it.
+#
+# The payload-log screen's own max_chars is 50 -- already documented and
+# verified two screens down, where the ASCII banner was deliberately kept
+# under it (see that comment, just above `LOG cyan ' _____ ___ ___'`). That
+# same 50-char limit was never applied to the ~40 capability-detection
+# messages below, several running 60-157 characters -- confirmed via a
+# standalone line/width test payload that overflowing a line doesn't just
+# wrap oddly, it leaves the screen's render buffer in a state that
+# resurfaces later as unrelated-looking flashing/garbled screens, reported
+# from the field as exactly that: fragments of an old screen flashing back
+# during normal menu use, long after the line that actually overflowed had
+# scrolled off. Every one of those messages fires in a burst on every
+# single launch, right before the menu loop even starts.
+#
+# A function of the same name wins over the PATH-found command in bash's
+# lookup order, so this covers all ~90 existing `LOG "text"` / `LOG colour
+# "text"` call sites with no changes anywhere else in the file, and covers
+# any added later automatically. `command LOG` inside it explicitly bypasses
+# this function to reach the real one -- that builtin exists precisely for
+# wrapping a command under its own name without infinite recursion.
+LOG_MAX_WIDTH=49
+LOG() {
+    if [ "$#" -eq 0 ]; then
+        command LOG
+        return
+    fi
+    local last="${@: -1}"
+    if [ "${#last}" -gt "$LOG_MAX_WIDTH" ]; then
+        last="${last:0:$((LOG_MAX_WIDTH - 1))}…"
+    fi
+    if [ "$#" -eq 1 ]; then
+        command LOG "$last"
+    else
+        command LOG "$1" "$last"
+    fi
+}
 
 BLE_RID_OK=0
 WIFI_RID_OK=0
@@ -999,91 +1087,54 @@ fi
 # pipe, only the last stage's PID is available via $!, so the capture tool
 # could linger running (harmlessly, but pointlessly) until its next packet.
 # ---------------------------------------------------------------------------
-if [ "$BLE_RID_OK" = "1" ]; then
+# Shared BLE capture AND decode -- one hcidump feeding one merged awk
+# process instead of up to 4 of each (Drone Remote ID BLE, Rogue Trackers,
+# Flock BLE UUID, Smart Glasses used to each run their own `hcidump -i hci0
+# --raw` AND their own independent packet-reassembly pass over the
+# identical HCI event stream). Same change, same reasoning, as the WiFi
+# "type mgt" consolidation below -- see that pipeline's own comment for the
+# fuller story (confirmed live this session: redundant capture+decode
+# across several simultaneous detectors drove system load high enough on
+# this embedded MIPS hardware to glitch the foreground menu). See
+# ble_dispatch.awk's own header for the full per-file breakdown of what
+# changed and why it was safe to merge (each detector already used
+# uniquely-prefixed state/array/function names).
+#
+# Each detector's hits still land in its own separate loot file
+# (BLE_HITS/TRACKER_HITS/FLOCK_BLE_HITS/GLASSES_BLE_HITS) -- only how those
+# files get WRITTEN changed, same as the WiFi side: an explicit `>> file`
+# inside each process_*_packet() function now that several share one
+# process's stdout, instead of a shell-level `>>` per process.
+#
+# Reuses BLE_FIFO/HCIDUMP_PID/BLE_MON_PID directly rather than introducing
+# new names -- those already meant "the hcidump capture" and "its awk
+# reader" for rid_ble_monitor.awk alone; they mean the same thing for the
+# shared pipeline now, just with more readers behind that one awk process.
+if [ "$BLE_RID_OK" = "1" ] || [ "$TRACKER_BLE_OK" = "1" ] || [ "$FLOCK_BLE_UUID_OK" = "1" ] || [ "$GLASSES_BLE_OK" = "1" ]; then
     mkfifo "$BLE_FIFO"
     "$HCIDUMP" -i hci0 --raw > "$BLE_FIFO" 2>"$WORK_DIR/hcidump.log" &
     HCIDUMP_PID=$!
-    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/rid_ble_monitor.awk" \
-        < "$BLE_FIFO" >> "$BLE_HITS" 2>"$WORK_DIR/ble_monitor.log" &
+    "$AWK" -v WANT_RID_BLE="$BLE_RID_OK" -v WANT_TRACKER="$TRACKER_BLE_OK" \
+        -v WANT_FLOCK_BLE="$FLOCK_BLE_UUID_OK" -v WANT_GLASSES="$GLASSES_BLE_OK" \
+        -v RID_HITS_FILE="$BLE_HITS" -v TRACKER_HITS_FILE="$TRACKER_HITS" \
+        -v FLOCK_BLE_HITS_FILE="$FLOCK_BLE_HITS" -v GLASSES_HITS_FILE="$GLASSES_BLE_HITS" \
+        -f "$SCRIPT_DIR/rid_common.awk" \
+        -f "$SCRIPT_DIR/rid_ble_monitor.awk" -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" \
+        -f "$SCRIPT_DIR/flock_ble_monitor.awk" -f "$SCRIPT_DIR/glasses_ble_monitor.awk" \
+        -f "$SCRIPT_DIR/ble_dispatch.awk" \
+        < "$BLE_FIFO" 2>"$WORK_DIR/ble_dispatch.log" &
     BLE_MON_PID=$!
-fi
-
-# Own hcidump process, same adapter, same reasoning as the WiFi detectors'
-# own tcpdump processes: rid_ble_monitor.awk's rules end in `next`, so this
-# isn't a 3rd -f on that pipeline. HCI monitor sockets support multiple
-# simultaneous readers, so this is a second passive listener, not a second
-# radio -- and like the drone BLE reader, it only sees advertisements during
-# whatever scan window Flock-You's own hcitool lescan cycle has open (hcidump
-# doesn't itself enable scanning).
-if [ "$TRACKER_BLE_OK" = "1" ]; then
-    mkfifo "$TRACKER_FIFO"
-    "$HCIDUMP" -i hci0 --raw > "$TRACKER_FIFO" 2>"$WORK_DIR/tracker_hcidump.log" &
-    TRACKER_HCIDUMP_PID=$!
-    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/rogue_tracker_monitor.awk" \
-        < "$TRACKER_FIFO" >> "$TRACKER_HITS" 2>"$WORK_DIR/tracker_monitor.log" &
-    TRACKER_MON_PID=$!
-fi
-
-# Own hcidump process, same adapter/reasoning as the tracker BLE reader just
-# above -- see flock_ble_monitor.awk's header for the UNVERIFIED-signature
-# caveat this detector carries.
-if [ "$FLOCK_BLE_UUID_OK" = "1" ]; then
-    mkfifo "$FLOCK_BLE_FIFO"
-    "$HCIDUMP" -i hci0 --raw > "$FLOCK_BLE_FIFO" 2>"$WORK_DIR/flock_ble_hcidump.log" &
-    FLOCK_BLE_HCIDUMP_PID=$!
-    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/flock_ble_monitor.awk" \
-        < "$FLOCK_BLE_FIFO" >> "$FLOCK_BLE_HITS" 2>"$WORK_DIR/flock_ble_monitor.log" &
-    FLOCK_BLE_MON_PID=$!
-fi
-
-# Own hcidump process, same adapter/reasoning as the readers just above --
-# see glasses_ble_monitor.awk's header for the UNVERIFIED-signature caveat
-# this detector carries.
-if [ "$GLASSES_BLE_OK" = "1" ]; then
-    mkfifo "$GLASSES_BLE_FIFO"
-    "$HCIDUMP" -i hci0 --raw > "$GLASSES_BLE_FIFO" 2>"$WORK_DIR/glasses_ble_hcidump.log" &
-    GLASSES_BLE_HCIDUMP_PID=$!
-    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/glasses_ble_monitor.awk" \
-        < "$GLASSES_BLE_FIFO" >> "$GLASSES_BLE_HITS" 2>"$WORK_DIR/glasses_ble_monitor.log" &
-    GLASSES_BLE_MON_PID=$!
-fi
-
-if [ "$WIFI_RID_OK" = "1" ]; then
-    mkfifo "$WIFI_FIFO"
-    # -l: line-buffer tcpdump's own text output so packets reach the awk
-    #     consumer promptly instead of sitting in stdio's pipe-buffering.
-    # "type mgt": only beacon/action/etc frames -- we never look at data or
-    #     control frames, so filtering them out here saves CPU on both ends.
-    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$WIFI_FIFO" 2>"$WORK_DIR/tcpdump.log" &
-    TCPDUMP_PID=$!
-    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/rid_wifi_monitor.awk" \
-        < "$WIFI_FIFO" >> "$WIFI_HITS" 2>"$WORK_DIR/wifi_monitor.log" &
-    WIFI_MON_PID=$!
-fi
-
-# Own tcpdump process, same interface, same "type mgt" filter as the drone
-# WiFi pipeline above -- deliberately not a 3rd -f on that pipeline's awk
-# invocation. See flock_wifi_monitor.awk's header for why: rid_wifi_monitor.awk's
-# rules all end in `next`, which would silently block any rule appended
-# after it in the same merged awk program. Linux packet sockets support
-# multiple simultaneous readers on one interface, so this is a second
-# (identically filtered, low-rate) capture process, not a second radio.
-if [ "$FLOCK_WIFI_OK" = "1" ]; then
-    mkfifo "$FLOCK_WIFI_FIFO"
-    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$FLOCK_WIFI_FIFO" 2>"$WORK_DIR/flock_tcpdump.log" &
-    FLOCK_TCPDUMP_PID=$!
-    "$AWK" -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/flock_wifi_monitor.awk" \
-        < "$FLOCK_WIFI_FIFO" >> "$FLOCK_WIFI_HITS" 2>"$WORK_DIR/flock_wifi_monitor.log" &
-    FLOCK_WIFI_MON_PID=$!
 fi
 
 # Own tcpdump process, "type data" instead of "type mgt" -- see
 # flock_wifi_addr1_monitor.awk's header for the technique (addr1/receiver-
 # address OUI match on Data frames, catches a camera that never transmits
 # anything itself) and its UNVERIFIED status. Gated on the same
-# FLOCK_WIFI_OK as the main Flock WiFi detector above -- this is another
+# FLOCK_WIFI_OK as the main Flock WiFi detector below -- this is another
 # signal for the same "is a Flock camera nearby" question, not a separate
-# menu toggle.
+# menu toggle. Stays its own separate tcpdump+awk pair: genuinely different
+# traffic (data frames, not management), so there's nothing to consolidate
+# it with.
 if [ "$FLOCK_WIFI_OK" = "1" ] && [ -f "$SCRIPT_DIR/flock_wifi_addr1_monitor.awk" ]; then
     mkfifo "$FLOCK_ADDR1_FIFO"
     "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type data > "$FLOCK_ADDR1_FIFO" 2>"$WORK_DIR/flock_addr1_tcpdump.log" &
@@ -1093,28 +1144,55 @@ if [ "$FLOCK_WIFI_OK" = "1" ] && [ -f "$SCRIPT_DIR/flock_wifi_addr1_monitor.awk"
     FLOCK_ADDR1_MON_PID=$!
 fi
 
-# Same reasoning as the Flock WiFi pipeline above: its own tcpdump process
-# rather than a 4th -f alongside rid_wifi_monitor.awk / flock_wifi_monitor.awk.
-if [ "$MESH_WIFI_OK" = "1" ]; then
-    mkfifo "$MESH_WIFI_FIFO"
-    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$MESH_WIFI_FIFO" 2>"$WORK_DIR/mesh_tcpdump.log" &
-    MESH_TCPDUMP_PID=$!
-    "$AWK" -v CONFIG_FILE="$MESH_CONFIG_FILE" \
-        -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/mesh_wifi_monitor.awk" \
-        < "$MESH_WIFI_FIFO" >> "$MESH_WIFI_HITS" 2>"$WORK_DIR/mesh_wifi_monitor.log" &
-    MESH_WIFI_MON_PID=$!
-fi
-
-# Same reasoning again: its own tcpdump process, 5th reader total on this
-# one radio.
-if [ "$DEAUTH_OK" = "1" ]; then
-    mkfifo "$DEAUTH_FIFO"
-    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$DEAUTH_FIFO" 2>"$WORK_DIR/deauth_tcpdump.log" &
-    DEAUTH_TCPDUMP_PID=$!
-    "$AWK" -v CONFIG_FILE="$TRUSTED_NETWORKS_FILE" \
-        -f "$SCRIPT_DIR/rid_common.awk" -f "$SCRIPT_DIR/deauth_eviltwin_monitor.awk" \
-        < "$DEAUTH_FIFO" >> "$DEAUTH_HITS" 2>"$WORK_DIR/deauth_monitor.log" &
-    DEAUTH_MON_PID=$!
+# Shared "type mgt" capture AND decode -- one tcpdump feeding one awk
+# process instead of up to 4 of each (Drone WiFi RID, Flock WiFi, Mesh-
+# Detect WiFi, and Deauth used to each run their own tcpdump AND their own
+# independent packet-reassembly pass over the identical management-frame
+# stream off wlan1mon). Confirmed live this session: with several WiFi
+# detectors enabled together, system load on this embedded MIPS hardware
+# climbed into the teens and the foreground menu's WAIT_FOR_INPUT/
+# LIST_PICKER started flashing/glitching under that contention -- isolated
+# by testing every detector alone (all 8 clean individually) and by
+# combination (flashing scaled with detector COUNT, not any specific one).
+# An earlier pass here consolidated just the tcpdump capture (`tee`'d to 4
+# FIFOs, one independent reassembly pass still per awk process); load
+# stayed high and flashing persisted, tracing the real cost to the awk
+# DECODE work itself -- 8-9 parallel awk processes actively decoding real
+# traffic, not the packet capture layer. This consolidates that too: one
+# reassembly pass, in-process, calling each detector's own
+# process_*_packet() function directly. See wifi_mgt_dispatch.awk's own
+# header for the full per-file breakdown of what changed and why it was
+# safe to merge (each detector already used uniquely-prefixed state/array/
+# function names -- there was nothing here that collided).
+#
+# Each detector's hits still land in its own separate loot file
+# (WIFI_HITS/FLOCK_WIFI_HITS/MESH_WIFI_HITS/DEAUTH_HITS) -- the bash side's
+# file-reading/draining logic further down is unchanged; only how those
+# files get WRITTEN changed, from a shell-level `>>` per process to an
+# explicit `>> file` inside each process_*_packet() function now that
+# several share one process's stdout. MESH_CONFIG_FILE/DEAUTH_CONFIG_FILE
+# replace the plain CONFIG_FILE each used before (harmless as separate
+# processes; a real collision once merged, since awk `-v` names are global
+# to the whole merged program and both need a config file).
+if [ "$WIFI_RID_OK" = "1" ] || [ "$FLOCK_WIFI_OK" = "1" ] || [ "$MESH_WIFI_OK" = "1" ] || [ "$DEAUTH_OK" = "1" ]; then
+    mkfifo "$MGT_RAW_FIFO"
+    # -l: line-buffer tcpdump's own text output so packets reach the awk
+    #     consumer promptly instead of sitting in stdio's pipe-buffering.
+    # "type mgt": only beacon/action/etc frames -- we never look at data or
+    #     control frames, so filtering them out here saves CPU on both ends.
+    "$TCPDUMP" -i "$WIFI_IFACE" -n -l -xx type mgt > "$MGT_RAW_FIFO" 2>"$WORK_DIR/tcpdump.log" &
+    MGT_TCPDUMP_PID=$!
+    "$AWK" -v WANT_WIFI_RID="$WIFI_RID_OK" -v WANT_FLOCK_WIFI="$FLOCK_WIFI_OK" \
+        -v WANT_MESH_WIFI="$MESH_WIFI_OK" -v WANT_DEAUTH="$DEAUTH_OK" \
+        -v RID_HITS_FILE="$WIFI_HITS" -v FLOCK_HITS_FILE="$FLOCK_WIFI_HITS" \
+        -v MESH_HITS_FILE="$MESH_WIFI_HITS" -v DEAUTH_HITS_FILE="$DEAUTH_HITS" \
+        -v MESH_CONFIG_FILE="$MESH_CONFIG_FILE" -v DEAUTH_CONFIG_FILE="$TRUSTED_NETWORKS_FILE" \
+        -f "$SCRIPT_DIR/rid_common.awk" \
+        -f "$SCRIPT_DIR/rid_wifi_monitor.awk" -f "$SCRIPT_DIR/flock_wifi_monitor.awk" \
+        -f "$SCRIPT_DIR/mesh_wifi_monitor.awk" -f "$SCRIPT_DIR/deauth_eviltwin_monitor.awk" \
+        -f "$SCRIPT_DIR/wifi_mgt_dispatch.awk" \
+        < "$MGT_RAW_FIFO" 2>"$WORK_DIR/wifi_mgt_dispatch.log" &
+    MGT_AWK_PID=$!
 fi
 
 LOG "Color key:"
@@ -1184,7 +1262,7 @@ declare -A CAT_COUNT
 # Order the dashboard lists categories in. Kept as a space-separated
 # string rather than an associative array so the display order is fixed
 # and readable; the panel only prints the ones actually enabled.
-DASH_CATS="flock drone tracker mesh deauth skimmer glasses"
+DASH_CATS="flock drone tracker mesh deauth skimmer glasses pineapple"
 
 dash_cat_label() {
     case "$1" in
@@ -1195,6 +1273,7 @@ dash_cat_label() {
         deauth)  echo "Deauth" ;;
         skimmer) echo "Skimmer" ;;
         glasses) echo "Glasses" ;;
+        pineapple) echo "Pineapple" ;;
     esac
 }
 
@@ -1215,6 +1294,9 @@ dash_cat_live() {
         # Skimmer matching runs over the shared hcitool lescan dump rather
         # than a reader of its own, so it is up whenever that cycle is.
         skimmer) [ "$BTCLASSIC_OK" = "1" ] && echo 1 ;;
+        # Same reasoning as skimmer: pineapple_match() runs over the shared
+        # BT Classic scan and hcitool lescan dump, no reader of its own.
+        pineapple) [ "$BTCLASSIC_OK" = "1" ] && echo 1 ;;
     esac
 }
 
@@ -1230,10 +1312,35 @@ dash_cat_enabled() {
         deauth)  [ "$WANT_DEAUTH" = "1" ] ;;
         skimmer) [ "$WANT_SKIMMER" = "1" ] ;;
         glasses) [ "$WANT_GLASSES" = "1" ] ;;
+        pineapple) [ "$WANT_PINEAPPLE" = "1" ] ;;
         *)       false ;;
     esac
 }
 
+# One compact "label status count" slot for a detector, e.g. "Flock     run 3"
+# -- 17 characters fixed width, two of these plus a separating space (35
+# chars) comfortably fits the display's own hard ~50-char line limit (see
+# LOG_MAX_WIDTH's header), which is what makes packing two per line safe
+# rather than a guess. Labels over 9 characters truncate (the "10.9" in
+# %-10.9s: pad to 10, but never take more than 9 of the source) rather than
+# wrap or push the second slot off-screen -- only "BT Classic" is affected,
+# reading as "BT Classi" here; the truncate-to-9/pad-to-10 split (not just
+# %-9.9s) is deliberate so even a fully-9-character label like "Pineapple"
+# still gets one trailing space before the next field, instead of running
+# straight into "run"/"off" with nothing between them.
+dash_cat_entry() {
+    local cat="$1" n label status
+    n=${CAT_COUNT[$cat]:-0}
+    label=$(dash_cat_label "$cat")
+    if ! dash_cat_enabled "$cat"; then
+        status="off"; n="-"
+    elif [ "$(dash_cat_live "$cat")" = "1" ]; then
+        status="run"
+    else
+        status="N/A"; n="-"
+    fi
+    printf '%-10.9s%-4s%-3s' "$label" "$status" "$n"
+}
 
 # The one-line "how is this rig configured right now" strip under the
 # title: GPS fix if there is one, and stealth state, since both change
@@ -1271,7 +1378,7 @@ dash_rule() {
 # small write to tmpfs, and crucially NOTHING to the screen -- the screen
 # is only ever drawn by show_dash_screen(), on LEFT.
 write_dash_state() {
-    local up_s up_h up_m cat tag n row i entry txt gps stealth
+    local up_s up_h up_m cat tag n row i entry txt gps stealth pending btc
     local -a out=()
     up_s=$(( $(date +%s) - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
@@ -1295,26 +1402,37 @@ write_dash_state() {
     fi
 
     _o magenta "$(dash_rule 'Detections')"
-    # One row per detector: readable name, whether it is actually running,
-    # and its count. "off" means you did not select it; "N/A" means you did
-    # but it could not start (missing radio or tool), which is the case
-    # worth seeing in the field and was previously only on a second screen.
+    # Two detectors per line instead of one -- cuts this section from 9
+    # rows to 5. "off" means you did not select it; "N/A" means you did but
+    # it could not start (missing radio or tool), which is the case worth
+    # seeing in the field and was previously only on a second screen.
+    # dash_cat_entry() builds one fixed-width slot; paired here two at a
+    # time via $pending, flushed as a combined line once the second slot of
+    # a pair is ready.
+    pending=""
     for cat in $DASH_CATS; do
-        n=${CAT_COUNT[$cat]:-0}
-        if ! dash_cat_enabled "$cat"; then
-            _o "" "$(printf '%-11s%-6s%s' "$(dash_cat_label "$cat")" "off" "-")"
-        elif [ "$(dash_cat_live "$cat")" = "1" ]; then
-            _o "" "$(printf '%-11s%-6s%s' "$(dash_cat_label "$cat")" "run" "$n")"
+        if [ -z "$pending" ]; then
+            pending=$(dash_cat_entry "$cat")
         else
-            _o "" "$(printf '%-11s%-6s%s' "$(dash_cat_label "$cat")" "N/A" "-")"
+            _o "" "$pending $(dash_cat_entry "$cat")"
+            pending=""
         fi
     done
     # No WANT_ toggle of its own -- it rides the BLE cycle whenever hcitool
-    # is present, so it reports availability only.
+    # is present, so it isn't in DASH_CATS and doesn't go through
+    # dash_cat_entry(); folded in as one more slot here instead of always
+    # getting its own trailing line. DASH_CATS has an even count (8), so
+    # $pending is always empty going into this -- BT Classic lands alone on
+    # the last line every time, not paired with a leftover from above.
     if [ "$BTCLASSIC_OK" = "1" ]; then
-        _o "" "$(printf '%-11s%-6s%s' "BT Classic" "run" "")"
+        btc="$(printf '%-10.9s%-4s%-3s' "BT Classic" "run" "")"
     else
-        _o "" "$(printf '%-11s%-6s%s' "BT Classic" "N/A" "-")"
+        btc="$(printf '%-10.9s%-4s%-3s' "BT Classic" "N/A" "-")"
+    fi
+    if [ -z "$pending" ]; then
+        _o "" "$btc"
+    else
+        _o "" "$pending $btc"
     fi
 
     # Written whole then moved into place, so the watcher can never read a
@@ -1518,6 +1636,44 @@ flock_ble_match() {
 # hex). Any ONE match (OUI, name, or a valid embedded date) is enough to
 # flag, matching upstream. Echoes a short reason string ("oui" / "name:x" /
 # "date:YYYY-MM-DD") for the first match, or nothing.
+
+# Checks one "MAC NAME" BT scan result (Classic or BLE, same as
+# ble_skimmer_match() above) against Hak5's own registered OUI and the
+# generic Bluetooth names its stock/community firmware advertises under --
+# ported from cncartistsec/BluePine-WiFi-Pineapple-Pager's
+# check_bt_pineapps(). Matches this payload's own threat model directly:
+# someone else running a Pineapple/pentest rig against you is exactly what
+# a counter-surveillance tool should flag, the same way a rogue tracker or
+# an evil-twin AP is flagged.
+#
+# 00:13:37 is Hak5 LLC's IEEE-registered OUI -- confirmed as the exact
+# prefix this device's own radios carry (eth0/br-lan/wlan0mon all show
+# 00:13:37:xx:xx:xx locally). This only ever matches an OTHER device's
+# advertisement, never this one's own: hcitool scan/lescan report
+# addresses they hear FROM other devices, not the local scanning
+# adapter's own address, so there is nothing to exclude here.
+#
+# Name match is "pine"/"pager" (case-insensitive) -- narrower than
+# upstream's own check_bt_pineapps(), which also matches "bluez". That
+# third arm is dropped here: "bluez" is the default Bluetooth stack name
+# on essentially any stock Linux BT adapter, not something specific to
+# Hak5 hardware, so on its own it would flag ordinary laptops/phones/IoT
+# devices broadcasting BlueZ's own generic default rather than anything
+# resembling a Pineapple. "pine"/"pager" are still broad (a real product
+# name containing either would also match) but at least point at this
+# specific hardware family; the OUI match above is the strong signal
+# regardless, and the name match exists only to catch a Pineapple running
+# non-default/USB Bluetooth hardware whose adapter MAC won't carry the
+# 00:13:37 prefix at all.
+pineapple_match() {
+    local mac="$1" name="$2"
+    local mac_lc="${mac,,}"
+    [ "${mac_lc:0:8}" = "00:13:37" ] && { echo "oui"; return; }
+    case "${name,,}" in
+        *pine*|*pager*) echo "name:$name"; return ;;
+    esac
+}
+
 ble_skimmer_match() {
     local mac="$1" name="$2"
     local mac_lc="${mac,,}"
@@ -2015,6 +2171,79 @@ get_gps_fix() {
     echo "$lat,$lon"
 }
 
+# Sets GPS_FIX/GPS_TAG from a fresh get_gps_fix() call. GPS_TAG is what
+# every hit logged appends to its line (" | gps=LAT,LON", or nothing
+# without a fix).
+#
+# Called twice per detection_loop tick, not once: that loop blocks for
+# ~19s across two scan windows (7s BT Classic + 12s BLE lescan), and a
+# single fix taken at the top used to tag every hit from BOTH windows.
+# Moving at 60mph, a hit logged near the end of the BLE window was
+# carrying a position from up to ~19s (and the loop's own trailing sleep 3
+# from the PREVIOUS tick pushes worst case toward ~22s) earlier -- upwards
+# of 600m of drift on the loot file's own coordinates. The second call
+# sits right after the BLE window closes and before any of its results
+# are processed, so the larger window's hits get a fix taken close to
+# when they actually happened rather than one taken up to 19s before them.
+# Still not per-hit precision -- GPS_GET itself costs another ~2-3s each
+# call, so tagging every single hit individually would meaningfully slow
+# the loop for marginal gain over two calls -- this halves the worst-case
+# error, it doesn't eliminate it.
+refresh_gps_tag() {
+    GPS_FIX=$(get_gps_fix)
+    GPS_TAG=""
+    [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
+}
+
+# Read-only GPS diagnostics for the menu's GPS Status screen below -- ported
+# from this project's own sibling payload, alpr-gps-alert/payload.sh (whose
+# header explains the three independent things that have to line up: gpsd
+# running, the configured device path actually present, and a fix). Kept
+# read-only here deliberately, same stance as that file: GPS is device
+# configuration, done in Settings > GPS in the Pager UI, not this payload's
+# job to change -- only to report accurately, since GPS_GET's "0 0 0 0" is
+# indistinguishable between "gpsd isn't running" and "cold receiver, no
+# lock yet" without checking gpsd itself.
+gpsd_running() {
+    # NOT `pgrep -x gpsd` -- BusyBox pgrep's -x matches the whole command
+    # line, not the process name, so it false-negatives on a running gpsd.
+    # See alpr-gps-alert/payload.sh's gpsd_running() for the confirmed-live
+    # detail (ps showed gpsd running, `pgrep -x gpsd` still said no match).
+    pgrep -f "/usr/sbin/gpsd" >/dev/null 2>&1
+}
+gps_device_path()  { uci get gpsd.core.device 2>/dev/null; }
+gps_device_speed() { uci get gpsd.core.speed 2>/dev/null; }
+
+# Menu leaf screen: gpsd process state, configured device path (present or
+# missing on disk), baud, and a fresh fix via get_gps_fix() -- called
+# directly here rather than through detection_loop's GPS_FIX, since this
+# runs in the foreground menu process and that variable only exists in the
+# backgrounded one (same reason show_menu_banner() reads $DASH_STATE_FILE
+# instead of touching GPS_FIX directly -- see menu_status_line()'s header).
+# do_bookmark() already calls get_gps_fix() fresh from this same foreground
+# process, so this isn't a new pattern.
+screen_gps() {
+    local dev fix
+    LOG magenta "$(dash_rule 'GPS Status')"
+    if gpsd_running; then LOG green "gpsd: running"; else LOG red "gpsd: NOT RUNNING"; fi
+    dev=$(gps_device_path)
+    if [ -z "$dev" ]; then
+        LOG red "Device: not configured"
+    elif [ -e "$dev" ]; then
+        LOG green "Device: OK ($(basename "$dev"))"
+    else
+        LOG red "Device: MISSING ($(basename "$dev"))"
+    fi
+    LOG cyan "Baud: $(gps_device_speed)"
+    fix=$(get_gps_fix)
+    if [ -n "$fix" ]; then
+        LOG green "Fix: $fix"
+    else
+        LOG yellow "No fix yet (cold start can take 15-30m)"
+    fi
+    LOG magenta "$(dash_rule 'GPS Status')"
+}
+
 # Manual "flag this moment for later analysis" -- a menu action rather
 # than a button watcher. A background process parked in WAIT_FOR_INPUT
 # would compete with the foreground menu for the D-pad (only one reader
@@ -2057,12 +2286,9 @@ do_bookmark() {
 # interface feels settled and the old always-on log did not.
 detection_loop() {
 while true; do
-    # Refreshed once per tick; GPS_TAG is what every hit logged this tick
-    # appends to its line (" | gps=LAT,LON", or nothing without a fix) --
-    # see get_gps_fix() above.
-    GPS_FIX=$(get_gps_fix)
-    GPS_TAG=""
-    [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
+    # See refresh_gps_tag()'s own header (defined above, next to
+    # get_gps_fix()) for why this is called twice per tick instead of once.
+    refresh_gps_tag
 
 
     load_tracker_snooze
@@ -2075,7 +2301,7 @@ while true; do
     # is wanted -- the loop's own `sleep 3` at the bottom still paces it, so
     # this doesn't turn into a busy-loop, it just iterates faster and spends
     # that time draining WiFi-side hits instead.
-    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ] || [ "$WANT_SKIMMER" = "1" ]; then
+    if [ "$WANT_FLOCK" = "1" ] || [ "$WANT_MESH" = "1" ] || [ "$WANT_TRACKER" = "1" ] || [ "$WANT_DRONE" = "1" ] || [ "$WANT_SKIMMER" = "1" ] || [ "$WANT_PINEAPPLE" = "1" ]; then
     # --- Bluetooth Classic inquiry -------------------------------------
     # Everything else on the Bluetooth side here is BLE: hcitool lescan and
     # the hcidump readers that piggyback on it only ever see advertising
@@ -2132,6 +2358,9 @@ while true; do
             if [ -z "$CAT" ] && [ "$WANT_SKIMMER" = "1" ]; then
                 MATCH=$(ble_skimmer_match "$MAC" "$NAME"); [ -n "$MATCH" ] && CAT=skimmer
             fi
+            if [ -z "$CAT" ] && [ "$WANT_PINEAPPLE" = "1" ]; then
+                MATCH=$(pineapple_match "$MAC" "$NAME"); [ -n "$MATCH" ] && CAT=pineapple
+            fi
             [ -z "$CAT" ] && continue
 
             ENTRY="DECT: $CURRENT_TIME | $MAC | ${NAME:-(no name)} (BT Classic, $MATCH)$GPS_TAG"
@@ -2146,11 +2375,26 @@ while true; do
     hciconfig hci0 down 2>>"$LOG_FILE"
     hciconfig hci0 reset 2>>"$LOG_FILE"
     hciconfig hci0 up 2>>"$LOG_FILE"
+    # `timeout 18` is a dead-man's-switch, not the intended scan length: the
+    # real stop signal is `kill $PID` below, at 12s. The 6s of headroom
+    # between them exists so hcitool still gets killed (by its own timeout,
+    # SIGTERM) if `kill $PID` ever fails to land -- a wedged process or a
+    # PID that already exited -- rather than running unbounded and eating
+    # into the next tick's BT Classic window. Left at upstream's original
+    # value (see the "unmodified from" note above) rather than trimmed
+    # closer to 12s, since this hasn't been re-verified live and shortening
+    # a safety margin on unverified grounds is the wrong direction to guess.
     timeout 18 hcitool lescan --duplicates > /tmp/hci_scan.txt 2>>"$LOG_FILE" &
     PID=$!
     sleep 12
     kill $PID 2>/dev/null
     wait $PID 2>/dev/null
+    # Second fix of this tick -- see refresh_gps_tag()'s header for why.
+    # Everything below reading /tmp/hci_scan.txt (Flock/Mesh/Skimmer/
+    # Pineapple BLE) was captured during the 12s window that just closed,
+    # so this is a closer-to-the-fact position than the one taken at the
+    # top of the tick, before BT Classic's own 7s ran.
+    refresh_gps_tag
     if [ "$WANT_FLOCK" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
         while read -r full_line; do
             MAC=$(echo "$full_line" | awk '{print $1}')
@@ -2215,7 +2459,27 @@ while true; do
             SEEN_STRONG="$SEEN_STRONG $MAC BLE_SKIMMER"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
-    fi   # closes the WANT_FLOCK/WANT_MESH/WANT_TRACKER/WANT_DRONE/WANT_SKIMMER BLE-scan gate above
+
+    # --- Rogue Pineapple BLE scan: reuse the same hcitool lescan dump ---
+    # --- above, checked against pineapple_match() instead of Flock/Mesh/ ---
+    # --- Skimmer names -----------------------------------------------------
+    if [ "$WANT_PINEAPPLE" = "1" ] && [ -s /tmp/hci_scan.txt ]; then
+        while read -r full_line; do
+            MAC=$(echo "$full_line" | awk '{print $1}')
+            NAME=$(echo "$full_line" | cut -d' ' -f2-)
+            [ -z "$MAC" ] && continue
+            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BLE_PINEAPPLE"; then continue; fi
+            MATCH=$(pineapple_match "$MAC" "$NAME")
+            [ -z "$MATCH" ] && continue
+            CURRENT_TIME=$(date '+%H:%M:%S')
+            ENTRY="DECT: $CURRENT_TIME | $MAC | Rogue Pineapple? (BLE \"$NAME\", $MATCH)$GPS_TAG"
+            bump_counter pineapple "$MAC" "$MAC"
+            echo "$ENTRY" >> "$LOG_FILE"
+            stealth_blink
+            SEEN_STRONG="$SEEN_STRONG $MAC BLE_PINEAPPLE"
+        done < <(sort -u /tmp/hci_scan.txt)
+    fi
+    fi   # closes the WANT_FLOCK/WANT_MESH/WANT_TRACKER/WANT_DRONE/WANT_SKIMMER/WANT_PINEAPPLE BLE-scan gate above
 
     # --- Flock Safety WiFi scan: drain whatever flock_wifi_monitor.awk found ---
     # Uses process substitution (not a `cmd | while` pipe) so the SEEN_STRONG
@@ -2421,12 +2685,63 @@ fi
 LOG " "
 LOG green "Detectors running in the background. Use the menu."
 
+# Cross-process-safe status line for the menu banner below: pulled from
+# $DASH_STATE_FILE rather than GPS_FIX/STEALTH_MODE/DETECTIONS directly.
+# Those only exist inside detection_loop's process (backgrounded with
+# "detection_loop &", a separate shell) -- see write_dash_state()'s own
+# header for why the state file is the only channel between the two. Line
+# 2 of that file is always write_dash_state()'s "Uptime: .. | GPS: .. |
+# Alerts: .." cyan fact line; cut drops just the leading "cyan|" colour
+# field and rejoins the rest on the same delimiter, which is safe here
+# because that line's own " | " separators use spaces around the pipe and
+# never collide with cut's bare "|" field split.
+menu_status_line() {
+    [ -s "$DASH_STATE_FILE" ] && sed -n '2p' "$DASH_STATE_FILE" | cut -d'|' -f2-
+}
+
+# Persistent header + numbered list, painted before every LIST_PICKER
+# raise -- context only, NOT gated behind its own WAIT_FOR_INPUT. An
+# earlier version of this function added that second gate, modeled on
+# bt-bluepine's main_menu() (which does block on a press before its own
+# picker) -- confirmed live on THIS device to cause exactly the "flashing
+# between two screens" symptom pause_screen() exists to prevent: reported
+# from the field as the banner and the picker alternating rapidly.
+#
+# The mechanism isn't WAIT_FOR_INPUT itself -- pause_screen() below uses
+# the identical call and has been solid the whole time this function
+# existed. What's different here is calling it a SECOND time back-to-back:
+# every path into this function arrives immediately after pause_screen()'s
+# own WAIT_FOR_INPUT just returned (leaf screen) or after a
+# CONFIRMATION_DIALOG just closed (declined Stop Scanning), with no
+# rendering happening in between the two waits the way pause_screen()
+# always has (a leaf screen's own LOG output, including this file's
+# dash-style sleep 0.2 pauses between sections, running before ITS
+# WAIT_FOR_INPUT is reached). Two WAIT_FOR_INPUT calls with nothing
+# rendered between them is the one thing that changed; removing this
+# function's own call, while still painting the banner for context, is
+# the targeted revert -- pause_screen() already covers the transition that
+# actually caused the original documented bug (leaf screen -> menu).
+show_menu_banner() {
+    local status
+    status=$(menu_status_line)
+    LOG magenta "$(dash_rule 'Main Menu')"
+    [ -n "$status" ] && LOG cyan "$status"
+    LOG "1: Live Stats"
+    LOG "2: Recent Detections"
+    LOG "3: Bookmark This Moment"
+    LOG "4: Session Files"
+    LOG "5: GPS Status"
+    LOG "0: Stop Scanning"
+}
+
 while true; do
+    show_menu_banner
     _sel=$(LIST_PICKER "Counter-Surveillance v$SCRIPT_VERSION" \
         "1: Live Stats" \
         "2: Recent Detections" \
         "3: Bookmark This Moment" \
         "4: Session Files" \
+        "5: GPS Status" \
         "0: Stop Scanning" \
         "1: Live Stats")
     case "$_sel" in
@@ -2434,7 +2749,21 @@ while true; do
         "2: Recent Detections")    screen_recent;  pause_screen ;;
         "3: Bookmark This Moment") do_bookmark;    pause_screen ;;
         "4: Session Files")        screen_session; pause_screen ;;
-        "0: Stop Scanning")        break ;;
+        "5: GPS Status")           screen_gps;     pause_screen ;;
+        "0: Stop Scanning")
+            # Confirmation dialog, bt-bluepine style (its own main_menu()
+            # exit does the same before killing anything). Guarded the
+            # same way LIST_PICKER itself is guarded above: if
+            # CONFIRMATION_DIALOG isn't available, fall through to the old
+            # immediate-stop behavior rather than hang waiting on a verb
+            # that doesn't exist here.
+            if command -v CONFIRMATION_DIALOG >/dev/null 2>&1; then
+                _resp=$(CONFIRMATION_DIALOG "Stop scanning and exit?")
+                [ "$_resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ] && break
+                continue
+            fi
+            break
+            ;;
         *)                         break ;;
     esac
 done

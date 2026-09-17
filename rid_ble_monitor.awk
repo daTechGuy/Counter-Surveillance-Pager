@@ -25,34 +25,17 @@
 # ble_total_adv_len()/ble_rssi_for() helpers -- the same two used by
 # rogue_tracker_monitor.awk and flock_ble_monitor.awk for this same layout.
 
-BEGIN {
-    npkt = 0
-    started = 0
-}
-
-/^[><] / {
-    if (started && npkt > 0) process_ble_packet()
-    started = 1
-    npkt = 0
-    n = split($0, toks, " ")
-    for (k = 2; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { npkt++; pkt[npkt] = toks[k] }
-    }
-    next
-}
-
-{
-    if (!started) next   # ignore hcidump's own startup banner lines
-    n = split($0, toks, " ")
-    for (k = 1; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { npkt++; pkt[npkt] = toks[k] }
-    }
-}
-
-END {
-    if (started && npkt > 0) process_ble_packet()
-}
-
+# Packet reassembly (BEGIN npkt/started init, the hcidump-format driver
+# rules, the END flush) used to live here -- see ble_dispatch.awk, which now
+# owns that reassembly once for every BLE detector sharing the capture
+# (rid_ble_monitor.awk/rogue_tracker_monitor.awk/flock_ble_monitor.awk/
+# glasses_ble_monitor.awk) and calls process_ble_packet() (unchanged below)
+# once per packet -- same change already made on the WiFi side, see
+# rid_wifi_monitor.awk's header for the fuller rationale (redundant capture
+# under multiple simultaneous detectors driving system load high enough to
+# glitch the foreground menu). npkt/pkt[] below are still this function's
+# own state, just written by that shared driver now.
+#
 # Look for the ASTM Remote ID Service Data AD structure (AD type 0x16,
 # UUID 0xFFFA on the wire as bytes FA FF, AD App Code 0x0D) inside one
 # report's adv_data slice, arr[start .. start+len-1]. BLE legacy

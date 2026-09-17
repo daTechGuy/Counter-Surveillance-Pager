@@ -20,41 +20,23 @@
 #   - NAN method: Public Action frame carrying a NAN Service Descriptor
 #     attribute for the "org.opendroneid.remoteid" service ID
 
-BEGIN {
-    npkt = 0
-    started = 0
-}
-
-/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
-    if (started && npkt > 0) process_wifi_packet()
-    started = 1
-    npkt = 0
-    next   # summary line carries no packet bytes
-}
-
-/^[ \t]*0x[0-9A-Fa-f]+:/ {
-    if (!started) next
-    line = $0
-    sub(/^[ \t]*0x[0-9A-Fa-f]+:[ \t]*/, "", line)
-    n = split(line, toks, " ")
-    for (k = 1; k <= n; k++) {
-        tok = toks[k]
-        if (tok ~ /^[0-9A-Fa-f]+$/) {
-            tl = length(tok)
-            for (p = 1; p <= tl; p += 2) {
-                b = substr(tok, p, 2)
-                if (length(b) == 2) { npkt++; pkt[npkt] = b }
-            }
-        }
-    }
-    next
-}
-
-{ next }   # ignore tcpdump's startup banner / trailing capture-stats lines
-
-END {
-    if (started && npkt > 0) process_wifi_packet()
-}
+# Packet reassembly (BEGIN npkt/started init, the summary-line and hex-line
+# driver rules, the catch-all, and the END flush) used to live here, one
+# independent copy per WiFi detector script. Removed once this reader was
+# merged with flock_wifi_monitor.awk/mesh_wifi_monitor.awk/
+# deauth_eviltwin_monitor.awk into one shared tcpdump+awk process -- see
+# wifi_mgt_dispatch.awk, which now owns that reassembly once and calls
+# process_wifi_packet() (still defined below, unchanged) once per packet.
+# Confirmed live this session: running each detector's own independent
+# tcpdump+awk reassembly pass over the identical management-frame stream
+# was the actual driver of high system load with several WiFi detectors
+# enabled together, which in turn caused the foreground menu to flash/
+# glitch under that contention -- see payload.sh's own comment where the
+# shared capture starts for the full story.
+#
+# npkt/started/pkt[] below are still this function's own state -- just
+# written by wifi_mgt_dispatch.awk's shared driver now instead of a driver
+# living in this file.
 
 # ies: 802.11 information-element list, TYPE-FIRST-THEN-LENGTH (element_id,
 # length, data[length]) -- the reverse of a BLE AD structure's length-first

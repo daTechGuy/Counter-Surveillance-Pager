@@ -37,33 +37,11 @@
 # rid_common.awk's shared ble_total_adv_len()/ble_rssi_for() helpers --
 # same trailing-per-report-RSSI layout rid_ble_monitor.awk's header cites.
 
-BEGIN {
-    fbnpkt = 0
-    fbstarted = 0
-}
-
-/^[><] / {
-    if (fbstarted && fbnpkt > 0) process_flock_ble_packet()
-    fbstarted = 1
-    fbnpkt = 0
-    n = split($0, toks, " ")
-    for (k = 2; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { fbnpkt++; fbpkt[fbnpkt] = toks[k] }
-    }
-    next
-}
-
-{
-    if (!fbstarted) next   # ignore hcidump's own startup banner lines
-    n = split($0, toks, " ")
-    for (k = 1; k <= n; k++) {
-        if (toks[k] ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/) { fbnpkt++; fbpkt[fbnpkt] = toks[k] }
-    }
-}
-
-END {
-    if (fbstarted && fbnpkt > 0) process_flock_ble_packet()
-}
+# Packet reassembly used to live here -- see rogue_tracker_monitor.awk's
+# analogous note for why: merged into ble_dispatch.awk alongside
+# rid_ble_monitor.awk/rogue_tracker_monitor.awk/glasses_ble_monitor.awk.
+# fbnpkt/fbpkt[] are still this function's own state, just written by that
+# shared driver now.
 
 # Same 1st + every-10th packet-count throttle as rogue_tracker_monitor.awk's.
 function flock_ble_throttle_ok(key,    c) {
@@ -75,7 +53,8 @@ function flock_ble_throttle_ok(key,    c) {
 # Same AD-structure walk as rogue_tracker_monitor.awk's scan_tracker_adv_data,
 # narrowed to just the 16-bit Service UUID list check (AD type 0x02
 # incomplete / 0x03 complete) for UUID 0x09C8.
-function scan_flock_ble_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, u1, u2, j, key) {
+function scan_flock_ble_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype, u1, u2, j, key, out) {
+    out = (FLOCK_BLE_HITS_FILE != "") ? FLOCK_BLE_HITS_FILE : "/dev/stdout"
     i = start
     while (i < start + len) {
         adlen = hex2dec(arr[i])
@@ -89,7 +68,7 @@ function scan_flock_ble_adv_data(arr, start, len, mac, rssi,    i, adlen, adtype
                 if (u1 == "C8" && u2 == "09") {   # UUID 0x09C8, little-endian
                     key = mac "|flock_uuid09c8"
                     if (flock_ble_throttle_ok(key)) {
-                        print "ble_flock|" mac "|uuid_09c8" ((rssi != "" && rssi != 127) ? "|rssi=" rssi : "")
+                        print "ble_flock|" mac "|uuid_09c8" ((rssi != "" && rssi != 127) ? "|rssi=" rssi : "") >> out
                         fflush()
                     }
                 }

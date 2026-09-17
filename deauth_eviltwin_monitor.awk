@@ -29,18 +29,20 @@
 #   Response only happens in reply to an active probe, less coverage for
 #   comparable complexity. Documented gap, not an oversight.
 #
-# Own tcpdump process, same interface, same reasoning as flock_wifi_monitor.awk
-# / mesh_wifi_monitor.awk's headers: rid_wifi_monitor.awk's rules end in
-# `next`, so this isn't a 4th -f on that pipeline. Radiotap-stripping /
-# mgmt-header byte offsets are the same ones hardware-verified for
-# rid_wifi_monitor.awk (see that file's header).
+# Run as part of the shared "type mgt" dispatch process now -- see
+# wifi_mgt_dispatch.awk, which owns packet reassembly (once, for every
+# detector sharing that stream) and calls process_deauth_packet() below once
+# per packet. Config variable renamed DEAUTH_CONFIG_FILE (was CONFIG_FILE)
+# since mesh_wifi_monitor.awk's own config file used the same generic name
+# -- harmless as long as each ran in its own separate awk process, a real
+# collision once both share one.
+#
+# dnpkt/dpkt[] below are still this function's own state, just written by
+# the shared driver instead of a driver living in this file.
 
 BEGIN {
-    dnpkt = 0
-    dstarted = 0
-
-    if (CONFIG_FILE != "") {
-        while ((getline cfgline < CONFIG_FILE) > 0) {
+    if (DEAUTH_CONFIG_FILE != "") {
+        while ((getline cfgline < DEAUTH_CONFIG_FILE) > 0) {
             sub(/#.*/, "", cfgline)
             gsub(/^[ \t]+|[ \t]+$/, "", cfgline)
             if (cfgline == "") continue
@@ -55,39 +57,10 @@ BEGIN {
                 }
             }
         }
-        close(CONFIG_FILE)
+        close(DEAUTH_CONFIG_FILE)
     }
     HAVE_TRUSTED = 0
     for (_k in has_trusted_ssid) { HAVE_TRUSTED = 1; break }
-}
-
-/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\./ {
-    if (dstarted && dnpkt > 0) process_deauth_packet()
-    dstarted = 1
-    dnpkt = 0
-    next
-}
-
-/^[ \t]*0x[0-9A-Fa-f]+:/ {
-    if (!dstarted) next
-    line = $0
-    sub(/^[ \t]*0x[0-9A-Fa-f]+:[ \t]*/, "", line)
-    n = split(line, toks, " ")
-    for (k = 1; k <= n; k++) {
-        tok = toks[k]
-        if (tok ~ /^[0-9A-Fa-f]+$/) {
-            tl = length(tok)
-            for (p = 1; p <= tl; p += 2) {
-                b = substr(tok, p, 2)
-                if (length(b) == 2) { dnpkt++; dpkt[dnpkt] = tolower(b) }
-            }
-        }
-    }
-    next
-}
-
-END {
-    if (dstarted && dnpkt > 0) process_deauth_packet()
 }
 
 # Emit on the 1st sighting of a key, then every 10th after that -- a
@@ -119,7 +92,7 @@ function extract_ssid(arr, start, end,    i, id, elen) {
 }
 
 function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
-                                    src, dst, bssid, ies_start, ssid, key, subtype_name, rssi, rssi_sfx) {
+                                    src, dst, bssid, ies_start, ssid, key, subtype_name, rssi, rssi_sfx, out) {
     if (dnpkt < 4) return
     itlen = hex2dec(dpkt[3]) + hex2dec(dpkt[4]) * 256
     dot11_start = 1 + itlen
@@ -132,6 +105,10 @@ function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
 
     rssi = wifi_rssi(dpkt, itlen, dnpkt)
     rssi_sfx = (rssi != 127) ? "|rssi=" rssi : ""
+    # Redirects every print below to $DEAUTH_HITS_FILE instead of this
+    # process's shared stdout -- see process_flock_packet()'s own comment
+    # on the identical reasoning.
+    out = (DEAUTH_HITS_FILE != "") ? DEAUTH_HITS_FILE : "/dev/stdout"
 
     if (stype == 12 || stype == 10) {                # Deauth / Disassoc
         src = mac_str_dot11(dpkt, dot11_start + 10)   # addr2: transmitter
@@ -139,7 +116,7 @@ function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
         subtype_name = (stype == 12) ? "deauth" : "disassoc"
         key = src
         if (deauth_throttle_ok(key)) {
-            print "deauth|" src "|" dst "|" subtype_name "|" dcount[key] rssi_sfx
+            print "deauth|" src "|" dst "|" subtype_name "|" dcount[key] rssi_sfx >> out
             fflush()
         }
         return
@@ -154,7 +131,7 @@ function process_deauth_packet(    itlen, dot11_start, b0, ftype, stype, \
         if ((ssid, tolower(bssid)) in trusted) return   # known-good BSSID for this SSID
         key = ssid "|" tolower(bssid)
         if (deauth_throttle_ok(key)) {
-            print "eviltwin|" bssid "|" ssid "|rogue_bssid" rssi_sfx
+            print "eviltwin|" bssid "|" ssid "|rogue_bssid" rssi_sfx >> out
             fflush()
         }
     }

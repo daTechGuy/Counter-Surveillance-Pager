@@ -216,10 +216,26 @@ function decode_message_fields(arr, base,    t) {
 # 127 is the Bluetooth spec's own "not available" sentinel -- suppressed
 # here rather than printed, same reasoning as GPS_TAG staying empty on no
 # fix instead of printing "gps=0,0".
-function emit_hit(src, mac, arr, base, rssi,    mtype, fields) {
+#
+# Redirects to $RID_HITS_FILE instead of a bare `print` (which would just
+# go to this process's own stdout) once the WiFi RID reader was merged into
+# the shared "type mgt" dispatch process (see wifi_mgt_dispatch.awk) --
+# that process ALSO runs flock_wifi_monitor.awk/mesh_wifi_monitor.awk/
+# deauth_eviltwin_monitor.awk, each needing hits routed to their OWN
+# separate loot file rather than one shared stdout. rid_ble_monitor.awk
+# (BLE side, still its own standalone process) sets RID_HITS_FILE to ITS
+# hits file the same way, via the same `-v`, so this function's contract
+# doesn't otherwise change for that caller. Falls back to /dev/stdout if
+# unset, matching this function's original behavior for any caller that
+# doesn't set it.
+function emit_hit(src, mac, arr, base, rssi,    mtype, fields, out) {
     mtype = msg_type_of(arr, base)
     fields = decode_message_fields(arr, base)
-    print src "|" mac "|" mtype "|" fields ((rssi != "" && rssi != 127) ? "|rssi=" rssi : "")
+    out = (RID_HITS_FILE != "") ? RID_HITS_FILE : "/dev/stdout"
+    print src "|" mac "|" mtype "|" fields ((rssi != "" && rssi != 127) ? "|rssi=" rssi : "") >> out
+    # Bare fflush() (all open streams), not fflush(out) -- this file's own
+    # header only confirms bare fflush() against this device's busybox awk;
+    # a file-argument form was never verified and isn't worth risking here.
     fflush()
 }
 
