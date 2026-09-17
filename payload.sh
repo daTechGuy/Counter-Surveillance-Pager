@@ -401,6 +401,13 @@ echo "Flock WiFi diagnostic log (unmatched-OUI wildcard probes, never alerts) st
 # the menu when a stats screen is drawn. Work dir, not loot: it is a
 # snapshot of live state, not session evidence, and it lives on tmpfs.
 DASH_STATE_FILE="${WORK_DIR}/dash_state"
+# Deleted explicitly: the cleanup above this only removes *.log and *.fifo,
+# so a previous session's state file survived into the next run. Live Stats
+# then showed the LAST session's screen -- its uptime, its counts, frozen --
+# for the whole first cycle, until the detection loop first wrote this file
+# ~22s in. Reported from the device as an uptime of 1:39 on a payload that
+# had just been started, which never changed.
+rm -f "$DASH_STATE_FILE" "$DASH_STATE_FILE.tmp" 2>/dev/null
 
 BOOKMARK_LOG_FILE="${LOOT_DIR}/bookmarks_${TIMESTAMP}.txt"
 echo "Bookmark log (RIGHT button = flag this moment) started at $(date)" > "$BOOKMARK_LOG_FILE"
@@ -1537,6 +1544,13 @@ write_dash_state() {
         fi
     done
     [ -n "$row" ] && _o "" "$row"
+
+    # When these numbers were taken. The screen is painted once and never
+    # repaints (see show_dash_screen()'s header), so without this there is
+    # no way to tell a screen you have been staring at for five minutes
+    # from one drawn a second ago -- the uptime is HH:MM and only moves
+    # once a minute, which is what made a stale screen look live.
+    _o cyan "Stats as of $(date '+%H:%M:%S')"
 
     # Written whole then moved into place, so the watcher can never read a
     # half-written file -- it runs in its own process and is not
@@ -2833,6 +2847,13 @@ while true; do
 done
 }
 
+# Written once here, before the loop is backgrounded, so Live Stats has a
+# real screen (this session's uptime, zeroed counts) from the moment the
+# menu appears rather than the "still starting up" placeholder for the
+# first cycle. Runs in this process, where SESSION_START was just set --
+# the same call inside the loop writes the same file from its own.
+write_dash_state
+
 detection_loop &
 DETECTION_PID=$!
 
@@ -2861,7 +2882,29 @@ pause_screen() {
     WAIT_FOR_INPUT >/dev/null 2>&1
 }
 
-screen_live_stats()   { show_dash_screen; }
+# Live Stats holds its own input rather than falling through to
+# pause_screen(), so the screen can be redrawn in place: LEFT repaints from
+# the state file the detection loop keeps writing (up to ~22s old, hence
+# the "Stats as of" line), any other button returns to the menu.
+#
+# This is still paint-on-demand, not a timer: the foreground is the only
+# process that draws, and it draws only when you ask. A repaint here is the
+# same append the menu already makes when you re-enter this screen -- the
+# rejected design was a background heartbeat painting under the foreground,
+# which is what tore. bt-bluepine's own Info screen does not refresh at all
+# (LOG lines, then WAIT_FOR_BUTTON_PRESS A); this is that plus a repeat.
+screen_live_stats() {
+    while true; do
+        show_dash_screen
+        LOG green "LEFT refreshes, any other button returns"
+        case "$(WAIT_FOR_INPUT 2>/dev/null)" in
+            LEFT) continue ;;
+            # Anything else returns -- including an empty result, so a
+            # platform without WAIT_FOR_INPUT cannot spin here forever.
+            *) break ;;
+        esac
+    done
+}
 
 # Last hits across every loot file this session, newest first. Read from
 # the files rather than from memory: the counters live in detection_loop's
@@ -2964,7 +3007,7 @@ while true; do
         "0: Stop Scanning" \
         "1: Live Stats")
     case "$_sel" in
-        "1: Live Stats")           screen_live_stats; pause_screen ;;
+        "1: Live Stats")           screen_live_stats ;;   # holds its own input, see above
         "2: Recent Detections")    screen_recent;  pause_screen ;;
         "3: Bookmark This Moment") do_bookmark;    pause_screen ;;
         "4: Session Files")        screen_session; pause_screen ;;
