@@ -1317,29 +1317,29 @@ dash_cat_enabled() {
     esac
 }
 
-# One compact "label status count" slot for a detector, e.g. "Flock     run 3"
-# -- 17 characters fixed width, two of these plus a separating space (35
-# chars) comfortably fits the display's own hard ~50-char line limit (see
-# LOG_MAX_WIDTH's header), which is what makes packing two per line safe
-# rather than a guess. Labels over 9 characters truncate (the "10.9" in
-# %-10.9s: pad to 10, but never take more than 9 of the source) rather than
-# wrap or push the second slot off-screen -- only "BT Classic" is affected,
-# reading as "BT Classi" here; the truncate-to-9/pad-to-10 split (not just
-# %-9.9s) is deliberate so even a fully-9-character label like "Pineapple"
-# still gets one trailing space before the next field, instead of running
-# straight into "run"/"off" with nothing between them.
-dash_cat_entry() {
-    local cat="$1" n label status
-    n=${CAT_COUNT[$cat]:-0}
-    label=$(dash_cat_label "$cat")
-    if ! dash_cat_enabled "$cat"; then
-        status="off"; n="-"
-    elif [ "$(dash_cat_live "$cat")" = "1" ]; then
-        status="run"
-    else
-        status="N/A"; n="-"
-    fi
-    printf '%-10.9s%-4s%-3s' "$label" "$status" "$n"
+# One dot-leader slot, e.g. "Flock ............... 3" -- label on the left,
+# value flush right, dots between. Fixed DASH_SLOT_W wide, so two slots plus
+# DASH_SLOT_GAP spaces come to exactly DASH_RULE_W (48): the grid spans the
+# same width as the "====" rules above and below it, under the display's
+# 50-char max_chars (see LOG_MAX_WIDTH's header).
+#
+# Replaces the old packed "Flock     run 3" slot (17 chars, 35 for a pair),
+# which read as cluttered: three short columns per slot crammed into the
+# left two-thirds of the screen. The "run" column is gone -- a running
+# detector just shows its count; one that could not start shows N/A in
+# place of it; one you switched off is not in the grid at all (see the
+# "Off:" line in write_dash_state()).
+#
+# Dots come from a substring of DASH_DOTS rather than printf|tr, so building
+# the grid every tick forks nothing.
+DASH_SLOT_W=22
+DASH_SLOT_GAP="    "
+DASH_DOTS="......................"
+dash_slot() {
+    local label="$1" val="$2" n
+    n=$(( DASH_SLOT_W - ${#label} - ${#val} - 2 ))
+    [ "$n" -lt 1 ] && n=1
+    echo "$label ${DASH_DOTS:0:$n} $val"
 }
 
 # The one-line "how is this rig configured right now" strip under the
@@ -1378,8 +1378,8 @@ dash_rule() {
 # small write to tmpfs, and crucially NOTHING to the screen -- the screen
 # is only ever drawn by show_dash_screen(), on LEFT.
 write_dash_state() {
-    local up_s up_h up_m cat tag n row i entry txt gps stealth pending btc
-    local -a out=()
+    local up_s up_h up_m cat tag n row i entry txt gps stealth label val
+    local -a out=() slots=() off=()
     up_s=$(( $(date +%s) - SESSION_START ))
     up_h=$(printf '%02d' $(( up_s / 3600 )))
     up_m=$(printf '%02d' $(( (up_s % 3600) / 60 )))
@@ -1402,38 +1402,62 @@ write_dash_state() {
     fi
 
     _o magenta "$(dash_rule 'Detections')"
-    # Two detectors per line instead of one -- cuts this section from 9
-    # rows to 5. "off" means you did not select it; "N/A" means you did but
-    # it could not start (missing radio or tool), which is the case worth
-    # seeing in the field and was previously only on a second screen.
-    # dash_cat_entry() builds one fixed-width slot; paired here two at a
-    # time via $pending, flushed as a combined line once the second slot of
-    # a pair is ready.
-    pending=""
+    # Two dot-leader slots per line (see dash_slot()). Only detectors you
+    # selected get a slot: a count if it came up, "N/A" if it was selected
+    # but could not start (missing radio or tool) -- the case worth seeing
+    # in the field. Ones you switched off are named once on a trailing
+    # "Off:" line instead of each holding a slot that can never change.
+    slots=()
+    off=()
     for cat in $DASH_CATS; do
-        if [ -z "$pending" ]; then
-            pending=$(dash_cat_entry "$cat")
+        label=$(dash_cat_label "$cat")
+        if ! dash_cat_enabled "$cat"; then
+            off+=("$label")
+            continue
+        fi
+        if [ "$(dash_cat_live "$cat")" = "1" ]; then
+            val=${CAT_COUNT[$cat]:-0}
         else
-            _o "" "$pending $(dash_cat_entry "$cat")"
-            pending=""
+            val="N/A"
+        fi
+        slots+=("$(dash_slot "$label" "$val")")
+    done
+    # No WANT_ toggle and no count of its own -- it rides the BLE cycle
+    # whenever hcitool is present and feeds the categories above -- so it
+    # is not in DASH_CATS; it just reports whether it is up, as the last slot.
+    #
+    # ROOM FOR ONE MORE STAT, right here. With all 8 detectors selected this
+    # makes 9 slots, so BT Classic sits alone on the last grid row and the
+    # right-hand half of that row is empty. One more `slots+=("$(dash_slot
+    # "Label" "value")")` after this block fills it with no extra line, and
+    # the screen stays at 9 lines (well inside the 14-line window). Keep the
+    # label + value within dash_slot()'s 22 chars.
+    if [ "$BTCLASSIC_OK" = "1" ]; then
+        slots+=("$(dash_slot "BT Classic" "on")")
+    else
+        slots+=("$(dash_slot "BT Classic" "N/A")")
+    fi
+    for ((i = 0; i < ${#slots[@]}; i += 2)); do
+        if [ -n "${slots[i+1]}" ]; then
+            _o "" "${slots[i]}$DASH_SLOT_GAP${slots[i+1]}"
+        else
+            _o "" "${slots[i]}"
         fi
     done
-    # No WANT_ toggle of its own -- it rides the BLE cycle whenever hcitool
-    # is present, so it isn't in DASH_CATS and doesn't go through
-    # dash_cat_entry(); folded in as one more slot here instead of always
-    # getting its own trailing line. DASH_CATS has an even count (8), so
-    # $pending is always empty going into this -- BT Classic lands alone on
-    # the last line every time, not paired with a leftover from above.
-    if [ "$BTCLASSIC_OK" = "1" ]; then
-        btc="$(printf '%-10.9s%-4s%-3s' "BT Classic" "run" "")"
-    else
-        btc="$(printf '%-10.9s%-4s%-3s' "BT Classic" "N/A" "-")"
-    fi
-    if [ -z "$pending" ]; then
-        _o "" "$btc"
-    else
-        _o "" "$pending $btc"
-    fi
+    # Wrapped at the rule width rather than left to LOG's truncation, so
+    # switching most detectors off still names every one of them.
+    row=""
+    for label in "${off[@]}"; do
+        if [ -z "$row" ]; then
+            row="Off: $label"
+        elif [ $(( ${#row} + 2 + ${#label} )) -gt "$DASH_RULE_W" ]; then
+            _o "" "$row,"
+            row="     $label"
+        else
+            row="$row, $label"
+        fi
+    done
+    [ -n "$row" ] && _o "" "$row"
 
     # Written whole then moved into place, so the watcher can never read a
     # half-written file -- it runs in its own process and is not
