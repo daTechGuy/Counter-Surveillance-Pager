@@ -2146,29 +2146,32 @@ handle_rid_line() {
     fi
 }
 
-# Best-effort GPS fix via the Pager's own GPS_GET command (/usr/bin/GPS_GET,
-# a thin wrapper over pineapd's HTTP API -- same platform-builtin convention
-# already used for LOG/LED/RINGTONE elsewhere in this file,
-# rather than reinventing GPS handling by talking to gpsd/gpspipe directly).
-# Confirmed live: prints "LAT LON ALT SPEED", space-separated, and "0 0 0 0"
-# when there's no hardware or no fix yet -- the same no-fix sentinel another
-# Pager Bluetooth payload (cncartistsec/BluePine) already checks for, so
-# this isn't a guessed convention. `timeout` guards it regardless: confirmed
-# live GPS_GET's own runtime varies (roughly 2-3s with no fix in testing)
-# rather than failing instantly like a dead socket would. No GPS hardware /
-# no fix is the expected, common case, not an error -- prints nothing and
-# every call site below just omits the tag. Called once per main-loop tick
-# (below), not per hit, so a burst of several detections in one tick shares
-# one GPS_GET call instead of one each.
+# Best-effort GPS fix, read straight from gpsd (gpspipe, localhost:2947)
+# rather than the Pager's GPS_GET command.
+#
+# This used to call GPS_GET, and that was the last source of the menu
+# flashing between two screens. GPS_GET is not a hak5cmd verb but a shell
+# script: `HAK5_API_GET "pineap/gps/get"`, i.e. curl over /tmp/api.sock --
+# the same socket LOG, LIST_PICKER and WAIT_FOR_INPUT drive the screen
+# through, and the same socket LED/RINGTONE/VIBRATE post to (each is a
+# HAK5_API_POST wrapper, checked in /usr/bin). stealth_alert()'s header
+# records LED and RINGTONE, called from the backgrounded detection loop,
+# as confirmed-live causes of this exact symptom. GPS_GET was that same
+# call from that same process, made twice every tick whether or not
+# anything was detected.
+#
+# gpspipe talks to gpsd's own socket and never goes near the UI. -w
+# streams JSON; a TPV report with mode >= 2 carries lat/lon, mode 1 (no
+# fix, confirmed live indoors) does not. The last good TPV in the sample
+# wins. `timeout` bounds it when gpsd is up but the receiver is silent;
+# no gpsd / no hardware / no fix prints nothing, and every call site below
+# just omits the tag, exactly as before. Output format is unchanged
+# ("LAT,LON") -- export_gps_kml.awk parses it.
 get_gps_fix() {
-    local out lat lon
-    out=$(timeout 3 GPS_GET 2>/dev/null)
-    [ -z "$out" ] && return
-    [ "$out" = "0 0 0 0" ] && return
-    read -r lat lon _ <<< "$out"
-    [ -z "$lat" ] && return
-    [ -z "$lon" ] && return
-    echo "$lat,$lon"
+    timeout 3 gpspipe -w -n 10 2>/dev/null \
+        | grep '"class":"TPV"' \
+        | jq -r 'select(.mode >= 2 and .lat != null and .lon != null) | "\(.lat),\(.lon)"' 2>/dev/null \
+        | tail -n 1
 }
 
 # Sets GPS_FIX/GPS_TAG from a fresh get_gps_fix() call. GPS_TAG is what
