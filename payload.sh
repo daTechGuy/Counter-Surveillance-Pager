@@ -1257,6 +1257,65 @@ LOG "----------------------------------"
 
 DETECTIONS=0
 SEEN_STRONG=""
+declare -A SEEN_STRONG_MAP
+
+is_seen() {
+    local key="$1"
+    [ "$ALWAYS_ALERT" = "1" ] && return 1
+    [ "${SEEN_STRONG_MAP[$key]:-}" = "1" ]
+}
+
+mark_seen() {
+    local key="$1"
+    SEEN_STRONG_MAP["$key"]=1
+    SEEN_STRONG="$SEEN_STRONG $key"
+}
+
+MENU_ACTIVE_FLAG="${WORK_DIR}/menu_active"
+RECENT_EVENTS_FILE="${WORK_DIR}/recent_events.log"
+LATEST_EVENT_FILE="${WORK_DIR}/latest_event.txt"
+rm -f "$MENU_ACTIVE_FLAG" "$RECENT_EVENTS_FILE" "$LATEST_EVENT_FILE" 2>/dev/null
+
+hud_event() {
+    local color="$1" tag="$2" detail="$3"
+    local now_ts
+    now_ts=$(date '+%H:%M:%S')
+    local line="[$now_ts] $tag $detail"
+
+    echo "$now_ts|$color|$tag|$detail" >> "$RECENT_EVENTS_FILE" 2>/dev/null
+    echo "$now_ts $tag $detail" > "$LATEST_EVENT_FILE" 2>/dev/null
+
+    # Suppress screen LOG output while interactive menu is open to prevent screen contention
+    [ -f "$MENU_ACTIVE_FLAG" ] && return
+
+    if [ -n "$color" ]; then
+        LOG "$color" "$line"
+    else
+        LOG "$line"
+    fi
+}
+
+LAST_TICKER_SEC=0
+hud_ticker() {
+    [ -f "$MENU_ACTIVE_FLAG" ] && return
+    local now_sec
+    now_sec=$(date +%s)
+    # Emit ticker every 30 seconds
+    if [ $(( now_sec - LAST_TICKER_SEC )) -ge 30 ]; then
+        LAST_TICKER_SEC=$now_sec
+        local up_s=$(( now_sec - SESSION_START ))
+        local up_h=$(printf '%02d' $(( up_s / 3600 )))
+        local up_m=$(printf '%02d' $(( (up_s % 3600) / 60 )))
+        local gps_st="NO-GPS"
+        [ -n "$GPS_FIX" ] && gps_st="GPS-OK"
+        local f_cnt=$(( ${CAT_COUNT[flock]:-0} + ${CAT_COUNT[raven]:-0} ))
+        local d_cnt=$(( ${CAT_COUNT[drone]:-0} + ${CAT_COUNT[unitree]:-0} ))
+        local t_cnt=${CAT_COUNT[tracker]:-0}
+        local a_cnt=$(( ${CAT_COUNT[deauth]:-0} + ${CAT_COUNT[pineapple]:-0} ))
+        local m_cnt=${CAT_COUNT[mesh]:-0}
+        LOG cyan "[$CURRENT_TIME] Up:${up_h}:${up_m} | ${gps_st} | Total:${DETECTIONS} [F:$f_cnt D:$d_cnt T:$t_cnt M:$m_cnt A:$a_cnt]"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Live on-screen dashboard
@@ -1585,10 +1644,6 @@ show_dash_screen() {
         txt="${line#*|}"
         if [ -n "$col" ]; then LOG "$col" "$txt"; else LOG "$txt"; fi
         shown=$((shown + 1))
-        # bt-bluepine paces its Info screen with a sleep between sections
-        # rather than dumping every line at once; a rule is where a section
-        # starts, so that is where the pause goes.
-        case "$txt" in ====*) sleep 0.2 ;; esac
     done < "$DASH_STATE_FILE"
 }
 
@@ -1610,7 +1665,7 @@ show_dash_screen() {
 
 bump_counter() {
     local cat="$1" key hit now
-    key=$(echo "$2" | tr 'A-Z' 'a-z')
+    key="${2,,}"
 
     if [ -n "$key" ] && [ -z "${DETECTED_DEVICES[$key]}" ]; then
         DETECTED_DEVICES["$key"]=1
@@ -1867,7 +1922,7 @@ handle_flock_wifi_line() {
     local src mac msgtype kv
     IFS='|' read -r src mac msgtype kv <<< "$line"
     [ -z "$mac" ] && return
-    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac WIFI_FLOCK"; then return; fi
+    if is_seen "$mac WIFI_FLOCK"; then return; fi
 
     local conf="high"
     case "$kv" in
@@ -1880,8 +1935,13 @@ handle_flock_wifi_line() {
     bump_counter flock "$mac" "$mac W/$conf"
     if [ "$conf" = "high" ]; then
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock (WiFi $msgtype, $kv)$GPS_TAG"
+        hud_event green "[FLOCK]" "$mac WiFi $msgtype"
+    elif [ "$conf" = "medium" ]; then
+        ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
+        hud_event green "[FLOCK]" "$mac WiFi $msgtype"
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Flock? (WiFi $msgtype, $kv)$GPS_TAG"
+        hud_event yellow "[FLOCK?]" "$mac WiFi $msgtype"
     fi
     echo "$ENTRY" >> "$LOG_FILE"
     # conf=medium now gets a physical alert too, not just conf=high --
@@ -1897,7 +1957,7 @@ handle_flock_wifi_line() {
     if [ "$conf" = "high" ] || [ "$conf" = "medium" ]; then
         stealth_blink
     fi
-    SEEN_STRONG="$SEEN_STRONG $mac WIFI_FLOCK"
+    mark_seen "$mac WIFI_FLOCK"
 }
 
 # Parse one line from flock_ble_monitor.awk and loot it. Two shapes, one per
@@ -1922,7 +1982,7 @@ handle_flock_ble_line() {
 
     local dedup_key="BLE_FLOCK_UUID"
     [ "$msgtype" = "mfg_serial_tn_validated" ] && dedup_key="BLE_FLOCK_VALIDATED"
-    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac $dedup_key"; then return; fi
+    if is_seen "$mac $dedup_key"; then return; fi
 
     local CURRENT_TIME ENTRY
     CURRENT_TIME=$(date '+%H:%M:%S')
@@ -1932,7 +1992,8 @@ handle_flock_ble_line() {
         bump_counter flock "$mac" "$mac B/validated"
         echo "$ENTRY" >> "$LOG_FILE"
         stealth_blink
-        SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
+        hud_event green "[FLOCK]" "$mac BLE validated"
+        mark_seen "$mac $dedup_key"
         return
     fi
 
@@ -1944,7 +2005,8 @@ handle_flock_ble_line() {
     ENTRY="DECT: $CURRENT_TIME | $mac | Flock?? (BLE $msgtype, unverified signature)$rssi_sfx$GPS_TAG"
     bump_counter flock "$mac" "$mac B?"
     echo "$ENTRY" >> "$LOG_FILE"
-    SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
+    hud_event yellow "[FLOCK?]" "$mac BLE UUID"
+    mark_seen "$mac $dedup_key"
 }
 
 # Parse one "ble_glasses|MAC|BRAND|cid=0xNNNN|rssi=N" line from
@@ -1958,7 +2020,7 @@ handle_glasses_ble_line() {
     local src mac brand kv
     IFS='|' read -r src mac brand kv <<< "$line"
     [ -z "$mac" ] && return
-    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac BLE_GLASSES"; then return; fi
+    if is_seen "$mac BLE_GLASSES"; then return; fi
 
     local rssi_sfx=""
     case "$kv" in
@@ -1971,7 +2033,8 @@ handle_glasses_ble_line() {
     ENTRY="DECT: $CURRENT_TIME | $mac | Glasses?? ($brand, unverified signature, $cid)$rssi_sfx$GPS_TAG"
     bump_counter glasses "$mac" "$mac $brand"
     echo "$ENTRY" >> "$LOG_FILE"
-    SEEN_STRONG="$SEEN_STRONG $mac BLE_GLASSES"
+    hud_event cyan "[GLASSES]" "$mac $brand"
+    mark_seen "$mac BLE_GLASSES"
 }
 
 # Parse one line from raven_ble_monitor.awk and loot it:
@@ -1991,7 +2054,7 @@ handle_raven_ble_line() {
 
     local dedup_key="RAVEN_FW11X"
     [ "$msgtype" = "fw12" ] && dedup_key="RAVEN_FW12"
-    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac $dedup_key"; then return; fi
+    if is_seen "$mac $dedup_key"; then return; fi
 
     local rssi_sfx=""
     case "$kv" in
@@ -2007,14 +2070,16 @@ handle_raven_ble_line() {
         bump_counter raven "$mac" "$mac fw12"
         echo "$ENTRY" >> "$LOG_FILE"
         stealth_blink
-        SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
+        hud_event magenta "[RAVEN]" "$mac fw12"
+        mark_seen "$mac $dedup_key"
         return
     fi
 
     ENTRY="DECT: $CURRENT_TIME | $mac | Raven?? (BLE fw11x, unverified signature)$rssi_sfx$GPS_TAG"
     bump_counter raven "$mac" "$mac fw11x"
     echo "$ENTRY" >> "$LOG_FILE"
-    SEEN_STRONG="$SEEN_STRONG $mac $dedup_key"
+    hud_event magenta "[RAVEN?]" "$mac fw11x"
+    mark_seen "$mac $dedup_key"
 }
 
 # Vendor-specific alert labels for select Mesh-Detect OUI/MAC hits (used by
@@ -2062,7 +2127,7 @@ handle_mesh_wifi_line() {
     local src mac matchkind
     IFS='|' read -r src mac matchkind <<< "$line"
     [ -z "$mac" ] && return
-    if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$mac WIFI_MESH\|$mac MESH_BLE"; then return; fi
+    if is_seen "$mac WIFI_MESH" || is_seen "$mac MESH_BLE"; then return; fi
 
     # wifi_mesh|MAC|matchkind was an exact 3-field fit for the 3 `read` vars
     # above before RSSI was added, so a trailing "|rssi=N" lands INSIDE
@@ -2084,13 +2149,15 @@ handle_mesh_wifi_line() {
     CURRENT_TIME=$(date '+%H:%M:%S')
     if [ -n "$vendor" ]; then
         ENTRY="DECT: $CURRENT_TIME | $mac | $vendor detected (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
+        hud_event yellow "[WATCHLIST]" "$mac $vendor (WiFi)"
     else
         ENTRY="DECT: $CURRENT_TIME | $mac | Mesh-Detect (WiFi, $matchkind)$rssi_sfx$GPS_TAG"
+        hud_event yellow "[WATCHLIST]" "$mac (WiFi $matchkind)"
     fi
     bump_counter mesh "$mac" "$mac W"
     echo "$ENTRY" >> "$LOG_FILE"
     stealth_blink
-    SEEN_STRONG="$SEEN_STRONG $mac WIFI_MESH"
+    mark_seen "$mac WIFI_MESH"
 }
 
 # Human-readable label per rogue_tracker_monitor.awk protocol tag.
@@ -2151,6 +2218,7 @@ handle_tracker_line() {
     local minutes=$(( age / 60 ))
     bump_counter tracker "$mac" "$mac $label"
     stealth_alert "ROGUE TRACKER" "$label\n$mac\nseen ${TRACKER_SIGHTINGS[$key]}x over ${minutes}min"
+    hud_event red "[TRACKER]" "$mac $label"
 }
 
 # Human-readable label per ble_beacon protocol tag emitted by
@@ -2196,9 +2264,7 @@ handle_beacon_line() {
     local label
     label=$(beacon_protocol_label "$protocol")
     echo "$(date '+%H:%M:%S') | $mac | $label | $detail$GPS_TAG" >> "$BEACON_LOG_FILE"
-    # No screen line: beacons are the noisiest source here by a wide
-    # margin, and the one category deliberately not counted either.
-    # BEACON_LOG_FILE still gets every one of them, unchanged.
+    hud_event cyan "[BEACON]" "$mac $label"
 }
 
 # Parse one line from deauth_eviltwin_monitor.awk -- either
@@ -2260,6 +2326,7 @@ handle_deauth_line() {
             DEAUTH_LAST_ALERT[$mac]=$now
             bump_counter deauth "$mac" "$mac flood"
             stealth_alert "DEAUTH FLOOD" "$mac\n${delta_count} ${subtype} in ${delta_time}s"
+            hud_event red "[ATTACK]" "$mac deauth flood ($delta_count in ${delta_time}s)"
         fi
         return
     fi
@@ -2273,6 +2340,7 @@ handle_deauth_line() {
         DEAUTH_LAST_ALERT[$mac]=$now
         bump_counter deauth "$mac" "$mac twin"
         stealth_alert "EVIL TWIN AP" "SSID: $ssid\nRogue BSSID: $mac"
+        hud_event red "[EVIL TWIN]" "$mac rogue SSID: $ssid"
     fi
 }
 
@@ -2337,6 +2405,7 @@ handle_rid_line() {
         [ -n "$known_id" ] && label="$mac ($known_id)"
         bump_counter drone "$mac" "$mac"
         stealth_alert "DRONE REMOTE ID" "$label\n$summary\nvia $src"
+        hud_event cyan "[DRONE]" "$label $summary"
     fi
 }
 
@@ -2546,7 +2615,7 @@ while true; do
             case "$MAC" in *:*:*) ;; *) continue ;; esac
             NAME=$(echo "$full_line" | cut -f2-)
             [ "$NAME" = "$full_line" ] && NAME=""
-            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BTCLASSIC"; then continue; fi
+            if is_seen "$MAC BTCLASSIC"; then continue; fi
 
             CURRENT_TIME=$(date '+%H:%M:%S')
             MATCH=""
@@ -2569,7 +2638,8 @@ while true; do
             bump_counter "$CAT" "$MAC" "$MAC BTC"
             echo "$ENTRY" >> "$LOG_FILE"
             stealth_blink
-            SEEN_STRONG="$SEEN_STRONG $MAC BTCLASSIC"
+            hud_event yellow "[$CAT/BTC]" "$MAC ${NAME:-(no name)}"
+            mark_seen "$MAC BTCLASSIC"
         done < <(sort -u /tmp/hci_classic.txt)
     fi
 
@@ -2602,7 +2672,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC $NAME"; then continue; fi
+            if is_seen "$MAC $NAME"; then continue; fi
             MATCH=$(flock_ble_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
@@ -2613,7 +2683,8 @@ while true; do
             bump_counter flock "$MAC" "$MAC"
             echo "$ENTRY" >> "$LOG_FILE"
             stealth_blink
-            SEEN_STRONG="$SEEN_STRONG $MAC $NAME"
+            hud_event green "[FLOCK/BLE]" "$MAC $NAME"
+            mark_seen "$MAC $NAME"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
 
@@ -2626,20 +2697,22 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC WIFI_MESH\|$MAC MESH_BLE"; then continue; fi
+            if is_seen "$MAC WIFI_MESH" || is_seen "$MAC MESH_BLE"; then continue; fi
             MATCH=$(mesh_ble_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
             VENDOR=$(mesh_vendor_label "${MATCH#*:}")
             if [ -n "$VENDOR" ]; then
                 ENTRY="DECT: $CURRENT_TIME | $MAC | $VENDOR detected (BLE \"$NAME\", $MATCH)$GPS_TAG"
+                hud_event yellow "[WATCHLIST]" "$MAC $VENDOR (BLE)"
             else
                 ENTRY="DECT: $CURRENT_TIME | $MAC | Mesh-Detect (BLE \"$NAME\", $MATCH)$GPS_TAG"
+                hud_event yellow "[WATCHLIST]" "$MAC (BLE $MATCH)"
             fi
             bump_counter mesh "$MAC" "$MAC B"
             echo "$ENTRY" >> "$LOG_FILE"
             stealth_blink
-            SEEN_STRONG="$SEEN_STRONG $MAC MESH_BLE"
+            mark_seen "$MAC MESH_BLE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
 
@@ -2650,7 +2723,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BLE_SKIMMER"; then continue; fi
+            if is_seen "$MAC BLE_SKIMMER"; then continue; fi
             MATCH=$(ble_skimmer_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
@@ -2658,7 +2731,8 @@ while true; do
             bump_counter skimmer "$MAC" "$MAC"
             echo "$ENTRY" >> "$LOG_FILE"
             stealth_blink
-            SEEN_STRONG="$SEEN_STRONG $MAC BLE_SKIMMER"
+            hud_event red "[SKIMMER]" "$MAC CC Skimmer"
+            mark_seen "$MAC BLE_SKIMMER"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
 
@@ -2670,7 +2744,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BLE_PINEAPPLE"; then continue; fi
+            if is_seen "$MAC BLE_PINEAPPLE"; then continue; fi
             MATCH=$(pineapple_match "$MAC" "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
@@ -2678,7 +2752,8 @@ while true; do
             bump_counter pineapple "$MAC" "$MAC"
             echo "$ENTRY" >> "$LOG_FILE"
             stealth_blink
-            SEEN_STRONG="$SEEN_STRONG $MAC BLE_PINEAPPLE"
+            hud_event red "[PINEAPPLE]" "$MAC Rogue Pineapple"
+            mark_seen "$MAC BLE_PINEAPPLE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
 
@@ -2690,7 +2765,7 @@ while true; do
             MAC=$(echo "$full_line" | awk '{print $1}')
             NAME=$(echo "$full_line" | cut -d' ' -f2-)
             [ -z "$MAC" ] && continue
-            if [ "$ALWAYS_ALERT" != "1" ] && echo "$SEEN_STRONG" | grep -q "$MAC BLE_UNITREE"; then continue; fi
+            if is_seen "$MAC BLE_UNITREE"; then continue; fi
             MATCH=$(unitree_ble_match "$NAME")
             [ -z "$MATCH" ] && continue
             CURRENT_TIME=$(date '+%H:%M:%S')
@@ -2698,7 +2773,8 @@ while true; do
             bump_counter unitree "$MAC" "$MAC"
             echo "$ENTRY" >> "$LOG_FILE"
             stealth_blink
-            SEEN_STRONG="$SEEN_STRONG $MAC BLE_UNITREE"
+            hud_event cyan "[ROBOT]" "$MAC Unitree $MATCH"
+            mark_seen "$MAC BLE_UNITREE"
         done < <(sort -u /tmp/hci_scan.txt)
     fi
     fi   # closes the BLE-scan gate above
@@ -2843,6 +2919,8 @@ while true; do
     # is what puts the panel up, whenever you want it.
     write_dash_state
 
+    hud_ticker
+
     sleep 3
 done
 }
@@ -2882,156 +2960,221 @@ pause_screen() {
     WAIT_FOR_INPUT >/dev/null 2>&1
 }
 
-# Live Stats holds its own input rather than falling through to
-# pause_screen(), so the screen can be redrawn in place: LEFT repaints from
-# the state file the detection loop keeps writing (up to ~22s old, hence
-# the "Stats as of" line), any other button returns to the menu.
-#
-# This is still paint-on-demand, not a timer: the foreground is the only
-# process that draws, and it draws only when you ask. A repaint here is the
-# same append the menu already makes when you re-enter this screen -- the
-# rejected design was a background heartbeat painting under the foreground,
-# which is what tore. bt-bluepine's own Info screen does not refresh at all
-# (LOG lines, then WAIT_FOR_BUTTON_PRESS A); this is that plus a repeat.
-screen_live_stats() {
+# Auto-refreshing Live Overview dashboard
+# Uses timed non-blocking input (timeout 3 WAIT_FOR_INPUT) to automatically refresh stats
+# without requiring manual button presses. If no button is pressed within 3s, it checks
+# whether state updated and repaints. LEFT forces an immediate reprint; any other button exits.
+screen_live_overview() {
+    LOG cyan "================ Live Overview ================"
+    LOG "Auto-refreshing every 3s. Press any key to return."
+    local last_rendered=""
+
     while true; do
-        show_dash_screen
-        LOG green "LEFT refreshes, any other button returns"
-        case "$(WAIT_FOR_INPUT 2>/dev/null)" in
-            LEFT) continue ;;
-            # Anything else returns -- including an empty result, so a
-            # platform without WAIT_FOR_INPUT cannot spin here forever.
-            *) break ;;
+        if [ -s "$DASH_STATE_FILE" ]; then
+            local cur_state
+            cur_state=$(cat "$DASH_STATE_FILE")
+            if [ "$cur_state" != "$last_rendered" ]; then
+                while IFS= read -r line; do
+                    [ -z "$line" ] && continue
+                    local col="${line%%|*}"
+                    local txt="${line#*|}"
+                    if [ -n "$col" ]; then LOG "$col" "$txt"; else LOG "$txt"; fi
+                done < "$DASH_STATE_FILE"
+                last_rendered="$cur_state"
+            fi
+        else
+            LOG yellow "Stats: initializing..."
+        fi
+
+        local key
+        key=$(timeout 3 WAIT_FOR_INPUT 2>/dev/null)
+        case "$key" in
+            "")
+                # Timed out without button press: loop & auto-refresh!
+                continue
+                ;;
+            "LEFT")
+                # Force instant repaint
+                last_rendered=""
+                continue
+                ;;
+            *)
+                # User pressed any other button -> return to menu
+                LOG green "Returning to menu..."
+                break
+                ;;
         esac
     done
 }
 
-# Last hits across every loot file this session, newest first. Read from
-# the files rather than from memory: the counters live in detection_loop's
-# process and are not visible here.
+# Shows the newest 8 detections across ALL detectors in chronological order.
+# Reads from RECENT_EVENTS_FILE first (consolidated by hud_event), falling back to loot files.
 screen_recent() {
     local n=0 f line
     LOG magenta "$(dash_rule 'Recent Detections')"
-    for f in "$LOG_FILE" "$TRACKER_LOG_FILE" "$DRONE_LOG_FILE" "$DEAUTH_LOG_FILE"; do
-        [ -s "$f" ] || continue
-        while IFS= read -r line; do
-            case "$line" in ""|*"log started"*|*"started at"*) continue ;; esac
-            LOG "${line:0:48}"
+    if [ -s "$RECENT_EVENTS_FILE" ]; then
+        while IFS='|' read -r ts col tag det; do
+            [ -z "$tag" ] && continue
+            if [ -n "$col" ]; then
+                LOG "$col" "$ts $tag $det"
+            else
+                LOG "$ts $tag $det"
+            fi
             n=$((n + 1))
+        done < <(tail -n 8 "$RECENT_EVENTS_FILE")
+    fi
+    if [ "$n" = "0" ]; then
+        for f in "$LOG_FILE" "$TRACKER_LOG_FILE" "$DRONE_LOG_FILE" "$DEAUTH_LOG_FILE"; do
+            [ -s "$f" ] || continue
+            while IFS= read -r line; do
+                case "$line" in ""|*"log started"*|*"started at"*) continue ;; esac
+                LOG "${line:0:48}"
+                n=$((n + 1))
+                [ "$n" -ge 8 ] && break
+            done < <(tail -n 8 "$f")
             [ "$n" -ge 8 ] && break
-        done < <(tail -n 8 "$f")
-        [ "$n" -ge 8 ] && break
-    done
+        done
+    fi
     [ "$n" = "0" ] && LOG green "Nothing logged yet this session"
     LOG magenta "$(dash_rule 'Recent Detections')"
 }
-
 
 screen_session() {
     LOG magenta "$(dash_rule 'Session Files')"
     LOG cyan "Loot: $LOOT_DIR"
     LOG "Session: $TIMESTAMP"
     LOG "Version: v$SCRIPT_VERSION"
+    if [ -f "$SCRIPT_DIR/export_gps_kml.sh" ]; then
+        LOG green "Tip: GPS hits will auto-export to KML upon exit"
+    fi
     LOG magenta "$(dash_rule 'Session Files')"
 }
 
-# Falls back to running headless if LIST_PICKER is missing, rather than
-# spinning on a picker that never returns -- same defensive stance the
-# startup toggle menu already takes.
+# Interactive control menu with dynamic live counters embedded in menu labels
+menu_loop() {
+    touch "$MENU_ACTIVE_FLAG"
+    while true; do
+        local dev_cnt="0"
+        if [ -s "$DASH_STATE_FILE" ]; then
+            dev_cnt=$(grep -E "^(red|green)\|Unique Devices:" "$DASH_STATE_FILE" 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}')
+        fi
+        [ -z "$dev_cnt" ] && dev_cnt="$DETECTIONS"
+
+        local latest="None"
+        if [ -s "$LATEST_EVENT_FILE" ]; then
+            latest=$(cat "$LATEST_EVENT_FILE" 2>/dev/null)
+            latest="${latest:0:22}"
+        fi
+
+        local gps_st="No Fix"
+        if [ -s "$DASH_STATE_FILE" ] && grep -q "GPS: yes" "$DASH_STATE_FILE" 2>/dev/null; then
+            gps_st="Fix OK"
+        fi
+
+        local stealth_st="Alerts On"
+        case "$STEALTH_MODE" in
+            1) stealth_st="Vibrate Only" ;;
+            2) stealth_st="Silent" ;;
+        esac
+
+        local sel
+        sel=$(LIST_PICKER "Counter-Surveillance" \
+            "1: Live Overview ($dev_cnt devs)" \
+            "2: Recent Hits ($latest)" \
+            "3: Bookmark Moment ($gps_st)" \
+            "4: Stealth Mode ($stealth_st)" \
+            "5: GPS Status ($gps_st)" \
+            "6: Session Info & Export" \
+            "0: Return to Live HUD" \
+            "X: Stop Scanning & Exit")
+
+        case "$sel" in
+            "1: Live Overview"*) screen_live_overview ;;
+            "2: Recent Hits"*)   screen_recent;  pause_screen ;;
+            "3: Bookmark Moment"*) do_bookmark;  pause_screen ;;
+            "4: Stealth Mode"*)
+                STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 ))
+                case "$STEALTH_MODE" in
+                    0) LOG green "Stealth: Alerts On (LED+Audio+Vibrate)" ;;
+                    1) LOG yellow "Stealth: Vibrate Only (LED/Audio off)" ;;
+                    2) LOG red "Stealth: Silent (All physical alerts off)" ;;
+                esac
+                sleep 0.8
+                ;;
+            "5: GPS Status"*)    screen_gps;     pause_screen ;;
+            "6: Session Info"*)  screen_session; pause_screen ;;
+            "0: Return to Live HUD"|"")
+                break
+                ;;
+            "X: Stop Scanning"*)
+                if command -v CONFIRMATION_DIALOG >/dev/null 2>&1; then
+                    local resp
+                    resp=$(CONFIRMATION_DIALOG "Stop scanning and exit?")
+                    [ "$resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ] && return 1
+                    continue
+                fi
+                return 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    rm -f "$MENU_ACTIVE_FLAG"
+    LOG green "Live Scanner active (Press any button for Menu)"
+    return 0
+}
+
+# Startup banner & fallback check
+rm -f "$MENU_ACTIVE_FLAG"
+LOG " "
+LOG cyan "================================================"
+LOG cyan "  Counter-Surveillance-Pager v$SCRIPT_VERSION"
+LOG cyan "  Live Scanner Active"
+LOG cyan "================================================"
+LOG green "  Press any button at any time to open Menu"
+LOG green "  Press RIGHT to bookmark current location"
+LOG " "
+
 if ! command -v LIST_PICKER >/dev/null 2>&1; then
-    LOG red "LIST_PICKER unavailable -- detectors running, no menu."
+    LOG yellow "LIST_PICKER unavailable -- running continuous Live HUD."
     wait "$DETECTION_PID"
     exit 0
 fi
 
-LOG " "
-LOG green "Detectors running in the background. Use the menu."
-
-# Cross-process-safe status line for the menu banner below: pulled from
-# $DASH_STATE_FILE rather than GPS_FIX/STEALTH_MODE/DETECTIONS directly.
-# Those only exist inside detection_loop's process (backgrounded with
-# "detection_loop &", a separate shell) -- see write_dash_state()'s own
-# header for why the state file is the only channel between the two. Line
-# 2 of that file is always write_dash_state()'s "Uptime: .. | GPS: .. |
-# Alerts: .." cyan fact line; cut drops just the leading "cyan|" colour
-# field and rejoins the rest on the same delimiter, which is safe here
-# because that line's own " | " separators use spaces around the pipe and
-# never collide with cut's bare "|" field split.
-menu_status_line() {
-    [ -s "$DASH_STATE_FILE" ] && sed -n '2p' "$DASH_STATE_FILE" | cut -d'|' -f2-
-}
-
-# Persistent header + numbered list, painted before every LIST_PICKER
-# raise -- context only, NOT gated behind its own WAIT_FOR_INPUT. An
-# earlier version of this function added that second gate, modeled on
-# bt-bluepine's main_menu() (which does block on a press before its own
-# picker) -- confirmed live on THIS device to cause exactly the "flashing
-# between two screens" symptom pause_screen() exists to prevent: reported
-# from the field as the banner and the picker alternating rapidly.
-#
-# The mechanism isn't WAIT_FOR_INPUT itself -- pause_screen() below uses
-# the identical call and has been solid the whole time this function
-# existed. What's different here is calling it a SECOND time back-to-back:
-# every path into this function arrives immediately after pause_screen()'s
-# own WAIT_FOR_INPUT just returned (leaf screen) or after a
-# CONFIRMATION_DIALOG just closed (declined Stop Scanning), with no
-# rendering happening in between the two waits the way pause_screen()
-# always has (a leaf screen's own LOG output, including this file's
-# dash-style sleep 0.2 pauses between sections, running before ITS
-# WAIT_FOR_INPUT is reached). Two WAIT_FOR_INPUT calls with nothing
-# rendered between them is the one thing that changed; removing this
-# function's own call, while still painting the banner for context, is
-# the targeted revert -- pause_screen() already covers the transition that
-# actually caused the original documented bug (leaf screen -> menu).
-show_menu_banner() {
-    local status
-    status=$(menu_status_line)
-    LOG magenta "$(dash_rule 'Main Menu')"
-    [ -n "$status" ] && LOG cyan "$status"
-    LOG "1: Live Stats"
-    LOG "2: Recent Detections"
-    LOG "3: Bookmark This Moment"
-    LOG "4: Session Files"
-    LOG "5: GPS Status"
-    LOG "0: Stop Scanning"
-}
-
+# Foreground controller: default is Live Scanner HUD
+# When user presses a button, pause HUD logging and open interactive menu!
 while true; do
-    show_menu_banner
-    _sel=$(LIST_PICKER "Counter-Surveillance v$SCRIPT_VERSION" \
-        "1: Live Stats" \
-        "2: Recent Detections" \
-        "3: Bookmark This Moment" \
-        "4: Session Files" \
-        "5: GPS Status" \
-        "0: Stop Scanning" \
-        "1: Live Stats")
-    case "$_sel" in
-        "1: Live Stats")           screen_live_stats ;;   # holds its own input, see above
-        "2: Recent Detections")    screen_recent;  pause_screen ;;
-        "3: Bookmark This Moment") do_bookmark;    pause_screen ;;
-        "4: Session Files")        screen_session; pause_screen ;;
-        "5: GPS Status")           screen_gps;     pause_screen ;;
-        "0: Stop Scanning")
-            # Confirmation dialog, bt-bluepine style (its own main_menu()
-            # exit does the same before killing anything). Guarded the
-            # same way LIST_PICKER itself is guarded above: if
-            # CONFIRMATION_DIALOG isn't available, fall through to the old
-            # immediate-stop behavior rather than hang waiting on a verb
-            # that doesn't exist here.
-            if command -v CONFIRMATION_DIALOG >/dev/null 2>&1; then
-                _resp=$(CONFIRMATION_DIALOG "Stop scanning and exit?")
-                [ "$_resp" = "$DUCKYSCRIPT_USER_CONFIRMED" ] && break
-                continue
-            fi
-            break
-            ;;
-        *)                         break ;;
-    esac
+    rm -f "$MENU_ACTIVE_FLAG"
+    _btn=$(WAIT_FOR_INPUT 2>/dev/null)
+
+    # RIGHT button quick-bookmarks without interrupting the Live Scanner HUD
+    if [ "$_btn" = "RIGHT" ]; then
+        do_bookmark
+        LOG green "Bookmark saved! Live Scanner continuing..."
+        continue
+    fi
+
+    touch "$MENU_ACTIVE_FLAG"
+    menu_loop
+    _menu_status=$?
+
+    # If menu returned 1, user selected "Stop Scanning"
+    if [ "$_menu_status" -eq 1 ]; then
+        break
+    fi
 done
 
 LOG magenta "$(dash_rule 'Stopping')"
 kill "$DETECTION_PID" 2>/dev/null
 wait "$DETECTION_PID" 2>/dev/null
+
+# Automated KML export if GPS fixes were recorded during the session!
+if [ -f "$SCRIPT_DIR/export_gps_kml.sh" ] && grep -q " | gps=" "$LOG_FILE" 2>/dev/null; then
+    LOG cyan "Exporting GPS detections to KML..."
+    bash "$SCRIPT_DIR/export_gps_kml.sh" "$LOG_FILE" 2>>"$LOG_FILE"
+    LOG green "KML export saved to loot!"
+fi
+
 LOG green "Detectors stopped. Loot in $LOOT_DIR"
 exit 0

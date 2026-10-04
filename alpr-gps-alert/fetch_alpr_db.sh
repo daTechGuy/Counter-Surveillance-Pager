@@ -97,6 +97,27 @@ CREATE TABLE cameras (id INTEGER, lat REAL, lon REAL);
 CREATE INDEX idx_lat ON cameras(lat);
 SQL
     echo "DB: $DB_FILE built ($(sqlite3 "$DB_FILE" 'SELECT COUNT(*) FROM cameras;') rows indexed)"
+elif command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+    DB_FILE="${OUT_CSV%.csv}.sqlite"
+    rm -f "$DB_FILE"
+    PY_BIN=$(command -v python3 2>/dev/null || command -v python 2>/dev/null)
+    "$PY_BIN" -c '
+import sqlite3, csv, sys
+db_file = sys.argv[1]
+csv_file = sys.argv[2]
+conn = sqlite3.connect(db_file)
+cur = conn.cursor()
+cur.execute("CREATE TABLE cameras (id INTEGER, lat REAL, lon REAL)")
+with open(csv_file, "r", encoding="utf-8") as f:
+    r = csv.reader(f)
+    next(r)
+    cur.executemany("INSERT INTO cameras VALUES (?, ?, ?)", r)
+cur.execute("CREATE INDEX idx_lat ON cameras(lat)")
+conn.commit()
+cur.execute("SELECT COUNT(*) FROM cameras")
+print(f"DB: {db_file} built ({cur.fetchone()[0]} rows indexed via Python)")
+conn.close()
+' "$DB_FILE" "$OUT_CSV"
 else
-    echo "WARN: sqlite3 not found on this machine -- $OUT_CSV was written, but the .sqlite payload.sh actually reads was NOT built. Install sqlite3 and re-run, or build it manually (see this script's own sqlite3 invocation above)." >&2
+    echo "WARN: neither sqlite3 nor python found -- $OUT_CSV was written, but the .sqlite payload.sh actually reads was NOT built." >&2
 fi
