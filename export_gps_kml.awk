@@ -27,6 +27,7 @@ BEGIN {
     # One Style per category so Google Earth/Maps color-codes the pins.
     # KML color format is aabbggrr (alpha, blue, green, red), not rrggbb.
     print style_def("flock",    "ff0000ff")   # red
+    print style_def("alpr",     "ff0000cc")   # crimson -- GPS DeFlock ALPR camera
     print style_def("mesh",     "ff00a5ff")   # orange
     print style_def("tracker",  "ffff00ff")   # magenta
     print style_def("deauth",   "ff0000ff")   # red
@@ -34,6 +35,9 @@ BEGIN {
     print style_def("drone",    "ff00ffff")   # yellow
     print style_def("raven",    "ff800080")   # purple -- Flock Raven gunshot detector
     print style_def("robot",    "ffffff00")   # cyan -- Unitree robot
+    print style_def("glasses",  "ffcc0099")   # violet -- smart glasses
+    print style_def("pineapple","ff0045ff")   # orange-red -- rogue pineapple
+    print style_def("skimmer",  "ff000088")   # maroon -- credit card skimmer
     print style_def("bookmark", "ff00ff00")   # green -- deliberately not used
                                                # by any detector category, so a
                                                # manually-flagged moment always
@@ -66,6 +70,10 @@ function category_for(fname, text,    lt) {
         return "deauth"
     }
     if (fname ~ /drone_rid/) return "drone"
+    if (lt ~ /known alpr camera|osm:/) return "alpr"
+    if (lt ~ /glasses\?\?/) return "glasses"
+    if (lt ~ /rogue pineapple\?/) return "pineapple"
+    if (lt ~ /cc skimmer\?/) return "skimmer"
     # "Raven? (BLE fw12, ..." / "Raven?? (BLE fw11x, ..." and "Unitree Go2
     # (BLE ..." -- own pins rather than folded into flock/drone the way Live
     # Stats groups them, so a map review can still tell them apart.

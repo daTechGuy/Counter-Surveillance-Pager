@@ -34,7 +34,7 @@ See `rogue_tracker_monitor.awk`'s header for the exact byte offsets and what was
 
 ## What this is
 
-Combines thirteen radio detectors into one Pager payload, each independently toggleable at startup via a `LIST_PICKER` menu, all on by default. Bluetooth Classic inquiry has no toggle of its own: it needs no decoder and no second radio, so it rides the same scan cycle whenever `hcitool` is present. The fourteenth detector, GPS-database ALPR, is now a separate payload -- see [`alpr-gps-alert/`](alpr-gps-alert/).
+Combines thirteen radio detectors and GPS-database ALPR camera proximity detection into one unified Pager payload, each independently toggleable at startup via a `LIST_PICKER` menu, all on by default. Bluetooth Classic inquiry has no toggle of its own: it needs no decoder and no second radio, so it rides the same scan cycle whenever `hcitool` is present. GPS-database ALPR proximity cross-references live GPS position with an indexed SQLite database of 143k+ mapped plate-reader cameras via `gps_alpr_proximity.awk`.
 
 - **Flock Safety detection**, three independent WiFi paths plus BLE, all sharing one dedup/alert pipeline:
   - **BLE name scan** -- taken verbatim from Flock-You / Flock_Detect (now also matching "XUNTONG" -- the manufacturer behind BLE company ID 0x09C8 -- and a small Flock OUI list, see Credit above), plus `flock_ble_monitor.awk`'s two paths: an UNVERIFIED 16-bit service UUID 0x09C8 match (log-only), and a **validated** match that needs company ID 0x09C8 in the manufacturer data, a bare 10-digit serial as the device name, and an embedded `TN` serial all on one advertisement (vibrate/LED, same tier as `conf=medium`). Both skip already-resolved identity addresses, which only privacy-mode phones and wearables produce.
@@ -57,7 +57,7 @@ Combines thirteen radio detectors into one Pager payload, each independently tog
 - **Drone Remote ID detection** -- a from-scratch Linux port of what Sky-Spy does on ESP32, reimplementing its detection logic directly against the ASTM F3411 / Open Drone ID spec for the Pager's own BLE and WiFi radios, using `hcidump` and `iw`/`tcpdump` instead of ESP-IDF.
 - **Deauth-flood detection** (`deauth_eviltwin_monitor.awk`) -- counts Deauthentication/Disassociation management frames per transmitter MAC. A single deauth is normal WiFi churn (a client actually disconnecting); a rapid burst from one source is the signature of an active attack (aireplay-ng, mdk4, ESP32 "deauther" boards). Works standalone, no config needed. Rate decision (not just raw count) lives in `payload.sh`'s `handle_deauth_line()`, using a delta-based calculation (count/time since the *last* hit line, not since the start of the run) specifically so a slow trickle of normal disconnects over hours doesn't eventually cross a naive cumulative threshold.
 - **Evil-twin AP detection** (same file, same process) -- flags a Beacon advertising a trusted SSID name from a BSSID not in your configured allowlist, i.e. someone broadcasting your home/work WiFi's name to get your devices to auto-connect to them instead. Config-driven via `trusted_networks.conf`, which ships **empty** -- only you know your own network's real SSID/BSSID(s).
-- **Known ALPR Cameras (GPS Database)** -- **moved to its own payload**, [`alpr-gps-alert/`](alpr-gps-alert/). It is the one detector here that uses no radio at all: pure geography, cross-referencing your live GPS position against a local database of mapped ALPR camera locations, so a camera alerts even if it never transmits anything any RF detector could see. It was split out because it shares nothing with the detectors above -- no adapter, no monitor mode, no channel hopping, none of the `pineapd` contention -- cannot be starved by the shared-radio duty cycle they compete inside and never takes radio time from them, and carries a 3.8MB dataset nothing else reads. See that payload's own README.
+- **Known ALPR Cameras (GPS Database Proximity)** (`gps_alpr_proximity.awk`) -- queries a local SQLite database (`alpr_camera_db.sqlite`) of known ALPR / plate-reader camera locations (sourced from DeFlock / OpenStreetMap). Uses an indexed bounding-box pre-filter in SQLite followed by precise haversine distance filtering (<0.0947mi / ~500ft) via `gps_alpr_proximity.awk`. Operates geographically with zero RF required, alerting on silent cameras while you drive. Complements RF detection with ground-truth mapping. Also available as standalone dedicated payload in [`alpr-gps-alert/`](alpr-gps-alert/).
 
 All WiFi detectors (Flock's three WiFi paths + Mesh-Detect + drone Remote ID + deauth/evil-twin) share one radio hopping channels 11/6/1 (250ms dwell) instead of drone detection's old fixed channel 6 -- see Known limitations. The rogue tracker detector shares the BLE radio with the drone BLE detector and the Flock BLE scan the same way (the one shared passive `hcidump` capture, piggybacking on whatever scan window is already open) -- no new radio time for this either.
 
@@ -71,7 +71,7 @@ All WiFi detectors (Flock's three WiFi paths + Mesh-Detect + drone Remote ID + d
   - **Dynamic Context-Rich Menu:** Menu options in `LIST_PICKER` dynamically embed live telemetry directly in their labels (e.g. `1: Live Overview (10 devs)`, `2: Recent Hits (latest)`, `3: Bookmark Moment (GPS Fix OK)`).
   - **Auto-Refreshing Live Overview ("1: Live Overview"):** Replaced the static blocking screen. Uses non-blocking input interception (`timeout 3 WAIT_FOR_INPUT 2>/dev/null`) so the overview auto-refreshes every 3 seconds if state changed, or instantly when `LEFT` is pressed, while any other button cleanly returns to the menu. Artificial sleep pauses (`sleep 0.2`) on section rules were removed for snappy rendering.
   - **Chronological Recent Hits ("2: Recent Hits"):** Reads and prints the newest 8 detections chronologically across all detector categories, rather than dumping disparate files.
-  - Counts are unique devices, not alerts: a tracker re-alerting every cooldown, or a camera caught on both the WiFi and BLE paths, moves the total once. The detector grid is two dot-leader columns spanning 48 characters:
+  - Counts are unique devices, not alerts: a tracker re-alerting every cooldown, or a camera caught on both the WiFi and BLE paths, moves the total once. The detector grid is two dot-leader columns spanning 48 characters (8 slots perfectly filling 4 rows):
 
   ```
   ============================== Session Info ====
@@ -81,7 +81,7 @@ All WiFi detectors (Flock's three WiFi paths + Mesh-Detect + drone Remote ID + d
   Flock .............. 5    Drone/Robot ........ 2
   Tracker ............ 0    Mesh ............... 0
   WiFi Attack ........ 3    Skimmer ............ 0
-  Glasses ............ 0    Pineapple .......... 0
+  Glasses ............ 0    GPS ALPR ........... 0
   ```
 
   "0: Stop Scanning" confirms via `CONFIRMATION_DIALOG` before stopping detection and automatically exporting GPS tracks to KML if GPS fixes were recorded.

@@ -120,6 +120,9 @@
 #   Evil-twin AP scan : same as deauth flood (same detector file/process) --
 #                        no-op until trusted_networks.conf has a trusted:
 #                        entry
+#   GPS ALPR camera scan: + sqlite3, gps_alpr_proximity.awk, alpr_camera_db.sqlite,
+#                        and an active GPS fix (indexed bounding-box query +
+#                        haversine distance filtering against DeFlock OSM database)
 # ============================================================================
 #
 # CROSS-CUTTING FEATURES (not tied to one detector):
@@ -409,6 +412,42 @@ DASH_STATE_FILE="${WORK_DIR}/dash_state"
 # had just been started, which never changed.
 rm -f "$DASH_STATE_FILE" "$DASH_STATE_FILE.tmp" 2>/dev/null
 
+# ---------------------------------------------------------------------------
+# GPS-database ALPR camera proximity detection (DeFlock/OSM database)
+# ---------------------------------------------------------------------------
+# Cross-references live GPS fixes against an indexed SQLite database of known
+# plate-reader camera locations. Operates geographically with zero RF required.
+ALPR_DB_FILE=""
+for _db in "$SCRIPT_DIR/alpr_camera_db.sqlite" \
+           "$SCRIPT_DIR/alpr-gps-alert/alpr_camera_db.sqlite" \
+           "/root/payloads/user/reconnaissance/ALPR-GPS-Alert/alpr_camera_db.sqlite" \
+           "/root/loot/alpr_gps_alert/alpr_camera_db.sqlite" \
+           "/root/alpr_camera_db.sqlite"; do
+    if [ -f "$_db" ]; then
+        ALPR_DB_FILE="$_db"
+        break
+    fi
+done
+
+ALPR_AWK_FILE=""
+for _awk in "$SCRIPT_DIR/gps_alpr_proximity.awk" \
+            "$SCRIPT_DIR/alpr-gps-alert/gps_alpr_proximity.awk" \
+            "/root/payloads/user/reconnaissance/ALPR-GPS-Alert/gps_alpr_proximity.awk"; do
+    if [ -f "$_awk" ]; then
+        ALPR_AWK_FILE="$_awk"
+        break
+    fi
+done
+
+# Alert radius: 0.0947mi (~500ft / 152m). Bounding-box margin in degrees: 0.15 (~10mi)
+ALPR_RADIUS_MI=0.0947
+ALPR_BBOX_MARGIN_DEG=0.15
+
+GPS_ALPR_OK=0
+if [ -n "$ALPR_DB_FILE" ] && [ -n "$ALPR_AWK_FILE" ] && command -v sqlite3 >/dev/null 2>&1; then
+    GPS_ALPR_OK=1
+fi
+
 BOOKMARK_LOG_FILE="${LOOT_DIR}/bookmarks_${TIMESTAMP}.txt"
 echo "Bookmark log (RIGHT button = flag this moment) started at $(date)" > "$BOOKMARK_LOG_FILE"
 # Persistence heuristic thresholds -- see handle_tracker_line() and this
@@ -596,6 +635,8 @@ WANT_RAVEN=1
 # the same kind of autonomous platform as a drone, and counted in Live
 # Stats' Drone/Robot slot alongside drone Remote ID.
 WANT_UNITREE=1
+# Known ALPR camera GPS proximity detection via DeFlock SQLite database
+WANT_GPS_ALPR=1
 # Off by default, unlike every WANT_* above -- this piggybacks entirely on
 # the Rogue BLE trackers' scan process (rogue_tracker_monitor.awk's iBeacon/
 # Eddystone-UID/Eddystone-URL branches, see that file's header), so it's
@@ -762,6 +803,7 @@ detection_menu_item() {
         pineapple) val="$WANT_PINEAPPLE" ;;
         raven) val="$WANT_RAVEN" ;;
         unitree) val="$WANT_UNITREE" ;;
+        alpr_gps) val="$WANT_GPS_ALPR" ;;
         retail_beacons) val="$WANT_RETAIL_BEACONS" ;;
     esac
     if [ "$val" = "1" ]; then echo "[X] $name"; else echo "[ ] $name"; fi
@@ -841,6 +883,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item pineapple 'Rogue Pineapple / pentest device')" \
             "$(detection_menu_item raven 'Flock Raven gunshot detectors')" \
             "$(detection_menu_item unitree 'Unitree robots (Go2/G1/H1/B2/X1)')" \
+            "$(detection_menu_item alpr_gps 'GPS ALPR camera proximity (DeFlock DB)')" \
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
@@ -858,6 +901,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Rogue Pineapple"*) WANT_PINEAPPLE=$((1 - WANT_PINEAPPLE)) ;;
             *"Flock Raven"*) WANT_RAVEN=$((1 - WANT_RAVEN)) ;;
             *"Unitree robots"*) WANT_UNITREE=$((1 - WANT_UNITREE)) ;;
+            *"GPS ALPR camera proximity"*) WANT_GPS_ALPR=$((1 - WANT_GPS_ALPR)) ;;
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
@@ -1110,6 +1154,20 @@ if [ "$WANT_UNITREE" = "0" ]; then
     LOG yellow "Unitree robot BLE: disabled (not selected)"
 else
     LOG green "Unitree robot BLE: enabled"
+fi
+
+if [ "$WANT_GPS_ALPR" = "0" ]; then
+    LOG yellow "GPS ALPR proximity: disabled (not selected in detection menu)"
+elif [ "$GPS_ALPR_OK" = "1" ]; then
+    LOG green "GPS ALPR proximity: enabled ($(basename "$ALPR_DB_FILE"), ${ALPR_RADIUS_MI}mi radius)"
+else
+    if ! command -v sqlite3 >/dev/null 2>&1; then
+        LOG red "GPS ALPR proximity: disabled (sqlite3 not installed)"
+    elif [ -z "$ALPR_DB_FILE" ]; then
+        LOG yellow "GPS ALPR proximity: disabled (alpr_camera_db.sqlite not found)"
+    elif [ -z "$ALPR_AWK_FILE" ]; then
+        LOG red "GPS ALPR proximity: disabled (gps_alpr_proximity.awk missing)"
+    fi
 fi
 
 # The shared wlan1mon radio setup itself is gated on ANY WiFi-side category
@@ -1416,7 +1474,7 @@ declare -A CAT_COUNT
 # keys CAT_COUNT on, and what the "Off:" line names. Kept as a space-
 # separated string rather than an associative array so the order is fixed
 # and readable.
-DASH_CATS="flock raven drone unitree tracker mesh deauth pineapple skimmer glasses"
+DASH_CATS="flock raven drone unitree tracker mesh deauth pineapple skimmer glasses alpr_gps"
 
 # The grid shows fewer slots than there are categories: related detectors
 # share one, so adding Raven and Unitree did not add a row. DASH_SLOTS is
@@ -1424,39 +1482,43 @@ DASH_CATS="flock raven drone unitree tracker mesh deauth pineapple skimmer glass
 #   Flock       -- flock + raven (both Flock Safety products)
 #   Drone/Robot -- drone Remote ID + Unitree robots (autonomous platforms)
 #   WiFi Attack -- deauth/evil-twin + rogue Pineapple (hostile WiFi gear)
+#   GPS ALPR    -- DeFlock/OSM plate-reader database proximity matches
 # Grouping is display-only. Each detector keeps its own toggle, category,
 # count and loot-line label, so a session can still be picked apart after.
-DASH_SLOTS="flock drone tracker mesh attack skimmer glasses"
+DASH_SLOTS="flock drone tracker mesh attack skimmer glasses alpr_gps"
 
 dash_slot_label() {
     case "$1" in
-        drone)  echo "Drone/Robot" ;;
-        attack) echo "WiFi Attack" ;;
-        *)      dash_cat_label "$1" ;;
+        drone)    echo "Drone/Robot" ;;
+        attack)   echo "WiFi Attack" ;;
+        alpr_gps) echo "GPS ALPR" ;;
+        *)        dash_cat_label "$1" ;;
     esac
 }
 
 dash_slot_cats() {
     case "$1" in
-        flock)  echo "flock raven" ;;
-        drone)  echo "drone unitree" ;;
-        attack) echo "deauth pineapple" ;;
-        *)      echo "$1" ;;
+        flock)    echo "flock raven" ;;
+        drone)    echo "drone unitree" ;;
+        attack)   echo "deauth pineapple" ;;
+        alpr_gps) echo "alpr_gps" ;;
+        *)        echo "$1" ;;
     esac
 }
 
 dash_cat_label() {
     case "$1" in
-        flock)   echo "Flock" ;;
-        raven)   echo "Raven" ;;
-        drone)   echo "Drone" ;;
-        unitree) echo "Unitree" ;;
-        tracker) echo "Tracker" ;;
-        mesh)    echo "Mesh" ;;
-        deauth)  echo "Deauth" ;;
-        skimmer) echo "Skimmer" ;;
-        glasses) echo "Glasses" ;;
+        flock)     echo "Flock" ;;
+        raven)     echo "Raven" ;;
+        drone)     echo "Drone" ;;
+        unitree)   echo "Unitree" ;;
+        tracker)   echo "Tracker" ;;
+        mesh)      echo "Mesh" ;;
+        deauth)    echo "Deauth" ;;
+        skimmer)   echo "Skimmer" ;;
+        glasses)   echo "Glasses" ;;
         pineapple) echo "Pineapple" ;;
+        alpr_gps)  echo "GPS ALPR" ;;
     esac
 }
 
@@ -1483,6 +1545,7 @@ dash_cat_live() {
         raven)   [ "$RAVEN_BLE_OK" = "1" ] && echo 1 ;;
         # Same again: unitree_ble_match() runs over the shared lescan dump.
         unitree) [ "$BTCLASSIC_OK" = "1" ] && echo 1 ;;
+        alpr_gps) [ "$GPS_ALPR_OK" = "1" ] && echo 1 ;;
     esac
 }
 
@@ -1501,6 +1564,7 @@ dash_cat_enabled() {
         pineapple) [ "$WANT_PINEAPPLE" = "1" ] ;;
         raven)   [ "$WANT_RAVEN" = "1" ] ;;
         unitree) [ "$WANT_UNITREE" = "1" ] ;;
+        alpr_gps) [ "$WANT_GPS_ALPR" = "1" ] ;;
         *)       false ;;
     esac
 }
@@ -2503,10 +2567,50 @@ get_gps_fix() {
 # call, so tagging every single hit individually would meaningfully slow
 # the loop for marginal gain over two calls -- this halves the worst-case
 # error, it doesn't eliminate it.
+# Cross-references live GPS position against indexed ALPR camera database
+# (DeFlock/OpenStreetMap data). Two-stage filter: indexed bounding box in SQLite
+# + precise haversine distance in gps_alpr_proximity.awk.
+check_alpr_gps_proximity() {
+    [ "$WANT_GPS_ALPR" = "1" ] || return
+    [ "$GPS_ALPR_OK" = "1" ] || return
+    [ -z "$GPS_FIX" ] && return
+
+    local lat lon box_lat1 box_lat2 box_lon1 box_lon2
+    lat="${GPS_FIX%%,*}"
+    lon="${GPS_FIX##*,}"
+
+    case "$lat" in *.*) ;; *) return ;; esac
+    case "$lon" in *.*) ;; *) return ;; esac
+
+    read -r box_lat1 box_lat2 box_lon1 box_lon2 < <(awk \
+        -v clat="$lat" -v clon="$lon" -v m="$ALPR_BBOX_MARGIN_DEG" \
+        'BEGIN { print clat-m, clat+m, clon-m, clon+m }')
+
+    local id clat2 clon2 dist CURRENT_TIME ENTRY
+    while IFS=',' read -r id clat2 clon2 dist; do
+        [ -z "$id" ] && continue
+        if is_seen "ALPR_GPS_$id"; then continue; fi
+
+        CURRENT_TIME=$(date '+%H:%M:%S')
+        ENTRY="DECT: $CURRENT_TIME | osm:$id | Known ALPR Camera (GPS, ${dist}mi away)$GPS_TAG"
+        echo "$ENTRY" >> "$LOG_FILE"
+        bump_counter alpr_gps "osm:$id" "osm:$id"
+        stealth_alert "KNOWN ALPR CAMERA" "osm node $id\n${dist} miles away"
+        stealth_blink
+        hud_event red "[GPS/ALPR]" "Camera $id (${dist}mi away)"
+        mark_seen "ALPR_GPS_$id"
+    done < <(sqlite3 -csv "$ALPR_DB_FILE" \
+        "SELECT id,lat,lon FROM cameras WHERE lat BETWEEN $box_lat1 AND $box_lat2 AND lon BETWEEN $box_lon1 AND $box_lon2;" 2>/dev/null \
+        | awk -v clat="$lat" -v clon="$lon" -v radius_mi="$ALPR_RADIUS_MI" -f "$ALPR_AWK_FILE")
+}
+
 refresh_gps_tag() {
     GPS_FIX=$(get_gps_fix)
     GPS_TAG=""
     [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
+    if [ "$WANT_GPS_ALPR" = "1" ] && [ -n "$GPS_FIX" ]; then
+        check_alpr_gps_proximity
+    fi
 }
 
 # Read-only GPS diagnostics for the menu's GPS Status screen below -- ported
@@ -2554,6 +2658,13 @@ screen_gps() {
         LOG green "Fix: $fix"
     else
         LOG yellow "No fix yet (cold start can take 15-30m)"
+    fi
+    if [ "$WANT_GPS_ALPR" = "1" ]; then
+        if [ "$GPS_ALPR_OK" = "1" ]; then
+            LOG green "ALPR DB: $(basename "$ALPR_DB_FILE") (${ALPR_RADIUS_MI}mi)"
+        else
+            LOG yellow "ALPR DB: inactive (sqlite/db missing)"
+        fi
     fi
     LOG magenta "$(dash_rule 'GPS Status')"
 }
