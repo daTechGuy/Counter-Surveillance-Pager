@@ -327,7 +327,7 @@ SCRIPT_VERSION="unknown"
 LOOT_DIR="/root/loot/counter_surveillance_pager"
 WORK_DIR="/tmp/counter_surveillance_pager"
 mkdir -p "$LOOT_DIR" "$WORK_DIR"
-rm -f "$WORK_DIR"/*.log "$WORK_DIR"/*.fifo 2>/dev/null
+rm -f "$WORK_DIR"/*.log "$WORK_DIR"/*.fifo "$WORK_DIR"/screen_asleep 2>/dev/null
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # Renamed from flock_you_<ts>.txt: this file now carries Flock AND
@@ -335,12 +335,14 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 # log below, unchanged.)
 LOG_FILE="${LOOT_DIR}/surveillance_${TIMESTAMP}.txt"
 DRONE_LOG_FILE="${LOOT_DIR}/drone_rid_${TIMESTAMP}.txt"
+TRACK_FILE="${LOOT_DIR}/track_${TIMESTAMP}.txt"
 # Created (truncating) here, before any of the capability-detection commands
 # below start appending (2>>) diagnostic output to LOG_FILE -- writing this
 # with `>` again later would silently wipe out those first-run diagnostics
 # right when they're most useful (e.g. did `iw ... type monitor` fail?).
 echo "Counter-Surveillance-Pager v$SCRIPT_VERSION started at $(date)" > "$LOG_FILE"
 echo "Drone Remote ID log started at $(date)" > "$DRONE_LOG_FILE"
+echo "GPS survey route breadcrumbs started at $(date)" > "$TRACK_FILE"
 
 BLE_HITS="$WORK_DIR/ble_rid_hits.log"
 WIFI_HITS="$WORK_DIR/wifi_rid_hits.log"
@@ -512,14 +514,48 @@ WIFI_HOP_PID=""
 DETECTION_PID=""
 WIFI_IFACE_CREATED=0
 
+# Display backlight management & screen power saving
+BACKLIGHT_SYSFS="/sys/class/backlight/backlight_pwm"
+SAVED_BRIGHTNESS=1
+if [ -f "${BACKLIGHT_SYSFS}/brightness" ]; then
+    _init_b=$(cat "${BACKLIGHT_SYSFS}/brightness" 2>/dev/null)
+    [ -n "$_init_b" ] && [ "$_init_b" -gt 0 ] 2>/dev/null && SAVED_BRIGHTNESS="$_init_b"
+fi
+
+set_backlight() {
+    local val="$1"
+    if [ -f "${BACKLIGHT_SYSFS}/brightness" ]; then
+        echo "$val" > "${BACKLIGHT_SYSFS}/brightness" 2>/dev/null
+    fi
+}
+
+wake_screen() {
+    if [ -f "${WORK_DIR}/screen_asleep" ]; then
+        rm -f "${WORK_DIR}/screen_asleep" 2>/dev/null
+        set_backlight "$SAVED_BRIGHTNESS"
+    fi
+}
+
+sleep_screen() {
+    if [ -f "${BACKLIGHT_SYSFS}/brightness" ]; then
+        local _cur_b
+        _cur_b=$(cat "${BACKLIGHT_SYSFS}/brightness" 2>/dev/null)
+        [ -n "$_cur_b" ] && [ "$_cur_b" -gt 0 ] 2>/dev/null && SAVED_BRIGHTNESS="$_cur_b"
+        touch "${WORK_DIR}/screen_asleep"
+        set_backlight 0
+    fi
+}
+
 cleanup() {
+    wake_screen
+    set_backlight "$SAVED_BRIGHTNESS"
     for p in "$HCIDUMP_PID" "$BLE_MON_PID" "$MGT_TCPDUMP_PID" "$MGT_AWK_PID" \
              "$FLOCK_ADDR1_TCPDUMP_PID" "$FLOCK_ADDR1_MON_PID" \
              "$WIFI_HOP_PID" \
              "$DETECTION_PID"; do
         [ -n "$p" ] && kill "$p" 2>/dev/null
     done
-    rm -f "$BLE_FIFO" "$FLOCK_ADDR1_FIFO" "$MGT_RAW_FIFO"
+    rm -f "$BLE_FIFO" "$FLOCK_ADDR1_FIFO" "$MGT_RAW_FIFO" "${WORK_DIR}/screen_asleep" 2>/dev/null
     if [ "$WIFI_IFACE_CREATED" = "1" ]; then
         iw dev "$WIFI_IFACE" del 2>/dev/null
     fi
@@ -767,6 +803,9 @@ stealth_blink() {
 # was never suspect (see stealth_blink() below, which already writes it
 # directly to sysfs, no hak5cmd involved) and stays as-is.
 stealth_alert() {
+    # If display was asleep, wake screen for visual alert (unless in fully silent stealth mode 2)
+    [ "$STEALTH_MODE" != "2" ] && wake_screen
+
     if [ "$STEALTH_MODE" = "0" ]; then
         local _led_path
         _led_path=$(ls -d /sys/class/leds/*/ 2>/dev/null | head -1)
@@ -1390,6 +1429,13 @@ hud_event() {
 
     echo "$now_ts|$color|$tag|$detail" >> "$RECENT_EVENTS_FILE" 2>/dev/null
     echo "$now_ts $tag $detail" > "$LATEST_EVENT_FILE" 2>/dev/null
+
+    # If screen is sleeping and a priority event arrives, wake screen
+    if [ -f "${WORK_DIR}/screen_asleep" ] && [ "$STEALTH_MODE" != "2" ]; then
+        case "$color" in
+            red|yellow|magenta) wake_screen ;;
+        esac
+    fi
 
     # Suppress screen LOG output while interactive menu is open to prevent screen contention
     [ -f "$MENU_ACTIVE_FLAG" ] && return
@@ -2604,12 +2650,24 @@ check_alpr_gps_proximity() {
         | awk -v clat="$lat" -v clon="$lon" -v radius_mi="$ALPR_RADIUS_MI" -f "$ALPR_AWK_FILE")
 }
 
+LAST_TRACK_FIX=""
+LAST_TRACK_TIME=0
+
 refresh_gps_tag() {
     GPS_FIX=$(get_gps_fix)
     GPS_TAG=""
     [ -n "$GPS_FIX" ] && GPS_TAG=" | gps=$GPS_FIX"
     if [ "$WANT_GPS_ALPR" = "1" ] && [ -n "$GPS_FIX" ]; then
         check_alpr_gps_proximity
+    fi
+    if [ -n "$GPS_FIX" ]; then
+        local _now
+        _now=$(date +%s)
+        if [ "$GPS_FIX" != "$LAST_TRACK_FIX" ] && [ $((_now - LAST_TRACK_TIME)) -ge 4 ]; then
+            echo "$(date '+%H:%M:%S')|$GPS_FIX" >> "$TRACK_FILE"
+            LAST_TRACK_FIX="$GPS_FIX"
+            LAST_TRACK_TIME=$_now
+        fi
     fi
 }
 
@@ -3290,15 +3348,212 @@ screen_recent() {
     LOG magenta "$(dash_rule 'Recent Detections')"
 }
 
-screen_session() {
-    LOG magenta "$(dash_rule 'Session Files')"
-    LOG cyan "Loot: $LOOT_DIR"
-    LOG "Session: $TIMESTAMP"
-    LOG "Version: v$SCRIPT_VERSION"
-    if [ -f "$SCRIPT_DIR/export_gps_kml.sh" ]; then
-        LOG green "Tip: GPS hits will auto-export to KML upon exit"
+screen_session_hub() {
+    LOG magenta "$(dash_rule 'Session Hub')"
+    LOG cyan "Session: $TIMESTAMP (v$SCRIPT_VERSION)"
+    LOG "Loot: $LOOT_DIR"
+
+    # Quick hit counts for current session
+    local surv_c=0 track_c=0 drone_c=0 deauth_c=0 bcon_c=0 pts_c=0 bkmk_c=0
+    [ -f "$LOG_FILE" ] && surv_c=$(grep -c '^[0-9]' "$LOG_FILE" 2>/dev/null || echo 0)
+    [ -f "$TRACKER_LOG_FILE" ] && track_c=$(grep -c '^[0-9]' "$TRACKER_LOG_FILE" 2>/dev/null || echo 0)
+    [ -f "$DRONE_LOG_FILE" ] && drone_c=$(grep -c '^[0-9]' "$DRONE_LOG_FILE" 2>/dev/null || echo 0)
+    [ -f "$DEAUTH_LOG_FILE" ] && deauth_c=$(grep -c '^[0-9]' "$DEAUTH_LOG_FILE" 2>/dev/null || echo 0)
+    [ -f "$BEACON_LOG_FILE" ] && bcon_c=$(grep -c '^[0-9]' "$BEACON_LOG_FILE" 2>/dev/null || echo 0)
+    [ -f "$TRACK_FILE" ] && pts_c=$(grep -c '^[0-9]' "$TRACK_FILE" 2>/dev/null || echo 0)
+    local bkmk_file="${LOOT_DIR}/bookmarks_${TIMESTAMP}.txt"
+    [ -f "$bkmk_file" ] && bkmk_c=$(grep -c '^[0-9]' "$bkmk_file" 2>/dev/null || echo 0)
+
+    LOG "Hits -> Surv:$surv_c Trk:$track_c Drn:$drone_c Atk:$deauth_c"
+    LOG "GPS  -> Route Pts:$pts_c | Bookmarks:$bkmk_c"
+
+    if ! command -v LIST_PICKER >/dev/null 2>&1; then
+        pause_screen
+        return
     fi
-    LOG magenta "$(dash_rule 'Session Files')"
+
+    local hub_act
+    hub_act=$(LIST_PICKER "Session Actions" \
+        "1: Back to Menu" \
+        "2: Export GPS KML Now" \
+        "3: View Session Summary Report" \
+        "4: List Session Loot Files")
+
+    case "$hub_act" in
+        "2: Export GPS KML"*)
+            LOG cyan "Exporting session hits and route to KML..."
+            if [ -f "$SCRIPT_DIR/export_gps_kml.sh" ]; then
+                bash "$SCRIPT_DIR/export_gps_kml.sh" "$LOG_FILE"
+                local kml_out="${LOOT_DIR}/surveillance_${TIMESTAMP}.kml"
+                if [ -f "$kml_out" ]; then
+                    LOG green "KML Exported: $(basename "$kml_out")"
+                else
+                    LOG yellow "Export complete (check loot directory)."
+                fi
+            else
+                LOG red "export_gps_kml.sh not found."
+            fi
+            pause_screen
+            ;;
+        "3: View Session Summary"*)
+            LOG magenta "$(dash_rule 'Session Summary')"
+            if [ -f "$SCRIPT_DIR/summarize_session.sh" ]; then
+                bash "$SCRIPT_DIR/summarize_session.sh" "$TIMESTAMP"
+            else
+                LOG red "summarize_session.sh not found."
+            fi
+            LOG magenta "$(dash_rule 'Session Summary')"
+            pause_screen
+            ;;
+        "4: List Session Loot"*)
+            LOG magenta "$(dash_rule 'Loot Files')"
+            ls -lh "${LOOT_DIR}"/*"${TIMESTAMP}"* 2>/dev/null | awk '{print $9, "(" $5 ")"}' | while read -r f sz; do
+                [ -n "$f" ] && LOG cyan "$(basename "$f") $sz"
+            done
+            LOG magenta "$(dash_rule 'Loot Files')"
+            pause_screen
+            ;;
+    esac
+}
+
+menu_snooze_tracker() {
+    LOG magenta "$(dash_rule 'Tracker Snooze & Allowlist')"
+    if ! command -v LIST_PICKER >/dev/null 2>&1; then
+        LOG yellow "LIST_PICKER not available."
+        pause_screen
+        return
+    fi
+
+    local action
+    action=$(LIST_PICKER "Tracker Management" \
+        "1: Snooze Detected Tracker" \
+        "2: View Active Snoozes" \
+        "3: Clear/Remove Snooze" \
+        "4: View Permanent Allowlist" \
+        "0: Back to Menu")
+
+    case "$action" in
+        "1: Snooze Detected"*)
+            local mac_options=()
+            if [ -s "$TRACKER_LOG_FILE" ]; then
+                while IFS='|' read -r _ts _mac _lbl _rest; do
+                    _mac=$(echo "$_mac" | tr -d ' ')
+                    _lbl=$(echo "$_lbl" | tr -d ' ')
+                    [ -z "$_mac" ] && continue
+                    local exists=0
+                    for opt in "${mac_options[@]}"; do
+                        if [ "${opt%% *}" = "$_mac" ]; then exists=1; break; fi
+                    done
+                    [ "$exists" = "0" ] && mac_options+=("$_mac ($_lbl)")
+                done < <(grep -E '^[0-9:]+ \| [0-9a-fA-F:]+' "$TRACKER_LOG_FILE" | tail -n 20)
+            fi
+
+            if [ ${#mac_options[@]} -eq 0 ] && [ -s "$RECENT_EVENTS_FILE" ]; then
+                while IFS='|' read -r _ts _col _tag _det; do
+                    if [ "$_tag" = "[TRACKER]" ]; then
+                        local _m="${_det%% *}"
+                        local exists=0
+                        for opt in "${mac_options[@]}"; do
+                            if [ "${opt%% *}" = "$_m" ]; then exists=1; break; fi
+                        done
+                        [ "$exists" = "0" ] && mac_options+=("$_m (Rogue Tracker)")
+                    fi
+                done < "$RECENT_EVENTS_FILE"
+            fi
+
+            if [ ${#mac_options[@]} -eq 0 ]; then
+                LOG yellow "No tracker detections found yet this session."
+                pause_screen
+                return
+            fi
+
+            local chosen_target
+            chosen_target=$(LIST_PICKER "Select Tracker to Snooze" "${mac_options[@]}" "0: Cancel")
+            [ -z "$chosen_target" ] || [ "$chosen_target" = "0: Cancel" ] && return
+
+            local target_mac="${chosen_target%% *}"
+            local dur_pick
+            dur_pick=$(LIST_PICKER "Snooze Duration" \
+                "1h: Snooze for 1 Hour" \
+                "4h: Snooze for 4 Hours" \
+                "24h: Snooze for 24 Hours" \
+                "reboot: Until Pager Reboots" \
+                "forever: Permanent Allowlist" \
+                "0: Cancel")
+
+            local dur_arg=""
+            case "$dur_pick" in
+                "1h"*) dur_arg="1h" ;;
+                "4h"*) dur_arg="4h" ;;
+                "24h"*) dur_arg="24h" ;;
+                "reboot"*) dur_arg="reboot" ;;
+                "forever"*) dur_arg="forever" ;;
+                *) return ;;
+            esac
+
+            LOG cyan "Applying snooze: $target_mac ($dur_arg)..."
+            if [ -f "$SCRIPT_DIR/snooze_tracker.sh" ]; then
+                bash "$SCRIPT_DIR/snooze_tracker.sh" add "$target_mac" "$dur_arg"
+                load_tracker_snooze
+                LOG green "Snooze applied successfully!"
+            else
+                LOG red "snooze_tracker.sh not found."
+            fi
+            sleep 1.2
+            ;;
+
+        "2: View Active Snoozes"*)
+            LOG magenta "$(dash_rule 'Active Snoozes')"
+            if [ -f "$SCRIPT_DIR/snooze_tracker.sh" ]; then
+                bash "$SCRIPT_DIR/snooze_tracker.sh" list
+            else
+                cat "$TRACKER_SNOOZE_FILE" 2>/dev/null || LOG "No snooze file."
+            fi
+            LOG magenta "$(dash_rule 'Active Snoozes')"
+            pause_screen
+            ;;
+
+        "3: Clear/Remove Snooze"*)
+            if [ ! -s "$TRACKER_SNOOZE_FILE" ]; then
+                LOG yellow "No active snoozes to remove."
+                pause_screen
+                return
+            fi
+            local snooze_opts=()
+            while IFS='|' read -r _smac _exp _note; do
+                [ -z "$_smac" ] && continue
+                snooze_opts+=("$_smac ($_note)")
+            done < "$TRACKER_SNOOZE_FILE"
+
+            if [ ${#snooze_opts[@]} -eq 0 ]; then
+                LOG yellow "No active snoozes to remove."
+                pause_screen
+                return
+            fi
+
+            local to_remove
+            to_remove=$(LIST_PICKER "Select Snooze to Remove" "${snooze_opts[@]}" "0: Cancel")
+            [ -z "$to_remove" ] || [ "$to_remove" = "0: Cancel" ] && return
+            local rem_mac="${to_remove%% *}"
+            if [ -f "$SCRIPT_DIR/snooze_tracker.sh" ]; then
+                bash "$SCRIPT_DIR/snooze_tracker.sh" remove "$rem_mac"
+                load_tracker_snooze
+                LOG green "Removed snooze for $rem_mac."
+            fi
+            sleep 1
+            ;;
+
+        "4: View Permanent Allowlist"*)
+            LOG magenta "$(dash_rule 'Permanent Allowlist')"
+            if [ -f "$TRACKER_ALLOWLIST_FILE" ]; then
+                grep -i '^mac:' "$TRACKER_ALLOWLIST_FILE" 2>/dev/null || LOG "No permanent MAC entries."
+            else
+                LOG "Allowlist file not found."
+            fi
+            LOG magenta "$(dash_rule 'Permanent Allowlist')"
+            pause_screen
+            ;;
+    esac
 }
 
 # Interactive control menu with dynamic live counters embedded in menu labels
@@ -3335,7 +3590,9 @@ menu_loop() {
             "3: Bookmark Moment ($gps_st)" \
             "4: Stealth Mode ($stealth_st)" \
             "5: GPS Status ($gps_st)" \
-            "6: Session Info & Export" \
+            "6: Session Hub & KML Export" \
+            "7: Snooze / Allowlist Tracker" \
+            "8: Screen Sleep (Save Battery)" \
             "0: Return to Live HUD" \
             "X: Stop Scanning & Exit")
 
@@ -3374,7 +3631,24 @@ menu_loop() {
                     pause_screen
                 fi
                 ;;
-            "6: Session Info"*)  screen_session; pause_screen ;;
+            "6: Session Hub"*) screen_session_hub ;;
+            "7: Snooze"*)      menu_snooze_tracker ;;
+            "8: Screen Sleep"*)
+                LOG cyan "Entering Screen Sleep mode..."
+                LOG "Press any button to wake."
+                sleep 0.8
+                sleep_screen
+                while [ -f "${WORK_DIR}/screen_asleep" ]; do
+                    _wkey=$(timeout 2 WAIT_FOR_INPUT 2>/dev/null)
+                    if [ -n "$_wkey" ]; then
+                        wake_screen
+                        break
+                    fi
+                done
+                wake_screen
+                LOG green "Screen awakened."
+                sleep 0.5
+                ;;
             "0: Return to Live HUD"|"")
                 break
                 ;;
@@ -3419,6 +3693,7 @@ fi
 while true; do
     rm -f "$MENU_ACTIVE_FLAG"
     _btn=$(WAIT_FOR_INPUT 2>/dev/null)
+    wake_screen
 
     # RIGHT button quick-bookmarks without interrupting the Live Scanner HUD
     if [ "$_btn" = "RIGHT" ]; then
@@ -3442,11 +3717,13 @@ kill "$DETECTION_PID" 2>/dev/null
 wait "$DETECTION_PID" 2>/dev/null
 
 # Automated KML export if GPS fixes were recorded during the session!
-if [ -f "$SCRIPT_DIR/export_gps_kml.sh" ] && grep -q " | gps=" "$LOG_FILE" 2>/dev/null; then
+if [ -f "$SCRIPT_DIR/export_gps_kml.sh" ] && { grep -q " | gps=" "$LOG_FILE" 2>/dev/null || [ -s "$TRACK_FILE" ]; }; then
     LOG cyan "Exporting GPS detections to KML..."
     bash "$SCRIPT_DIR/export_gps_kml.sh" "$LOG_FILE" 2>>"$LOG_FILE"
     LOG green "KML export saved to loot!"
 fi
 
+wake_screen
+set_backlight "$SAVED_BRIGHTNESS"
 LOG green "Detectors stopped. Loot in $LOOT_DIR"
 exit 0

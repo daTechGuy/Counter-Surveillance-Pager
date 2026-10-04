@@ -43,7 +43,9 @@ BEGIN {
                                                # manually-flagged moment always
                                                # stands out from real hits
     print style_def("other",    "ffffffff")   # white
+    print "  <Style id=\"route_path\"><LineStyle><color>b2ffaa00</color><width>4</width></LineStyle></Style>"
     total = 0
+    track_count = 0
 }
 
 function style_def(id, color) {
@@ -91,6 +93,19 @@ function category_for(fname, text,    lt) {
     return "other"
 }
 
+FILENAME ~ /track/ {
+    # Breadcrumb drive path coordinates from track_TS.txt
+    split($0, flds, "|")
+    pos = flds[2]
+    gsub(/^[ \t]+|[ \t]+$/, "", pos)
+    split(pos, ll, ",")
+    lat = ll[1]; lon = ll[2]
+    if (lat != "" && lon != "") {
+        track_coords[++track_count] = lon "," lat ",0"
+    }
+    next
+}
+
 {
     # Matched directly against the end of the line, not via split-on-" | "
     # -- a field with nothing in it before gps= (e.g. rogue_tracker_
@@ -118,6 +133,21 @@ function category_for(fname, text,    lt) {
 }
 
 END {
+    if (track_count > 1) {
+        print "  <Placemark>"
+        print "    <name>Survey Route (Drive Path)</name>"
+        print "    <styleUrl>#route_path</styleUrl>"
+        print "    <LineString>"
+        print "      <tessellate>1</tessellate>"
+        print "      <coordinates>"
+        for (i = 1; i <= track_count; i++) {
+            print "        " track_coords[i]
+        }
+        print "      </coordinates>"
+        print "    </LineString>"
+        print "  </Placemark>"
+        print "Wrote route path with " track_count " breadcrumbs" > "/dev/stderr"
+    }
     print "</Document>"
     print "</kml>"
     print "Wrote " total " placemark(s)" > "/dev/stderr"

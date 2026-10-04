@@ -52,6 +52,17 @@ resolve_loot_file() {
 }
 
 TS="${1:-}"
+if [ -n "$TS" ] && [ -f "$TS" ]; then
+    TS="$(basename "$TS")"
+    TS="${TS#surveillance_}"
+    TS="${TS#rogue_trackers_}"
+    TS="${TS#deauth_eviltwin_}"
+    TS="${TS#drone_rid_}"
+    TS="${TS#bookmarks_}"
+    TS="${TS#track_}"
+    TS="${TS#retail_beacons_}"
+    TS="${TS%.txt}"
+fi
 if [ -z "$TS" ]; then
     LATEST=$(ls -t "$LOOT_DIR"/surveillance_*.txt $ARCHIVE_GLOB/surveillance_*.txt 2>/dev/null | head -1)
     if [ -z "$LATEST" ]; then
@@ -68,6 +79,8 @@ TRACK="$(resolve_loot_file "rogue_trackers_${TS}.txt")"
 DEAUTH="$(resolve_loot_file "deauth_eviltwin_${TS}.txt")"
 DRONE="$(resolve_loot_file "drone_rid_${TS}.txt")"
 BOOKMARKS="$(resolve_loot_file "bookmarks_${TS}.txt")"
+BEACONS="$(resolve_loot_file "retail_beacons_${TS}.txt")"
+TRACK_ROUTE="$(resolve_loot_file "track_${TS}.txt")"
 
 # Count matches of a pattern in a file, always printing a clean integer
 # (grep -c prints 0 on no match already, but exits nonzero for it under
@@ -94,12 +107,16 @@ if [ -f "$SURV" ]; then
     unitree=$(count_of '\| Unitree ' "$SURV")
     flock_name=$(count_of '\| (fs ext battery|[Pp]enguin|[Pp]igvision)' "$SURV")
     mesh=$(count_of 'Mesh-Detect|detected \(' "$SURV")
+    alpr_hits=$(count_of 'Known ALPR Camera' "$SURV")
+    glasses_hits=$(count_of 'Glasses\?\?' "$SURV")
+    skimmer_hits=$(count_of 'CC Skimmer\?' "$SURV")
+    pineapple_hits=$(count_of 'Rogue Pineapple\?' "$SURV")
     gps_hits=$(count_of ' \| gps=' "$SURV")
     rssi_hits=$(count_of '\|rssi=' "$SURV")
     unique_macs=$(grep '^DECT:' "$SURV" 2>/dev/null | awk -F' \\| ' '{print $2}' | sort -u | wc -l)
-    echo "Flock / Mesh-Detect (surveillance.txt):"
+    echo "Surveillance Detections (surveillance.txt):"
     echo "  Total hit lines            : $total"
-    echo "  Unique MACs                : $unique_macs"
+    echo "  Unique Devices / MACs      : $unique_macs"
     echo "  Flock, conf=high           : $flock_high"
     echo "  Flock, conf=low            : $flock_low"
     echo "  Flock BLE UUID (unverified): $flock_ble_uuid"
@@ -108,10 +125,14 @@ if [ -f "$SURV" ]; then
     echo "  Unitree robots (BLE)       : $unitree"
     echo "  Flock BLE name-match       : $flock_name"
     echo "  Mesh-Detect watchlist      : $mesh"
+    echo "  GPS ALPR camera (database) : $alpr_hits"
+    echo "  Smart glasses (BLE)        : $glasses_hits"
+    echo "  CC Skimmers (BLE)          : $skimmer_hits"
+    echo "  Rogue Pineapple/pentest    : $pineapple_hits"
     echo "  GPS-tagged                 : $gps_hits"
     echo "  RSSI-tagged                : $rssi_hits"
 else
-    echo "Flock / Mesh-Detect: no surveillance_${TS}.txt found"
+    echo "Surveillance Detections: no surveillance_${TS}.txt found"
 fi
 echo ""
 
@@ -202,4 +223,27 @@ if [ -f "$BOOKMARKS" ]; then
     fi
 else
     echo "Bookmarks: no bookmarks_${TS}.txt found"
+fi
+echo ""
+
+if [ -f "$BEACONS" ]; then
+    total=$(count_of '^[0-9][0-9]:[0-9][0-9]:[0-9][0-9] \|' "$BEACONS")
+    ibeacon_n=$(count_of 'iBeacon' "$BEACONS")
+    eddystone_uid=$(count_of 'Eddystone-UID' "$BEACONS")
+    eddystone_url=$(count_of 'Eddystone-URL' "$BEACONS")
+    unique_macs=$(grep -E '^[0-9][0-9]:[0-9][0-9]:[0-9][0-9] \|' "$BEACONS" 2>/dev/null | awk -F' \\| ' '{print $2}' | sort -u | wc -l)
+    echo "Retail BLE Beacons (stationary store/marketing):"
+    echo "  Total sighting lines : $total"
+    echo "  Unique MACs          : $unique_macs"
+    echo "  iBeacon              : $ibeacon_n"
+    echo "  Eddystone-UID        : $eddystone_uid"
+    echo "  Eddystone-URL        : $eddystone_url"
+    echo ""
+fi
+
+if [ -f "$TRACK_ROUTE" ]; then
+    track_pts=$(grep -cE '^[0-9:]+\|[-0-9.]+,[-0-9.]+$' "$TRACK_ROUTE" 2>/dev/null || echo 0)
+    echo "GPS Route Breadcrumbs:"
+    echo "  Total route points   : ${track_pts:-0}"
+    echo ""
 fi
