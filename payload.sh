@@ -783,6 +783,51 @@ always_alert_menu_item() {
     fi
 }
 
+# Detect available Bluetooth HCI adapters. If an external USB adapter (e.g. hci1)
+# is attached alongside internal hci0, prefer hci1 by default for superior range/sensitivity
+# (same principle as cncartistsec/BluePine).
+detect_bt_ifaces() {
+    local devs=()
+    if command -v hcitool >/dev/null 2>&1; then
+        devs=($(hcitool dev 2>/dev/null | awk '/hci[0-9]+/ {print $1}'))
+    fi
+    if [ ${#devs[@]} -eq 0 ] && command -v hciconfig >/dev/null 2>&1; then
+        devs=($(hciconfig 2>/dev/null | awk -F: '/^hci[0-9]+/ {print $1}'))
+    fi
+    [ ${#devs[@]} -eq 0 ] && devs=("hci0")
+    echo "${devs[@]}"
+}
+
+AVAILABLE_HCI_DEVS=($(detect_bt_ifaces))
+BT_IFACE="hci0"
+for _d in "${AVAILABLE_HCI_DEVS[@]}"; do
+    if [ "$_d" = "hci1" ]; then
+        BT_IFACE="hci1"
+        break
+    fi
+done
+
+cycle_bt_iface() {
+    local idx=0 count=${#AVAILABLE_HCI_DEVS[@]}
+    [ $count -le 1 ] && return
+    for i in "${!AVAILABLE_HCI_DEVS[@]}"; do
+        if [ "${AVAILABLE_HCI_DEVS[$i]}" = "$BT_IFACE" ]; then
+            idx=$i
+            break
+        fi
+    done
+    idx=$(( (idx + 1) % count ))
+    BT_IFACE="${AVAILABLE_HCI_DEVS[$idx]}"
+}
+
+bt_iface_menu_item() {
+    if [ ${#AVAILABLE_HCI_DEVS[@]} -gt 1 ]; then
+        echo "BT Adapter: $BT_IFACE (tap to cycle ${#AVAILABLE_HCI_DEVS[@]} devs)"
+    else
+        echo "BT Adapter: $BT_IFACE"
+    fi
+}
+
 if command -v LIST_PICKER >/dev/null 2>&1; then
     while true; do
         _resp=$(LIST_PICKER "What to detect (select to toggle)" \
@@ -799,6 +844,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             "$(detection_menu_item retail_beacons 'Retail beacons (iBeacon/Eddystone, needs Rogue BLE trackers on)')" \
             "$(stealth_menu_item)" \
             "$(always_alert_menu_item)" \
+            "$(bt_iface_menu_item)" \
             "Start scanning" \
             "Start scanning")
         case "$_resp" in
@@ -815,6 +861,7 @@ if command -v LIST_PICKER >/dev/null 2>&1; then
             *"Retail beacons"*) WANT_RETAIL_BEACONS=$((1 - WANT_RETAIL_BEACONS)) ;;
             *"Stealth Mode"*) STEALTH_MODE=$(( (STEALTH_MODE + 1) % 3 )) ;;
             *"Always Alert"*) ALWAYS_ALERT=$((1 - ALWAYS_ALERT)) ;;
+            *"BT Adapter:"*) cycle_bt_iface ;;
             "Start scanning") break ;;
             *) break ;;   # LIST_PICKER unavailable/cancelled mid-loop -- fall through with current WANT_*/STEALTH_MODE/ALWAYS_ALERT values rather than looping forever
         esac
@@ -886,11 +933,12 @@ DEAUTH_OK=0
 # WANT_ toggle of its own: it rides the same scan cycle.
 if command -v hcitool >/dev/null 2>&1; then
     BTCLASSIC_OK=1
-    LOG green "BT Classic inquiry: enabled (7s per cycle, bt-bluepine's method)"
+    LOG green "BT Classic inquiry: enabled on $BT_IFACE (7s per cycle)"
 else
     BTCLASSIC_OK=0
     LOG red "BT Classic inquiry: disabled (hcitool not found)"
 fi
+LOG green "Bluetooth adapter: $BT_IFACE (detected: ${AVAILABLE_HCI_DEVS[*]})"
 
 # Payload-scoped "branding" -- deliberately not a device theme change (see
 # git history for why: this platform's payload-log screen background is
@@ -1156,7 +1204,7 @@ fi
 # shared pipeline now, just with more readers behind that one awk process.
 if [ "$BLE_RID_OK" = "1" ] || [ "$TRACKER_BLE_OK" = "1" ] || [ "$FLOCK_BLE_UUID_OK" = "1" ] || [ "$GLASSES_BLE_OK" = "1" ] || [ "$RAVEN_BLE_OK" = "1" ]; then
     mkfifo "$BLE_FIFO"
-    "$HCIDUMP" -i hci0 --raw > "$BLE_FIFO" 2>"$WORK_DIR/hcidump.log" &
+    "$HCIDUMP" -i "$BT_IFACE" --raw > "$BLE_FIFO" 2>"$WORK_DIR/hcidump.log" &
     HCIDUMP_PID=$!
     "$AWK" -v WANT_RID_BLE="$BLE_RID_OK" -v WANT_TRACKER="$TRACKER_BLE_OK" \
         -v WANT_FLOCK_BLE="$FLOCK_BLE_UUID_OK" -v WANT_GLASSES="$GLASSES_BLE_OK" \
@@ -2510,6 +2558,98 @@ screen_gps() {
     LOG magenta "$(dash_rule 'GPS Status')"
 }
 
+gps_configure_device() {
+    local cur_dev devs=() choices=() sel
+    cur_dev=$(gps_device_path)
+
+    # 1. Active ttyACM and ttyUSB devices
+    for d in /dev/ttyACM* /dev/ttyUSB*; do
+        [ -e "$d" ] && devs+=("$d")
+    done
+    # 2. Persistent serial by-path symlinks
+    for d in /dev/serial/by-path/*; do
+        [ -e "$d" ] && devs+=("$d")
+    done
+    # 3. Known platform defaults and network relays
+    devs+=("/dev/serial/by-path/1.1_1-1.1:1.0")
+    devs+=("udp://172.16.52.1:9999")
+
+    # Deduplicate while preserving order
+    local uniq_devs=()
+    for d in "${devs[@]}"; do
+        local already=0
+        for u in "${uniq_devs[@]}"; do
+            [ "$u" = "$d" ] && { already=1; break; }
+        done
+        [ $already -eq 0 ] && uniq_devs+=("$d")
+    done
+
+    # Format choices for LIST_PICKER
+    for d in "${uniq_devs[@]}"; do
+        local tag=""
+        if [ "$d" = "$cur_dev" ]; then
+            tag=" (ACTIVE)"
+        elif [ -e "$d" ]; then
+            tag=" (FOUND)"
+        fi
+        choices+=("$d$tag")
+    done
+    choices+=("Cancel")
+
+    if ! command -v LIST_PICKER >/dev/null 2>&1; then
+        LOG yellow "LIST_PICKER not available to select GPS device."
+        return
+    fi
+
+    sel=$(LIST_PICKER "Select GPS Device Node" "${choices[@]}")
+    case "$sel" in
+        "Cancel"|"") return ;;
+        *)
+            local chosen_node="${sel%% *}"
+            uci set gpsd.core.device="$chosen_node"
+            uci commit gpsd
+            /etc/init.d/gpsd reload 2>/dev/null
+            /etc/init.d/gpsd restart 2>/dev/null
+            LOG green "GPS Device set to: $chosen_node"
+            LOG cyan "Restarted gpsd service."
+            sleep 1.2
+            ;;
+    esac
+}
+
+gps_configure_baud() {
+    local cur_baud sel
+    cur_baud=$(gps_device_speed)
+
+    if ! command -v LIST_PICKER >/dev/null 2>&1; then
+        LOG yellow "LIST_PICKER not available to select baud."
+        return
+    fi
+
+    sel=$(LIST_PICKER "Select GPS Baud Rate" \
+        "9600 (Standard NMEA Default)" \
+        "4800 (Legacy NMEA)" \
+        "19200" \
+        "38400 (Fast NMEA)" \
+        "57600" \
+        "115200 (High-Speed / RTK)" \
+        "Cancel")
+
+    case "$sel" in
+        "Cancel"|"") return ;;
+        *)
+            local chosen_baud="${sel%% *}"
+            uci set gpsd.core.speed="$chosen_baud"
+            uci commit gpsd
+            /etc/init.d/gpsd reload 2>/dev/null
+            /etc/init.d/gpsd restart 2>/dev/null
+            LOG green "GPS Baud set to: $chosen_baud"
+            LOG cyan "Restarted gpsd service."
+            sleep 1.2
+            ;;
+    esac
+}
+
 # Manual "flag this moment for later analysis" -- a menu action rather
 # than a button watcher. A background process parked in WAIT_FOR_INPUT
 # would compete with the foreground menu for the D-pad (only one reader
@@ -2602,7 +2742,7 @@ while true; do
     # skimmers, Mesh-Detect) to buy this one, which is not a trade worth
     # making silently.
     : > /tmp/hci_classic.txt
-    timeout --signal=SIGINT 7s hcitool -i hci0 scan --length=7 \
+    timeout --signal=SIGINT 7s hcitool -i "$BT_IFACE" scan --length=7 \
         > /tmp/hci_classic.txt 2>>"$LOG_FILE"
     killall hcitool 2>/dev/null
 
@@ -2644,9 +2784,9 @@ while true; do
     fi
 
     # --- Flock Safety BLE scan cycle (unmodified from Flock-You / Flock_Detect) ---
-    hciconfig hci0 down 2>>"$LOG_FILE"
-    hciconfig hci0 reset 2>>"$LOG_FILE"
-    hciconfig hci0 up 2>>"$LOG_FILE"
+    hciconfig "$BT_IFACE" down 2>>"$LOG_FILE"
+    hciconfig "$BT_IFACE" reset 2>>"$LOG_FILE"
+    hciconfig "$BT_IFACE" up 2>>"$LOG_FILE"
     # `timeout 18` is a dead-man's-switch, not the intended scan length: the
     # real stop signal is `kill $PID` below, at 12s. The 6s of headroom
     # between them exists so hcitool still gets killed (by its own timeout,
@@ -2656,7 +2796,7 @@ while true; do
     # value (see the "unmodified from" note above) rather than trimmed
     # closer to 12s, since this hasn't been re-verified live and shortening
     # a safety margin on unverified grounds is the wrong direction to guess.
-    timeout 18 hcitool lescan --duplicates > /tmp/hci_scan.txt 2>>"$LOG_FILE" &
+    timeout 18 hcitool -i "$BT_IFACE" lescan --duplicates > /tmp/hci_scan.txt 2>>"$LOG_FILE" &
     PID=$!
     sleep 12
     kill $PID 2>/dev/null
@@ -3101,7 +3241,28 @@ menu_loop() {
                 esac
                 sleep 0.8
                 ;;
-            "5: GPS Status"*)    screen_gps;     pause_screen ;;
+            "5: GPS Status"*)
+                screen_gps
+                if command -v LIST_PICKER >/dev/null 2>&1; then
+                    local _gps_act
+                    _gps_act=$(LIST_PICKER "GPS Management" \
+                        "1: Back to Menu" \
+                        "2: Select GPS Device Node" \
+                        "3: Change GPS Baud Rate" \
+                        "4: Restart gpsd Service")
+                    case "$_gps_act" in
+                        "2: Select GPS Device"*) gps_configure_device ;;
+                        "3: Change GPS Baud"*)   gps_configure_baud ;;
+                        "4: Restart gpsd"*)
+                            /etc/init.d/gpsd restart 2>/dev/null
+                            LOG green "Restarted gpsd service."
+                            sleep 1
+                            ;;
+                    esac
+                else
+                    pause_screen
+                fi
+                ;;
             "6: Session Info"*)  screen_session; pause_screen ;;
             "0: Return to Live HUD"|"")
                 break
